@@ -88,6 +88,7 @@ class Family:
     files: bool = False  # top-level regular files are candidates too
     min_bytes: int | None = None  # size floor for this family instead of --min-mib
     git_disposable: bool = False  # a checkout that loses nothing when deleted is reclaimable
+    nested_git: bool = False  # judge every checkout inside an item, not only one rooted at it
     owner: str = ""  # who writes it, so a cache nobody owns any more is visible
     owner_job: str = ""  # launchd service of that owner (e.g. system/ai.x.worker); unloaded = retired
     rebuild_minutes: float = 10.0  # rough cost of losing it; cheaper items go first under pressure
@@ -148,7 +149,9 @@ def default_families() -> list[Family]:
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
-               skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5),
+               skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
+               # sessions clone into <session>/scratchpad/<name>; each clone must lose nothing
+               git_disposable=True, nested_git=True),
         Family("tmp", tmp, True, "agent scratch under the temp dir",
                skip=(f"claude-{uid}",), files=True,
                min_bytes=1024**2 if tmpfs else None, git_disposable=True, owner="agents and tools",
@@ -323,9 +326,21 @@ def named_by(path: str, cmds: str) -> bool:
     return False
 
 
-def in_cwd(path: str, opened: list[str]) -> bool:
+def open_index(opened: list[str]) -> frozenset[str]:
+    """Every opened path and all its ancestors, so in_cwd is one lookup per spelling instead of a
+    scan of every open file (lsof lists tens of thousands; the scan cost ~1 min per survey)."""
+    out: set[str] = set()
+    for o in opened:
+        while o and o not in out:  # an ancestor already present has all of its own ancestors too
+            out.add(o)
+            o = o.rpartition("/")[0]
+    return frozenset(out)
+
+
+def in_cwd(path: str, opened: list[str] | frozenset[str]) -> bool:
     """True when any process has its cwd or an open file inside path."""
-    return any(o == sp or o.startswith(sp + "/") for sp in spellings(path) for o in opened)
+    index = opened if isinstance(opened, frozenset) else open_index(opened)
+    return any(sp in index for sp in spellings(path))
 
 
 def claude_config_dirs() -> list[Path]:
@@ -378,12 +393,12 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
                         budget -= 1
                         if budget < 0:
                             return "unchecked"
-                        if e.name == ".git":
-                            return "git"
+                        if e.name == ".git" or (e.name == "HEAD" and looks_like_repository(d)):
+                            return "git"  # a bare repository holds commits just like a checkout
                         if e.is_dir(follow_symlinks=False):
                             if e.name not in REPRODUCIBLE_DIRS:
                                 nxt.append(e.path)
-                            elif os.path.lexists(os.path.join(e.path, ".git")):
+                            elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
                                 return "git"  # e.g. `git clone x target`; not searched deeper
             except PermissionError:
                 return "unchecked"
@@ -391,6 +406,65 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
                 pass
         frontier = nxt
     return "unchecked" if frontier else "none"
+
+
+def looks_like_repository(d: str) -> bool:
+    """A bare repository or a copied git dir: no .git entry of its own, but HEAD, objects and refs."""
+    return (os.path.isfile(os.path.join(d, "HEAD")) and os.path.isdir(os.path.join(d, "objects"))
+            and os.path.isdir(os.path.join(d, "refs")))
+
+
+def checkouts(path: Path, depth: int = 5, budget: int = 20000) -> list[Path] | None:
+    """Every checkout (a directory holding .git) or bare repository up to `depth` levels below
+    path, not searching inside one; None when the search could not finish."""
+    found: list[Path] = []
+    frontier = [str(path)]
+    for _ in range(depth + 1):
+        nxt: list[str] = []
+        for d in frontier:
+            if os.path.lexists(os.path.join(d, ".git")) or looks_like_repository(d):
+                found.append(Path(d))
+                continue
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return None
+                        if e.is_dir(follow_symlinks=False):
+                            if e.name not in REPRODUCIBLE_DIRS:
+                                nxt.append(e.path)
+                            elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
+                                found.append(Path(e.path))  # as git_state: not searched deeper
+            except PermissionError:
+                return None
+            except OSError:
+                pass
+        frontier = nxt
+    return None if frontier else found
+
+
+def family_git_loss(fam: "Family", path: Path) -> str:
+    """git_loss for the checkout at path, or with fam.nested_git for every checkout inside it."""
+    if not fam.nested_git:
+        return git_loss(path)
+    roots = checkouts(path)
+    if roots is None:
+        return "too deep or large to find every checkout"
+    inside = os.path.realpath(path) + "/"
+    for root in roots:
+        where = root.relative_to(path)
+        if not os.path.lexists(root / ".git"):
+            return f"{where}: a repository without a checkout"  # its commits have no git_loss check
+        if (loss := git_loss(root)):
+            return f"{where}: {loss}"
+        # git_loss keeps a linked worktree because its repository stays; here the repository
+        # may be inside the item being deleted
+        if (root / ".git").is_file():
+            common = git_common_dir(root)
+            if not common or (os.path.realpath(common) + "/").startswith(inside):
+                return f"{where}: worktree of a repository inside this item"
+    return ""
 
 
 def has_git(path: Path) -> bool:
@@ -648,8 +722,11 @@ def git_common_dir(path: Path) -> str:
     """The repository of a linked worktree, so its record can be pruned after deletion."""
     if not (path / ".git").is_file():
         return ""
-    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
-                        "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    try:
+        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+                            "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""  # callers treat an unknown repository as one to keep
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
@@ -879,6 +956,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         blind = ""
     except NoEvidence as e:
         cwds, cmds, blind = [], "", f"no process evidence ({e})"
+    opened = open_index(cwds)
     for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
         if size < floor:
             continue
@@ -886,15 +964,18 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         reasons = []
         if blind:
             reasons.append(blind)
-        if in_cwd(sp, cwds):
+        if in_cwd(sp, opened):
             reasons.append("open by a process")
         if named_by(sp, cmds):
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
             reasons.append("claude session active")
-        if fam.reclaimable and holds_socket(path):
+        # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
+        # so only an item old enough to delete pays for them (apply re-checks before deleting).
+        deletable_age = fam.reclaimable and idle >= idle_hours
+        if deletable_age and holds_socket(path):
             reasons.append("holds a socket")
-        if fam.reclaimable and job_busy(fam, path):
+        if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
         if not fam.reclaimable:
             verdict = "report-only"
@@ -902,7 +983,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             verdict = "in-use"
         elif (not derived_data(fam, path) and (g := git_state(path)) != "none"
               and not (g == "git" and fam.git_disposable and idle >= idle_hours
-                       and not (loss := git_loss(path)))):
+                       and not (loss := family_git_loss(fam, path)))):
             verdict = "git-checkout" if g == "git" else "unchecked"
             if g == "unchecked":
                 reasons.append("too deep or large to rule out a git checkout")
@@ -1077,6 +1158,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     except NoEvidence as e:
         print(f"refusing to delete anything: {e}", file=sys.stderr)
         return 0
+    cwds = open_index(cwds)
     # cheapest loss per byte first, not simply largest first
     for i in sorted(items, key=lambda i: value(i, families[i.family]), reverse=True):
         if i.verdict != "reclaimable":
@@ -1090,12 +1172,13 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
         # fresh re-observation right before the destructive step
-        if in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p):
+        if (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
+                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"
         elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
-              and (g := git_state(p)) != "none" and (g != "git" or git_loss(p))):
+              and (g := git_state(p)) != "none" and (g != "git" or family_git_loss(families[i.family], p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
         else:
             try:

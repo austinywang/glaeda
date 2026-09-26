@@ -178,6 +178,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --dirs=/private/tmp/foo,/x\n"))
         self.assertFalse(gd.named_by("/private/tmp/foo", "tool /tmp/foobar\n"))
         self.assertTrue(gd.in_cwd("/private/tmp/foo", ["/tmp/foo/a.log"]))
+        index = gd.open_index(["/tmp/foo/a.log", "/tmp/foobar/b"])
+        self.assertTrue(gd.in_cwd("/tmp/foo", index))
+        self.assertTrue(gd.in_cwd("/tmp/foo/a.log", index))
+        self.assertFalse(gd.in_cwd("/tmp/fo", index))
+        self.assertFalse(gd.in_cwd("/tmp/foo/a", index))
 
     def test_missing_process_evidence_fails_closed(self) -> None:
         make(self.root / "old")
@@ -344,7 +349,9 @@ class GlaedaDiskTest(unittest.TestCase):
         sock = socket.socket(socket.AF_UNIX)
         self.addCleanup(sock.close)
         sock.bind(str(d / "default"))
-        os.utime(d, (time.time() - 48 * 3600,) * 2)
+        # a long-lived server's socket is as old as its directory; only an old enough item pays for the socket walk
+        for p in (d / "default", d):
+            os.utime(p, (time.time() - 48 * 3600,) * 2)
         v = self.verdicts()
         self.assertEqual(v["tmux-1000"], "in-use")
         self.assertEqual(v["plain"], "reclaimable")
@@ -364,8 +371,9 @@ class GlaedaDiskTest(unittest.TestCase):
     def _git(self, *args: str) -> str:
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-        return subprocess.run(["git", *args], check=True, capture_output=True, text=True,
-                              env=env).stdout
+        # no detached auto-maintenance: it writes into .git after a test has aged the tree
+        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
+                              check=True, capture_output=True, text=True, env=env).stdout
 
     def _tmp_repos(self) -> tuple[Path, Path]:
         """A tmp-family root plus an origin repository with one commit outside it."""
@@ -416,6 +424,44 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.apply(gd.survey([self.fam], 24, 0), {"tmp": self.fam}, self.receipt(), None, 24)
         self.assertFalse((root / "leaked.so").exists())
         self.assertTrue((root / "fresh.log").exists())
+
+    def test_nested_checkouts_in_idle_scratch_sessions(self) -> None:
+        root, origin = self._tmp_repos()
+        self.fam = gd.replace(self.fam, files=False, nested_git=True)
+        for session in ("clean", "unpushed", "dirty"):
+            (root / session / "scratchpad").mkdir(parents=True)
+            self._git("clone", "-q", str(origin), str(root / session / "scratchpad/a"))
+            self._git("clone", "-q", str(origin), str(root / session / "scratchpad/b"))
+            (root / session / "scratchpad/notes.txt").write_text("n")
+        (root / "unpushed/scratchpad/b/g").write_text("y")
+        self._git("-C", str(root / "unpushed/scratchpad/b"), "add", "g")
+        self._git("-C", str(root / "unpushed/scratchpad/b"), "commit", "-qm", "local")
+        (root / "dirty/scratchpad/a/untracked").write_text("z")
+        # a bare seed with a linked worktree: the branch lives only in the seed, inside the item
+        (root / "seeded/scratchpad").mkdir(parents=True)
+        self._git("clone", "-q", "--bare", str(origin), str(root / "seeded/scratchpad/seed.git"))
+        self._git("-C", str(root / "seeded/scratchpad/seed.git"), "worktree", "add", "-q", "-b", "feat",
+                  str(root / "seeded/scratchpad/wt"))
+        (root / "seeded/scratchpad/wt/g").write_text("y")
+        self._git("-C", str(root / "seeded/scratchpad/wt"), "add", "g")
+        self._git("-C", str(root / "seeded/scratchpad/wt"), "commit", "-qm", "only in the seed")
+        # a bare repository alone is never judged clean
+        (root / "bare/scratchpad").mkdir(parents=True)
+        self._git("clone", "-q", "--bare", str(origin), str(root / "bare/scratchpad/copy.git"))
+        for d in root.iterdir():
+            self._age(d)
+        items = gd.survey([self.fam], 24, 0)
+        v = {Path(i.path).name: i.verdict for i in items}
+        self.assertEqual(v, {"clean": "reclaimable", "unpushed": "git-checkout", "dirty": "git-checkout",
+                             "seeded": "git-checkout", "bare": "git-checkout"})
+        why = {Path(i.path).name: i.reasons for i in items}
+        self.assertEqual(why["unpushed"], ["scratchpad/b: commits no remote confirms"])
+        self.assertEqual(why["bare"], ["scratchpad/copy.git: a repository without a checkout"])
+        # a checkout rooted below the item stays protected without the opt-in
+        plain = gd.replace(self.fam, nested_git=False)
+        self.assertEqual({i.verdict for i in gd.survey([plain], 24, 0)}, {"git-checkout"})
+        gd.apply(items, {"tmp": self.fam}, self.receipt(), None, 24)
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["bare", "dirty", "seeded", "unpushed"])
 
     def test_family_size_floor_overrides_min_mib(self) -> None:
         root, _ = self._tmp_repos()
