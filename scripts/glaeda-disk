@@ -170,8 +170,20 @@ def default_families() -> list[Family]:
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True,
                owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30),
-        Family("user-cache", HOME / ".cache", False, "tool caches (report only)", skip=("cmux-job",)),
-        Family("library-caches", HOME / "Library/Caches", False, "app caches (report only)"),
+        # Caches are disposable by definition; an idle one goes under pressure, a live one (go-build
+        # while a Go build runs) stays recent. Any git data inside keeps it, as everywhere else.
+        Family("user-cache", HOME / ".cache", True, "the tool re-downloads or rebuilds it",
+               # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
+               # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
+               skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
+               owner="tools (XDG cache)", rebuild_minutes=5),
+        Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
+               # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
+               # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
+               skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
+                     "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
+                     "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
+               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)"),
         Family("projects", projects, False, "checkouts (report only)",
@@ -1442,10 +1454,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
     ap.add_argument("--pressure", action="store_true",
                     help="only act when free space is below --low; stop at --target")
-    ap.add_argument("--low", default="15%:40-150",
+    # Air Blue sat at 3-7% free for a day with the old 15%/25%: act earlier and free more per run
+    ap.add_argument("--low", default="25%:60-200",
                     help="pressure threshold per filesystem: GiB free, N%% of its size, or "
                          "N%%:LO-HI to hold that share between LO and HI GiB (default %(default)s)")
-    ap.add_argument("--target", default="25%:80-300",
+    ap.add_argument("--target", default="35%:100-350",
                     help="stop freeing at this much free, same forms (default %(default)s)")
     ap.add_argument("--tmpfs-low", default="75%",
                     help="pressure threshold for a tmpfs, whose files live in RAM and swap "

@@ -791,6 +791,21 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.UNREADABLE.clear()
         self.tmp.cleanup()
 
+    def test_cache_families_skip_state_that_is_not_a_cache(self) -> None:
+        fams = {f.id: f for f in gd.default_families() if f.id in ("user-cache", "library-caches")}
+        for fam in fams.values():
+            fam.root.mkdir(parents=True, exist_ok=True)
+        keep = {"user-cache": ["glaeda", "glaeda-disk", "glaeda-fullapp", "glaeda-fleet-cas", "cmux-job",
+                               "huggingface", "codex-runtimes"],
+                "library-caches": ["glaeda", "PassKit", "tidy-branches", "CloudKit", "com.apple.Safari"]}
+        for fid, names in keep.items():
+            fam = fams.get(fid)
+            if fam is None:
+                continue
+            for n in names:
+                self.assertTrue(n in fam.skip or n.startswith(fam.skip_prefixes), f"{fid}/{n}")
+            self.assertTrue(fam.reclaimable)
+
     def test_linux_families(self) -> None:
         for rel in ("Projects/glaeda", "Projects/glaeda-worktrees/a", "Projects/botany-sim-worktrees/b",
                     ".cache/pip"):
@@ -805,7 +820,7 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in by_id["worktrees"]),
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
-        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad"})
+        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache"})
         projects = next(f for f in fams if f.id == "projects")
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")
