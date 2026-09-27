@@ -67,6 +67,13 @@ from pathlib import Path
 HOME = Path.home()
 SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
 DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+# Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
+# re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
+NESTED_KEEP = HOME / ".cache/glaeda-disk/nested-keep.json"
+NESTED_KEEP_S = 24 * 3600
+# Session scratch holds whole source copies nested deeper than git_state's search; finding every
+# checkout in one took ~48 s on a loaded Air Blue (glaeda#1293). Paid only by idle items.
+NESTED_DEPTH, NESTED_BUDGET = 40, 5_000_000
 DEDUPE_SUBDIRS = ("SourcePackages", "ModuleCache.noindex", "SDKExplicitPrecompiledModules")
 DEDUPE_MIN_BYTES = 1024 * 1024
 GIB = 1024**3
@@ -444,19 +451,119 @@ def checkouts(path: Path, depth: int = 5, budget: int = 20000) -> list[Path] | N
     return None if frontier else found
 
 
+_NESTED_WALKS: dict[str, list[Path] | None] = {}  # one walk per item per survey or apply pass
+
+
+def nested_checkouts(path: Path) -> list[Path] | None:
+    key = str(path)
+    if key not in _NESTED_WALKS:
+        _NESTED_WALKS[key] = checkouts(path, NESTED_DEPTH, NESTED_BUDGET)
+    return _NESTED_WALKS[key]
+
+
+def family_git_state(fam: "Family", path: Path) -> str:
+    """git_state, or for a nested_git family the full-depth checkout search."""
+    if not fam.nested_git:
+        return git_state(path)
+    roots = nested_checkouts(path)
+    return "unchecked" if roots is None else "git" if roots else "none"
+
+
+def bare_loss(gitdir: Path) -> str:
+    """repo_loss for a bare repository or copied git dir, and for every submodule repository
+    kept under its modules/ (they are deleted with it)."""
+    if (loss := repo_loss(gitdir)):
+        return loss
+    modules = gitdir / "modules"
+    if not modules.is_dir() or modules.is_symlink():
+        return ""
+    unreadable: list[str] = []
+    for dirpath, dirnames, _ in os.walk(modules, onerror=lambda e: unreadable.append(str(e.filename))):
+        if unreadable:
+            return "unreadable submodule store"
+        if looks_like_repository(dirpath):
+            if (loss := repo_loss(Path(dirpath))):
+                return f"{os.path.relpath(dirpath, gitdir)}: {loss}"
+            dirnames[:] = ["modules"] if "modules" in dirnames else []  # nested submodules only
+    return "unreadable submodule store" if unreadable else ""
+
+
+def _load_keep() -> dict:
+    try:
+        keep = json.loads(NESTED_KEEP.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in keep.items() if isinstance(v, dict) and isinstance(v.get("at"), (int, float))} \
+        if isinstance(keep, dict) else {}
+
+
 def family_git_loss(fam: "Family", path: Path) -> str:
     """git_loss for the checkout at path, or with fam.nested_git for every checkout inside it."""
     if not fam.nested_git:
         return git_loss(path)
-    roots = checkouts(path)
+    keep = _load_keep()
+    hit = keep.get(str(path))
+    if isinstance(hit, dict) and time.time() - hit.get("at", 0) < NESTED_KEEP_S and hit.get("loss"):
+        return str(hit["loss"])
+    loss = _nested_loss(path)
+    if loss:
+        keep = {k: v for k, v in keep.items()
+                if isinstance(v, dict) and time.time() - v.get("at", 0) < NESTED_KEEP_S}
+        keep[str(path)] = {"at": time.time(), "loss": loss}
+        try:
+            NESTED_KEEP.parent.mkdir(parents=True, exist_ok=True)
+            tmp = NESTED_KEEP.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(keep))
+            os.replace(tmp, NESTED_KEEP)
+        except OSError:
+            pass
+    return loss
+
+
+def ignored_checkout_loss(root: Path) -> str:
+    """checkouts() stops at a checkout, and its status hides ignored directories, so a clone kept
+    in one (vendor/ in .gitignore) would go unjudged. Build-output directories are skipped as
+    everywhere else: SwiftPM and friends keep reproducible dependency clones there."""
+    try:
+        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-z", "--ignored=matching",
+                            "--untracked-files=normal"], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.TimeoutExpired):
+        return "unreadable ignored files"
+    if r.returncode != 0:
+        return "unreadable ignored files"
+    for entry in r.stdout.split("\0"):  # -z: paths unquoted, so none is misread and skipped
+        if not entry.startswith("!! ") or not entry.endswith("/"):
+            continue
+        rel = entry[3:].rstrip("/")
+        if Path(rel).name in REPRODUCIBLE_DIRS:
+            continue
+        inner = checkouts(root / rel, NESTED_DEPTH, NESTED_BUDGET)
+        if inner is None:
+            return f"{rel}: too deep or large to find every checkout"
+        for sub in inner:
+            if not os.path.lexists(sub / ".git"):
+                if (loss := bare_loss(sub)):
+                    return f"{sub.relative_to(root)}: {loss}"
+            elif (loss := git_loss(sub)) or (loss := ignored_checkout_loss(sub)):
+                return f"{sub.relative_to(root)}: {loss}"
+    return ""
+
+
+def _nested_loss(path: Path) -> str:
+    roots = nested_checkouts(path)
     if roots is None:
         return "too deep or large to find every checkout"
     inside = os.path.realpath(path) + "/"
     for root in roots:
         where = root.relative_to(path)
         if not os.path.lexists(root / ".git"):
-            return f"{where}: a repository without a checkout"  # its commits have no git_loss check
+            if (loss := bare_loss(root)):
+                return f"{where}: {loss}"
+            continue
         if (loss := git_loss(root)):
+            return f"{where}: {loss}"
+        if (loss := ignored_checkout_loss(root)):
             return f"{where}: {loss}"
         # git_loss keeps a linked worktree because its repository stays; here the repository
         # may be inside the item being deleted
@@ -932,6 +1039,7 @@ def survey(families: list[Family], idle_hours: float, min_bytes: int,
 
 
 def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) -> list[Item]:
+    _NESTED_WALKS.clear()
     now = time.time()
     items: list[Item] = []
     known = known if known is not None else {}
@@ -981,7 +1089,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             verdict = "report-only"
         elif reasons:
             verdict = "in-use"
-        elif (not derived_data(fam, path) and (g := git_state(path)) != "none"
+        elif (not derived_data(fam, path) and (g := family_git_state(fam, path)) != "none"
               and not (g == "git" and fam.git_disposable and idle >= idle_hours
                        and not (loss := family_git_loss(fam, path)))):
             verdict = "git-checkout" if g == "git" else "unchecked"
@@ -1153,6 +1261,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     to stop at), only items on those filesystems are touched, each until its own target."""
     receipt.parent.mkdir(parents=True, exist_ok=True)
     released = 0
+    _NESTED_WALKS.clear()  # re-observe every checkout right before deleting
     try:
         cwds, cmds = process_evidence()
     except NoEvidence as e:
@@ -1178,7 +1287,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"
         elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
-              and (g := git_state(p)) != "none" and (g != "git" or family_git_loss(families[i.family], p))):
+              and (g := family_git_state(families[i.family], p)) != "none"
+              and (g != "git" or family_git_loss(families[i.family], p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
         else:
             try:

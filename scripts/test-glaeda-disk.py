@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import contextlib
 import io
+import json
 import os
 import shutil
 import socket
@@ -41,9 +42,13 @@ class GlaedaDiskTest(unittest.TestCase):
         self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild")
         self.gd_evidence = gd.process_evidence
         gd.process_evidence = lambda: ([], "")
+        self.gd_keep = gd.NESTED_KEEP
+        gd.NESTED_KEEP = self.root.parent / f"{self.root.name}-keep.json"
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
+        gd.NESTED_KEEP.unlink(missing_ok=True)
+        gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
 
     def verdicts(self, idle: float = 24) -> dict[str, str]:
@@ -445,23 +450,52 @@ class GlaedaDiskTest(unittest.TestCase):
         (root / "seeded/scratchpad/wt/g").write_text("y")
         self._git("-C", str(root / "seeded/scratchpad/wt"), "add", "g")
         self._git("-C", str(root / "seeded/scratchpad/wt"), "commit", "-qm", "only in the seed")
-        # a bare repository alone is never judged clean
+        # a bare copy whose commits a remote confirms loses nothing; one with a local commit does
         (root / "bare/scratchpad").mkdir(parents=True)
         self._git("clone", "-q", "--bare", str(origin), str(root / "bare/scratchpad/copy.git"))
+        (root / "barelocal/scratchpad").mkdir(parents=True)
+        seed = root / "barelocal/scratchpad/seed"
+        self._git("clone", "-q", "--bare", str(origin), str(seed))
+        tree = self._git("--git-dir", str(seed), "rev-parse", "HEAD^{tree}").strip()
+        local = self._git("--git-dir", str(seed), "commit-tree", tree, "-p", "HEAD", "-m", "local").strip()
+        self._git("--git-dir", str(seed), "update-ref", "refs/heads/main", local)
+        # a clone kept in an ignored directory of a clean checkout is judged too
+        (root / "vendored/scratchpad").mkdir(parents=True)
+        outer = root / "vendored/scratchpad/outer"
+        self._git("clone", "-q", str(origin), str(outer))
+        (outer / ".git/info/exclude").write_text("vendor/\n")
+        (outer / "vendor").mkdir()
+        self._git("clone", "-q", str(origin), str(outer / "vendor/lib"))
+        (outer / "vendor/lib/g").write_text("y")
+        self._git("-C", str(outer / "vendor/lib"), "add", "g")
+        self._git("-C", str(outer / "vendor/lib"), "commit", "-qm", "vendored and unpushed")
+        # checkouts nested deeper than git_state's search are still found and judged
+        deep = root / "deep/scratchpad/a/b/c/d/e/f"
+        deep.mkdir(parents=True)
+        self._git("clone", "-q", str(origin), str(deep / "clone"))
+        (deep / "clone/g").write_text("y")
+        self._git("-C", str(deep / "clone"), "add", "g")
+        self._git("-C", str(deep / "clone"), "commit", "-qm", "deep and unpushed")
         for d in root.iterdir():
             self._age(d)
         items = gd.survey([self.fam], 24, 0)
         v = {Path(i.path).name: i.verdict for i in items}
         self.assertEqual(v, {"clean": "reclaimable", "unpushed": "git-checkout", "dirty": "git-checkout",
-                             "seeded": "git-checkout", "bare": "git-checkout"})
+                             "seeded": "git-checkout", "bare": "reclaimable", "barelocal": "git-checkout",
+                             "deep": "git-checkout", "vendored": "git-checkout"})
         why = {Path(i.path).name: i.reasons for i in items}
         self.assertEqual(why["unpushed"], ["scratchpad/b: commits no remote confirms"])
-        self.assertEqual(why["bare"], ["scratchpad/copy.git: a repository without a checkout"])
+        self.assertEqual(why["barelocal"], ["scratchpad/seed: commits no remote confirms"])
+        self.assertEqual(why["deep"], ["scratchpad/a/b/c/d/e/f/clone: commits no remote confirms"])
+        self.assertEqual(why["vendored"], ["scratchpad/outer: vendor/lib: commits no remote confirms"])
+        # kept verdicts are cached, so a dead session with unpushed work is not re-walked every run
+        self.assertIn(str(root / "deep"), json.loads(gd.NESTED_KEEP.read_text()))
         # a checkout rooted below the item stays protected without the opt-in
         plain = gd.replace(self.fam, nested_git=False)
-        self.assertEqual({i.verdict for i in gd.survey([plain], 24, 0)}, {"git-checkout"})
+        self.assertLessEqual({i.verdict for i in gd.survey([plain], 24, 0)}, {"git-checkout", "unchecked"})
         gd.apply(items, {"tmp": self.fam}, self.receipt(), None, 24)
-        self.assertEqual(sorted(p.name for p in root.iterdir()), ["bare", "dirty", "seeded", "unpushed"])
+        self.assertEqual(sorted(p.name for p in root.iterdir()),
+                         ["barelocal", "deep", "dirty", "seeded", "unpushed", "vendored"])
 
     def test_family_size_floor_overrides_min_mib(self) -> None:
         root, _ = self._tmp_repos()
