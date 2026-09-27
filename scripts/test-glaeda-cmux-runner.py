@@ -1657,6 +1657,37 @@ time.sleep(60)
             for runner in ("w0", "w1", "w2", "w3", "w4", "w5"):
                 self.finish(runner)
 
+    def test_capacity_side_runner_waits_for_units(self) -> None:
+        # a 2-unit side lane on a side runner (instance past --canonical-roots) waits for units instead of
+        # refusing; a root runner still refuses at once
+        self.fleet()
+        release = None
+        try:
+            self.assertEqual(self.job("macos-compile-admission", "u0", 4).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "u1", 4).returncode, 0)
+            waited = time.monotonic()
+            root = self.job("release-build", "u2", 4, None, "--gui-wait", "30")
+            self.assertEqual(root.returncode, 1, root.stdout)
+            self.assertIn("refused: capacity: 1 of 4 units free", root.stdout)
+            self.assertLess(time.monotonic() - waited, 20, "a root runner does not wait for units")
+            release = threading.Timer(2.0, self.finish, args=("u1",))
+            release.start()
+            side = self.job("release-build", "u3", 4, None, "--instance", "1", "--gui-wait", "30")
+            release.join()
+            self.assertEqual(side.returncode, 0, side.stdout)
+            self.assertIn("holding 2/4 units for release-build (isolated", side.stdout)
+            # the wait ends at its deadline
+            waited = time.monotonic()
+            late = self.job("release-build", "u4", 4, None, "--instance", "1", "--gui-wait", "2")
+            self.assertEqual(late.returncode, 1, late.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 2)
+            self.assertLess(time.monotonic() - waited, 20, "a 2 s wait, then a refusal")
+        finally:
+            if release is not None:
+                release.cancel()
+            for runner in ("u0", "u1", "u2", "u3", "u4"):
+                self.finish(runner)
+
     def test_capacity_e2e_build_takes_the_gui_token_for_its_tests_only(self) -> None:
         # test-e2e's build compiles, then takes the gui token itself (take-gui) before its console-session tests
         self.fleet()
@@ -1759,6 +1790,9 @@ time.sleep(60)
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "nightly.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("gui", False))
+        self.assertEqual(hook.job_class("cdp-browser-smoke", home, home, "cmux-tui.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-build", home, home, "ci.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("macos-compile-admission", home, home, "ci.yml"), ("compile", False))

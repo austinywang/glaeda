@@ -147,8 +147,13 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # minis first") compiles the universal Release app into its own workspace (build-universal, cleared at job
 # start) and restores its own compile cache lineage: no canonical root, no kept DerivedData, no GUI. As an
 # unknown id it would take the compile class and hold the root a seed on the same mini waits for.
+# cmux-tui's `cdp-browser-smoke` drives a headless Playwright Chromium from cargo tests in the workspace: no
+# console session or canonical root. reload-build's `build` is a Debug build of the dev app (or the iOS app)
+# into the workspace's .ci-reload-derived-data, after git clean -ffdx: no GUI, keychain or canonical root.
+# Both reach the minis as side lanes (vars.CI_SIDE_LANE_RUNNER, cmux docs/ci-runners.md "Side lanes").
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
-                        ("cmux-tui.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
+                        ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
+                        ("reload-build.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui",
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated"}
@@ -186,6 +191,12 @@ GUEST_POLL_S = 5.0
 # listener gate need not hold a root runner off for the gui token (hq#661 Workstream 7).
 GUI_WAIT_S = 240.0
 GUI_TOKEN_TAKEN = "capacity: the gui token is taken"
+# A side runner (an instance past --canonical-roots) listens while one unit is free, so a 2-unit isolated
+# side lane (cmux's release-build, reload-build, cmux-tui) can reach a mini with one unit left. A cmux job
+# refused there only for units waits for them for the same GUI_WAIT_S (--gui-wait): side-lane jobs are minutes
+# long, while a refusal waits for the whole run to finish before the rescue re-runs it. Root runners keep
+# refusing at once: their listener gate already holds them until a root job's units are free.
+UNITS_SHORT = re.compile(r"capacity: [0-9]+ of [0-9]+ units free, ")
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -3213,8 +3224,11 @@ def main(argv: list[str] | None = None) -> int:
                 # A cmux job refused only for the gui token waits for it too: the holder is a short GUI job.
                 if held or not note.startswith("capacity:"):
                     break
-                # decided per try: a cmux job waits only while its latest refusal is the gui token
-                wait = args.guest_wait if guest else args.gui_wait if note.startswith(GUI_TOKEN_TAKEN) else 0
+                # decided per try: a cmux job waits only while its latest refusal is the gui token, or, on a
+                # side runner (not the gui runner, whose gate holds it until a unit is free), units (UNITS_SHORT)
+                side = args.instance >= max(1, args.canonical_roots) and not args.gui_runner
+                wait = (args.guest_wait if guest else args.gui_wait
+                        if note.startswith(GUI_TOKEN_TAKEN) or side and UNITS_SHORT.match(note) else 0)
                 left = start + wait - time.monotonic()
                 if left <= 0:
                     break

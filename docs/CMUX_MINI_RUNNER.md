@@ -212,7 +212,10 @@ What `--apply` does:
        none, and holding for it kept second roots idle while roots were the bottleneck.
        An app-host shard that meets a taken gui token waits up to 240 s for it
        (`--gui-wait`, inside cmux's 360 s refusal window) instead of refusing.
-       (cmuxterm-hq#661, Workstream 7.)
+       (cmuxterm-hq#661, Workstream 7.) A side runner listens with one unit free, so
+       a 2-unit side lane (cmux's release-build, reload-build, cmux-tui) that finds
+       fewer units than it needs waits for them the same 240 s instead of refusing;
+       a root runner still refuses at once.
      - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
