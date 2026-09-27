@@ -3734,24 +3734,66 @@ class RunnerTest(unittest.TestCase):
                 if verb == "bootstrap":
                     loaded.add(service)
                     return subprocess.CompletedProcess(argv, 0, "", "")
-                return subprocess.CompletedProcess(argv, 0 if argv[2] in loaded else 113, "", "")
+                code = 0 if argv[2] in loaded else 113
+                if verb == "bootout":
+                    loaded.discard(argv[2])
+                return subprocess.CompletedProcess(argv, code, "", "")
 
             with mock.patch.object(hook.subprocess, "run", side_effect=fake):
                 self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
                 agent = plistlib.loads(plist.read_bytes())
                 self.assertEqual(agent["LimitLoadToSessionType"], "Aqua", "the unlock must run in the desktop's session")
                 self.assertTrue(agent["RunAtLoad"], "every login unlocks it again")
-                self.assertEqual(agent["ProgramArguments"], ["/usr/bin/security", "unlock-keychain", "-p", "",
-                                                             os.fspath(home / "Library/Keychains" / hook.TEST_KEYCHAIN)])
-                self.assertEqual(calls, [["kickstart", service], ["bootstrap", "gui/501", os.fspath(plist)]])
+                keychain = os.fspath(home / "Library/Keychains" / hook.TEST_KEYCHAIN)
+                self.assertEqual(agent["ProgramArguments"], ["/bin/sh", "-c", hook.GUI_UNLOCK_SCRIPT, "sh", keychain])
+                self.assertEqual(calls, [["bootout", service], ["kickstart", service],
+                                         ["bootstrap", "gui/501", os.fspath(plist)]])
                 calls.clear()
                 self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
                 self.assertEqual(calls, [["kickstart", service]], "loaded: a kickstart reruns the unlock")
+                calls.clear()
+                plist.write_bytes(plistlib.dumps({"Label": hook.GUI_UNLOCK_LABEL, "ProgramArguments": ["old"]}))
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
+                self.assertEqual(calls[0], ["bootout", service], "a changed agent is reloaded, not rerun as it was")
+                self.assertIn(service, loaded)
             with mock.patch.object(hook.subprocess, "run",
                                    return_value=subprocess.CompletedProcess([], 5, "", "no gui")):
                 self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: no GUI session to unlock it in")
             with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 15)):
                 self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI unlock TimeoutExpired")
+
+    def test_gui_unlock_script_cancels_every_queued_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp)
+            log = bin_dir / "log"
+
+            def stub(name: str, body: str) -> str:
+                path = bin_dir / name
+                path.write_text(f"#!/bin/sh\necho {name} \"$@\" >> {log}\n{body}\n")
+                path.chmod(0o755)
+                return os.fspath(path)
+
+            def run(unlock_code: int, prompts: int) -> tuple[int, list[str]]:
+                log.write_text("")
+                (bin_dir / "left").write_text(str(prompts))
+                # Each kill finds SecurityAgent while a prompt is left; the last one finds none.
+                pkill = stub("pkill", f'n=$(cat {bin_dir}/left); [ "$n" -gt 0 ] || exit 1; '
+                                      f'echo $((n - 1)) > {bin_dir}/left')
+                security = stub("security", f"exit {unlock_code}")
+                script = hook.GUI_UNLOCK_SCRIPT.replace("/usr/bin/pkill", pkill) \
+                    .replace("/usr/bin/security", security).replace("sleep 1", "sleep 0")
+                done = subprocess.run(["/bin/sh", "-c", script, "sh", "/k"], capture_output=True, text=True, timeout=10)
+                return done.returncode, log.read_text().splitlines()
+
+            code, lines = run(0, 2)
+            self.assertEqual(code, 0)
+            self.assertEqual(lines, ["security unlock-keychain -p  /k"] + ["pkill -KILL -x SecurityAgent"] * 3,
+                             "unlock first, then kill until no queued prompt restarts SecurityAgent")
+            code, lines = run(0, 9)
+            self.assertEqual(lines.count("pkill -KILL -x SecurityAgent"), 5, "bounded")
+            code, lines = run(1, 2)
+            self.assertEqual((code, lines), (1, ["security unlock-keychain -p  /k"]),
+                             "still locked: leave the prompts to the next run")
 
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):

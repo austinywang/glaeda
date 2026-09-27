@@ -617,6 +617,21 @@ use the cmux-ci keychain" over UI tests (cmux run 36309272077). The hook therefo
 `com.teamleaderleo.glaeda.test-keychain-unlock`, a LaunchAgent limited to the Aqua session that runs
 `security unlock-keychain` on the test keychain. Its RunAtLoad unlocks it again at every login.
 
+The unlock alone does not clear a prompt that is already up. At every login the keychain starts locked in the
+new desktop session, and daemons ask for the default keychain within seconds, usually before the agent runs.
+securityd queues one SecurityAgent prompt per request and keeps it after the keychain is unlocked. Killing
+SecurityAgent cancels only the prompt on screen; securityd starts a new one for the next queued prompt. On
+cmux14 and cmux8s (2026-09-27) prompts queued at the 09-26 reboot were still up the next morning, and the
+assistantd one came back each time the cmux e2e action closed SecurityAgent (cmux run 36317492985). So after
+the unlock the agent kills SecurityAgent, up to 5 times, until no queued prompt starts it again. It does so
+at every job start and every login. No keychain prompt is wanted on a PR mini. When the hook changes the
+agent, it boots the old one out before loading the new one, since a loaded agent keeps running its old
+program.
+
+`cmux-ci` stays the user's default keychain. `swift test` runs in a runner's own session, where the login
+keychain is locked, and tests that add items without naming a keychain need an unlocked default. The
+default is per user, not per session.
+
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.

@@ -1060,29 +1060,44 @@ def ensure_test_keychain(home: Path) -> str:
 GUI_UNLOCK_LABEL = "com.teamleaderleo.glaeda.test-keychain-unlock"
 
 
+# Runs in the Aqua session: unlock, then cancel keychain prompts queued while it was locked. A prompt already
+# on screen stays there after the unlock, and killing SecurityAgent only cancels the one shown: securityd
+# starts a new SecurityAgent for the next queued prompt. Stop at the first kill that finds none (at most 5).
+# SIGKILL: a SecurityAgent showing a prompt ignores SIGTERM (cmux12s, 2026-09-27).
+GUI_UNLOCK_SCRIPT = ('/usr/bin/security unlock-keychain -p "" "$1" || exit 1\n'
+                     'n=0\n'
+                     'while [ "$n" -lt 5 ] && /usr/bin/pkill -KILL -x SecurityAgent; do n=$((n + 1)); sleep 1; done\n'
+                     'exit 0\n')
+
+
 def unlock_test_keychain_in_gui(home: Path, uid: int | None = None) -> str:
-    """Unlock the test keychain in the GUI (Aqua) security session too. Unlock state is per security session,
-    and each runner's LaunchAgent has SessionCreate, so the job-started unlock never reaches the desktop:
-    there the user's default keychain stays locked and Spotlight asks for its password over UI tests.
-    A LaunchAgent limited to Aqua runs the unlock in that session: RunAtLoad covers every login, and the
-    kickstart here covers a keychain made since. Best effort; without a GUI login there is nothing to fix."""
+    """Unlock the test keychain in the GUI (Aqua) security session too, and cancel keychain prompts queued there
+    while it was locked. Unlock state is per security session, and each runner's LaunchAgent has SessionCreate,
+    so the job-started unlock never reaches the desktop: there the user's default keychain stays locked and
+    Spotlight or assistantd asks for its password over UI tests. A LaunchAgent limited to Aqua runs the unlock in
+    that session: RunAtLoad covers every login, and the kickstart here covers a keychain made since.
+    Daemons ask for the default keychain within seconds of login, often before that agent runs, and securityd
+    keeps such a prompt up after the unlock (cmux14 and cmux8s, 2026-09-27: queued at the 09-26 reboot, still up
+    the next morning). So the agent then kills SecurityAgent until no queued prompt restarts it. On a PR mini
+    no keychain prompt is ever wanted. Best effort; without a GUI login there is nothing to fix."""
     uid = os.getuid() if uid is None else uid
     keychain = os.fspath(home / "Library/Keychains" / TEST_KEYCHAIN)
     plist = home / "Library/LaunchAgents" / f"{GUI_UNLOCK_LABEL}.plist"
     data = plistlib.dumps({"Label": GUI_UNLOCK_LABEL, "LimitLoadToSessionType": "Aqua", "RunAtLoad": True,
-                           "ProgramArguments": ["/usr/bin/security", "unlock-keychain", "-p", "", keychain]},
+                           "ProgramArguments": ["/bin/sh", "-c", GUI_UNLOCK_SCRIPT, "sh", keychain]},
                           sort_keys=True)
 
     def launchctl(*args: str) -> int:
         return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True, timeout=15).returncode
 
     try:
+        service = f"gui/{uid}/{GUI_UNLOCK_LABEL}"
         if not plist.is_file() or plist.read_bytes() != data:
             plist.parent.mkdir(parents=True, exist_ok=True)
             aside = plist.with_name(f".{plist.name}.{os.getpid()}")
             aside.write_bytes(data)
             os.replace(aside, plist)  # runner instances write it at once
-        service = f"gui/{uid}/{GUI_UNLOCK_LABEL}"
+            launchctl("bootout", service)  # a loaded agent keeps its old program until it is loaded again
         # Not loaded yet: bootstrap runs it (RunAtLoad). Another instance may bootstrap first: kickstart again.
         if launchctl("kickstart", service) and launchctl("bootstrap", f"gui/{uid}", os.fspath(plist)) \
                 and launchctl("kickstart", service):
