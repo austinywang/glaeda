@@ -780,7 +780,8 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
   capacity-mode runners. `touch ~/.config/glaeda/idle-warm.disabled` stops it on one mini.
 - **Which root.** The hook's own prediction (`warm_root_costs`) of each root's compile for main's head, from
   the seed prefetch's mirror and the job-written model: a rebuild root first, then far, then one it could not
-  compare, then one with no kept build (a cold build), skipping any already built or tried for that head. Three failed builds in a row pause it for six hours.
+  compare, then one with no kept build (a cold build), skipping any already built or tried for that head. When the hook can compare no root at all (every kept stamp predates the fields it reads, as on the light
+  minis after a quiet spell), every root counts as one it could not compare, so one catch-up per root re-stamps it. Three failed builds in a row pause it for six hours.
 - **How.** It loads the hook the runners run (from their `glaeda-hooks/`) and refuses if that hook predates
   the yield below, so a rollout in either order is safe. Under `capacity/admission.lock` it takes the root's
   token, a persistent-dd token and a compile's units, with the host lock shared, writes

@@ -128,8 +128,14 @@ class GateTest(Base):
                  "root-3": {"tier": "far", "app_swift_files": 7}}
         ranked = types.SimpleNamespace(warm_root_costs=lambda order, base, number, state: (order, mixed))
         self.assertEqual(warm.pick_root(ranked, 3, HEAD, self.state, {"roots": []})[0], 3, "far before unknown, cold")
-        cold = types.SimpleNamespace(warm_root_costs=lambda *args: ([], {}))
-        self.assertIn("cannot compare", warm.pick_root(cold, 2, HEAD, self.state, {}))
+        blind = types.SimpleNamespace(warm_root_costs=lambda *args: ([], {}))
+        root, guess = warm.pick_root(blind, 2, HEAD, self.state, {})
+        self.assertEqual(root, 1, "the hook compared nothing (a stamp older than its fields): warm anyway")
+        self.assertEqual(guess["root-2"]["tier"], "unknown")
+        self.assertEqual(warm.pick_root(blind, 2, HEAD, self.state, {"roots": {"1": {"head": HEAD}}})[0], 2)
+        self.assertIn("near", warm.pick_root(blind, 2, HEAD, self.state,
+                                             {"roots": {"1": {"head": HEAD}, "2": {"head": HEAD}}}),
+                      "once per root per head")
 
 
 class AttemptTest(Base):

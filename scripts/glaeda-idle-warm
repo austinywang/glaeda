@@ -23,7 +23,8 @@ It runs only when all of these hold, cheapest check first, and says which one st
   * 1-minute load under LOAD_PER_CORE per core, thermal pressure nominal, at least MIN_FREE_BYTES free,
     no reservation or fleet build on the host lock;
   * a root whose kept build the hook predicts far or rebuild for main's head (the seed prefetch's mirror),
-    not already built or failed for that head, outside a failure backoff.
+    or any root when the hook can compare none, not already built or failed for that head, outside a
+    failure backoff.
 Then it takes that root's token, a persistent-dd token and a compile's units through the capacity ledger, under
 admission.lock, with the host lock shared, exactly as a compile admission would, and writes WARM_HOLDER before
 letting admission.lock go. Every job's admission stops it (SIGTERM) and waits for those locks; on SIGTERM it
@@ -251,7 +252,12 @@ def pick_root(hook: Any, roots: int, head: str, state: Path, memory: dict[str, A
     order = list(range(roots))
     ranked, predicted = hook.warm_root_costs(order, head, None, os.fspath(state))
     if not ranked:
-        return "cannot compare the kept builds with main's head (no mirror, model or stamp)"
+        # The hook compares nothing when no kept build carries the stamp fields it reads, as on a light mini
+        # whose last owned compile predates them (cmux-austin-mini-0/1: 261 of 261 runs on 2026-09-26 stopped
+        # here). Rank every root unknown instead: one catch-up per root per head stamps it in the current
+        # format, so the hook compares it from then on.
+        predicted = {f"root-{copy + 1}": {"tier": "unknown", "app_swift_files": -1,
+                                          "why": "the hook could not compare any kept build"} for copy in order}
     done = memory.get("roots")
     done = done if isinstance(done, dict) else {}
     far = []
