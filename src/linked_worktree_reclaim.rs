@@ -339,8 +339,8 @@ impl LinkedWorktreeReclaimPlan {
 ///
 /// # Errors
 ///
-/// Refuses facts whose last activity is in the future relative to `now_seconds`, or whose idle
-/// arithmetic would overflow. Disagreeing clocks are not evidence a decision should rest on.
+/// Refuses facts whose idle arithmetic would overflow. Activity newer than `now_seconds` is
+/// planned as recently active, never as idle.
 pub fn plan_linked_worktree_reclaim(
     facts: &LinkedWorktreeFacts,
     policy: LinkedWorktreeReclaimPolicy,
@@ -381,9 +381,9 @@ pub fn plan_linked_worktree_reclaim(
     let idle_seconds = now_seconds
         .checked_sub(facts.last_activity_seconds)
         .ok_or_else(idle_overflow)?;
-    if idle_seconds < 0 {
-        return Err(future_timestamp());
-    }
+    // Activity newer than the clock reading is recent by definition. A sweep reads the clock once
+    // and then observes for many minutes on a loaded host, so a worktree touched meanwhile shows
+    // up here; a clock stepped backwards keeps worktrees too, which is the safe direction.
     let window = policy.window_for(facts.work_state);
     if idle_seconds < window {
         vetoes.push(LinkedWorktreeReclaimVeto::RecentlyActive);
@@ -1475,6 +1475,12 @@ fn parse_newest_reflog_entry(tail: &[u8]) -> Result<Option<i64>, LinkedWorktreeR
 /// Namespace for commits pinned before their only worktree is removed.
 pub const LINKED_WORKTREE_PIN_REF_PREFIX: &str = "refs/glaeda/worktree-pins/";
 
+/// Deadline for each constant-cost Git command of a reclaim sweep: reads, plus the `update-ref`
+/// pins and branch deletions, which are safer finished than killed partway. See
+/// [`ProjectCheckoutObserver::with_command_timeout`]. The sweep runs in the background, where a
+/// read that answers in 30 seconds beats a worktree that stays unobservable for another hour.
+pub const LINKED_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Deadline for one `git worktree remove`, which scales with ignored build output in the tree.
 pub const LINKED_WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -1949,14 +1955,6 @@ const fn invalid_index() -> LinkedWorktreeReclaimError {
     )
 }
 
-const fn future_timestamp() -> LinkedWorktreeReclaimError {
-    error(
-        LinkedWorktreeReclaimErrorKind::DisagreeingEvidence,
-        "future_timestamp",
-        "the observed worktree activity is newer than the supplied clock reading",
-    )
-}
-
 const fn idle_overflow() -> LinkedWorktreeReclaimError {
     error(
         LinkedWorktreeReclaimErrorKind::Overflow,
@@ -2165,13 +2163,18 @@ mod tests {
     }
 
     #[test]
-    fn future_activity_is_disagreeing_evidence() {
+    fn activity_after_the_clock_reading_is_recent() {
         let facts = LinkedWorktreeFacts {
             last_activity_seconds: NOW + 1,
             ..clean_idle()
         };
-        let error = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect_err("future");
-        assert_eq!(error.code(), "future_timestamp");
+        assert_eq!(
+            plan_linked_worktree_reclaim(&facts, policy(), NOW)
+                .expect("plan")
+                .decision()
+                .vetoes(),
+            &[LinkedWorktreeReclaimVeto::RecentlyActive]
+        );
     }
 
     #[test]
