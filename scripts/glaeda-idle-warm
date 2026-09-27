@@ -20,7 +20,7 @@ It runs only when all of these hold, cheapest check first, and says which one st
   * glaeda runners in capacity mode (--capacity-units), none trusted-only (a seeder), whose deployed hook yields
     to jobs (its WARM_HOLDER); the hook is loaded from the runner, so the model and locks are the ones jobs use;
   * no job or build running (Runner.Worker, xcodebuild) and none started or ended in the last IDLE_S;
-  * 1-minute load under LOAD_PER_CORE per core, thermal pressure nominal, at least MIN_FREE_BYTES free,
+  * 1-minute load under LOAD_PER_CORE per core, thermal pressure nominal,
     no reservation or fleet build on the host lock;
   * a root whose kept build the hook predicts far or rebuild for main's head (the seed prefetch's mirror),
     or any root when the hook can compare none, not already built or failed for that head, outside a
@@ -74,9 +74,6 @@ BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
 # catch-up costs the job at most the 5 s yield and never counts as a failure (settle_attempt).
 IDLE_S = 180
 LOAD_PER_CORE = 0.25
-# The job admission floor (100 GiB, mini-fleet.json disk.min_free_gib) plus a cold compile (up to 36 GiB):
-# a catch-up never leaves the mini refusing jobs on disk.
-MIN_FREE_BYTES = 136 * 1024**3
 BUILD_TIMEOUT_S = 45 * 60
 GIT_TIMEOUT_S = 1800  # the first clone of cmux and its submodules
 # Commits of main the checkout keeps: the head the seed prefetch mirror names (minutes behind main) plus the
@@ -220,12 +217,8 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     level = hook.thermal_pressure_level()
     if level is None or level > 0:
         return f"thermal pressure {level if level is not None else 'unknown'}"
-    try:
-        free = shutil.disk_usage(state).free
-    except OSError:
-        return "cannot read free disk"
-    if free < MIN_FREE_BYTES:
-        return f"{free / 1024**3:.0f} GiB free, under {MIN_FREE_BYTES / 1024**3:.0f}"
+    # No free-disk gate of its own: a catch-up rebuilds a kept root in place, and disk-pressure keeps the
+    # fleet's free-space policy (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming).
     host_lock = os.fspath(FLEET_DIR / "host.lock")
     held = hook.host_held(host_lock, os.fspath(FLEET_DIR / "reservation.json"), now)
     if held:
