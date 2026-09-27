@@ -338,7 +338,12 @@ WARM_NOT_APP = ("cmuxTests/", "cmuxUITests/")
 # The model fitted on 223 admissions of 2026-09-25/26 (cmux scripts/ci/warm-distance-model.json), used
 # until a job has copied one to this mini.
 WARM_DEFAULT_MODEL = {"near_app_swift_files": 5, "hot_files": [],
-                      "tiers": {"near": 140.0, "far": 266.5, "rebuild": 400.7}, "unknown": 309.7}
+                      "tiers": {"near": 140.0, "far": 266.5, "rebuild": 400.7}, "kept": {}, "unknown": 309.7}
+# Every root the hook compares starts from its kept build, and a kept start compiles faster than the tier's
+# mix of kept and seed starts (a near one about 90 s against 140 s). cmux's model keeps the p50 per tier and
+# start kind (tiers_by_start, with counts); a tier's kept cell costs a root once it has this many compiles,
+# as cmux warm_distance.py predict() does (MIN_START_ROWS).
+WARM_MIN_START_ROWS = 5
 
 
 def warm_app_swift(path: str) -> bool:
@@ -360,7 +365,18 @@ def read_warm_model(state_dir: str = "") -> dict[str, Any]:
         hot = [str(path) for path in model.get("hot_files") or [] if isinstance(path, str)][:200]
         near = int(model.get("near_app_swift_files") or 5)
         unknown = seconds(((model.get("start_classes") or {}).get("none") or {}).get("expected") or tiers["far"])
-        return {"near_app_swift_files": near, "hot_files": hot, "tiers": tiers, "unknown": unknown}
+        kept = {}
+        by_start = model.get("tiers_by_start")
+        for name in tiers:
+            try:  # a model without tiers_by_start, a sparse cell or a bad one: that tier's p50
+                cell = by_start[name]["kept"]
+                count = cell["n"]
+                if isinstance(count, int) and not isinstance(count, bool) and count >= WARM_MIN_START_ROWS \
+                        and not isinstance(cell["p50"], bool) and seconds(cell["p50"]) > 0:
+                    kept[name] = seconds(cell["p50"])
+            except Exception:  # noqa: BLE001
+                pass
+        return {"near_app_swift_files": near, "hot_files": hot, "tiers": tiers, "kept": kept, "unknown": unknown}
     except Exception:  # noqa: BLE001 - a model any job can write only ever falls back to the default
         return dict(WARM_DEFAULT_MODEL)
 
@@ -425,7 +441,8 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
     """ORDER with the root of the lowest predicted compile first, and the per-root predictions; ([], {}) to fall back.
 
     A root's prediction is the tier of main's changes from its kept build's merge base to BASE plus the kept
-    pull request's own files (unless it is pull request NUMBER). The job's own files are the same for every
+    pull request's own files (unless it is pull request NUMBER), at that tier's kept-start p50 when the model
+    has one (read_warm_model()). The job's own files are the same for every
     root and are left out, so the exported seconds are a lower bound; roots of one tier rank by that file
     count, then the runner's own root. A kept build that cannot be compared (a base past the mirror's depth,
     a stamp of an older cmux) costs the model's unknown start; a root with no kept build at all goes last.
@@ -471,7 +488,7 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
         count = len(changed) + extra
         hot = bool(changed & set(model["hot_files"]))
         name = ("rebuild" if package or hot else "far" if count > model["near_app_swift_files"] else "near")
-        costs[copy] = (model["tiers"][name], name, count)
+        costs[copy] = (model["kept"].get(name, model["tiers"][name]), name, count)
         known += 1
     if not known:
         return [], {}

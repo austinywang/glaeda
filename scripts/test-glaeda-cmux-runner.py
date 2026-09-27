@@ -1097,6 +1097,36 @@ class HookTest(unittest.TestCase):
                                                                 "rebuild": {"p50": 300}}}))
         order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
         self.assertEqual((order, predicted["root-2"]["tier"], predicted["root-1"]["seconds"]), ([0, 1], "rebuild", 200.0))
+        # Parity with cmux warm_distance.predict(): a root starts from its kept build, so a tier's kept cell costs
+        # it once the cell has 5 compiles; a sparse or bad cell, or a model without tiers_by_start, costs the tier.
+        def cells(near_kept: dict) -> None:
+            (ci / hook.WARM_MODEL).write_text(json.dumps({
+                "near_app_swift_files": 5, "hot_files": ["Sources/Q.swift"],
+                "tiers": {"near": {"p50": 100}, "far": {"p50": 200}, "rebuild": {"p50": 300}},
+                "tiers_by_start": {"near": {"kept": near_kept, "seed": {"n": 50, "p50": 150}},
+                                   "far": {"kept": {"n": 5, "p50": 120.5}, "seed": {"n": 9, "p50": 250}},
+                                   "rebuild": {"kept": {"n": 4, "p50": 250}}}}))
+
+        cells({"n": 5, "p50": 95})
+        model = hook.read_warm_model(os.fspath(ci))
+        self.assertEqual(model["kept"], {"near": 95.0, "far": 120.5})  # rebuild's cell has 4 compiles
+        self.assertEqual(model["tiers"], {"near": 100.0, "far": 200.0, "rebuild": 300.0})
+        order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
+        self.assertEqual((predicted["root-1"]["seconds"], predicted["root-2"]["seconds"]), (120.5, 300.0))
+        self.assertEqual(order, [0, 1])
+        order, predicted = hook.warm_root_costs([0, 1], new, 5, os.fspath(ci))  # both near on a re-push
+        self.assertEqual(predicted["root-1"], {"seconds": 95.0, "tier": "near", "app_swift_files": 3})
+        for bad in ({"n": 4, "p50": 95}, {"n": 5, "p50": -1}, {"n": 5, "p50": True}, {"n": True, "p50": 95},
+                    {"n": 5}, {"n": "5", "p50": 95}, [], None):
+            cells(bad)
+            model = hook.read_warm_model(os.fspath(ci))
+            self.assertEqual((model["kept"].get("near"), model["kept"]["far"], model["tiers"]["near"]),
+                             (None, 120.5, 100.0), bad)
+        self.assertEqual(hook.read_warm_model(os.fspath(self.dir / "nowhere"))["kept"], {})
+        (ci / hook.WARM_MODEL).write_text(json.dumps({"near_app_swift_files": 5, "hot_files": ["Sources/Q.swift"],
+                                                      "tiers": {"near": {"p50": 100}, "far": {"p50": 200},
+                                                                "rebuild": {"p50": 300}}}))
+        self.assertEqual(hook.read_warm_model(os.fspath(ci))["kept"], {})
         for junk in ("[" * 1000, '{"tiers": {"near": {"p50": NaN}, "far": {"p50": 1}, "rebuild": {"p50": 2}}}',
                      '{"tiers": {"near": {"p50": -1}, "far": {"p50": 1}, "rebuild": {"p50": 2}}}'):
             (ci / hook.WARM_MODEL).write_text(junk)
