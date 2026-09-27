@@ -521,11 +521,15 @@ def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
 # Read-only: the tail of the runner hook's per-job log (glaeda-cmux-job/v1; only "completed" lines, or lines with no
 # event from older hooks, carry the host record; "started" and "refused" lines are dropped on the host, so the
 # 400-line tail still holds about 400 completed records). A line cut
-# at the front by tail -c fails to parse and is skipped. @console is ioreg's console session lines (the runner
-# hook refuses GUI jobs while it is locked or has no user, cmuxterm-hq#757); only its state and user name leave.
+# at the front by tail -c fails to parse and is skipped. @stuck keeps the refusals for a user testmanagerd that
+# outlived SIGKILL (glaeda-cmux-runner-hook recycle_testmanagerd): every XCTest run on that mini would hang.
+# @console is ioreg's console session lines (the runner hook refuses GUI jobs while it is locked or has no user,
+# cmuxterm-hq#757); only its state and user name leave.
 JOBS_SCRIPT = (
     "echo @jobs; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
     "| grep -v -e '\"event\":\"started\"' -e '\"event\":\"refused\"' | tail -n 400 | tail -c 1048576; echo; "
+    "echo @stuck; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
+    "| grep -e '\"event\":\"refused\"' | grep -e 'testmanagerd: stuck' | tail -n 20; echo; "
     "echo @console; /usr/sbin/ioreg -n Root -d1 2>/dev/null | grep -e '\"IOConsoleUsers\" =' -e '\"IOConsoleLocked\" =' "
     "| cut -c1-65536; "
     "echo @now; date +%s"
@@ -551,8 +555,13 @@ def parse_jobs(stdout: str, at: int) -> dict[str, Any]:
     contended = [r for r in records if r.get("verdict") == "contended"]
     newest = sorted(contended, key=lambda r: -(num(r.get("ended_at")) or 0))[:MAX_CONTENDED_JOBS]
     console = runner_hook().parse_console_users("\n".join(sections.get("console", [])))
+    stuck = sorted((num(r.get("at")) or 0 for r in json_lines(sections.get("stuck", []))
+                    if r.get("schema") == "glaeda-cmux-job/v1" and r.get("event") == "refused"
+                    and "testmanagerd: stuck" in str(r.get("decision") or "") and (num(r.get("at")) or 0) >= since),
+                   reverse=True)
     return {"reachable": True, "observed_at": at, "count": len(records), "contended": len(contended),
             "console": None if console is None else {"state": console.state, "user": clean(console.user, 64) or None},
+            "testmanagerd_stuck": len(stuck), "testmanagerd_stuck_at": (int(stuck[0]) + skew) if stuck else None,
             "jobs": [{"job": clean(r.get("job") or "?", 60), "run_id": clean(r.get("run_id"), 32) or None,
                       "runner": clean(r.get("runner"), 60) or None, "seconds": num(r.get("seconds")),
                       "ended_at": (int(r["ended_at"]) + skew) if num(r.get("ended_at")) is not None else None,
@@ -1126,6 +1135,16 @@ class Builder:
                              self.action(member, "unlock_console", "person", None,
                                          note="log the console user in and turn off the screen lock and display "
                                               "sleep; the gui runner listens again within a minute (cmuxterm-hq#757)"))
+            stuck = int(num(row.get("testmanagerd_stuck")) or 0)
+            if stuck:
+                m["jobs"]["testmanagerd_stuck"] = stuck
+                self.finding("jobs", "testmanagerd_stuck", "warn",
+                             f"{stuck} XCTest job(s) refused in 24 h: the runner user's testmanagerd outlived "
+                             "SIGKILL, so every XCTest run here would hang", member,
+                             stamp_of(row.get("testmanagerd_stuck_at")) or at,
+                             self.action(member, "show_testmanagerd", "agent",
+                                         "/usr/bin/pgrep -lf testmanagerd", safe=True,
+                                         note="a person decides on a logout or reboot; the hook never does either"))
             if contended:
                 latest = m["jobs"]["contended_jobs"][0] if m["jobs"]["contended_jobs"] else {}
                 why = "; ".join(latest.get("reasons") or []) or "no reason recorded"

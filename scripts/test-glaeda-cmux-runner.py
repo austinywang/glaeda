@@ -17,6 +17,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import shlex
 import signal
 import shutil
@@ -1308,6 +1309,175 @@ time.sleep(60)
             self.assertIsNone(hook.mini_full(capacity, 4))
         finally:
             for runner in runners:
+                self.finish(runner)
+
+    def fake_process(self, name: str, target: str, *args: str) -> int:
+        """Start `self.dir/bin/NAME args` (a symlink to target, so ps shows that path) detached from this
+        process, so launchd or init reaps it as it would the real daemon. Returns its pid."""
+        link = self.dir / "bin" / name
+        link.parent.mkdir(exist_ok=True)
+        if not link.is_symlink():
+            link.symlink_to(target)
+        out = subprocess.run(["/bin/sh", "-c", '"$@" </dev/null >/dev/null 2>&1 & echo $!', "sh", os.fspath(link), *args],
+                             capture_output=True, text=True, timeout=10, check=True).stdout
+        pid = int(out.strip())
+
+        def stop() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+        self.addCleanup(stop)
+        return pid
+
+    def own_tests(self) -> tuple[str, str]:
+        """Only this test's fake xctest counts as a running test: real ones and other tests' stay out of it."""
+        return ("--xctest-pattern", re.escape(os.fspath(self.dir / "bin")) + r"/xctest(?:\s|$)")
+
+    def wait_gone(self, pid: int, seconds: float = 5.0) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not hook.pid_alive(pid):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_gui_token_jobs_recycle_testmanagerd_when_no_test_runs(self) -> None:
+        self.fleet()
+        program = os.fspath(self.dir / "bin" / "testmanagerd")
+        recycle = ("--recycle-testmanagerd", "--testmanagerd-program", program, *self.own_tests())
+        try:
+            daemon = self.fake_process("testmanagerd", "/bin/sleep", "60")
+            light = self.job("swift-package-tests", "t0", 4, None, *recycle)
+            self.assertEqual(light.returncode, 0, light.stdout)
+            self.assertNotIn("testmanagerd", light.stdout, "a job without the gui token leaves it")
+            self.assertTrue(hook.pid_alive(daemon))
+            # a test in flight on the mini (another runner's xctest) keeps it
+            xctest = self.fake_process("xctest", "/bin/sleep", "60")
+            kept = self.job("cli-product-tests", "t1", 4, None, *recycle)
+            self.assertEqual(kept.returncode, 0, kept.stdout)
+            self.assertIn("testmanagerd: kept (a test is running on this mini)", kept.stdout)
+            self.assertTrue(hook.pid_alive(daemon))
+            self.finish("t1")
+            os.kill(xctest, 9)
+            self.assertTrue(self.wait_gone(xctest))
+            shard = self.job("app-host-unit-tests", "t2", 4, None, *recycle)
+            self.assertEqual(shard.returncode, 0, shard.stdout)
+            self.assertRegex(shard.stdout, rf"testmanagerd: (stopped|killed) pid {daemon}\b")  # killed: a slow exit
+            self.assertTrue(self.wait_gone(daemon))
+            self.finish("t2")
+            # none running: launchd starts one at the next test
+            none = self.job("app-host-unit-tests", "t3", 4, None, *recycle)
+            self.assertIn("testmanagerd: not running", none.stdout)
+            self.finish("t3")
+            # a wedged daemon that ignores SIGTERM is killed
+            ready = self.dir / "ready"
+            (self.dir / "bin" / "testmanagerd").unlink()
+            wedged = self.fake_process("testmanagerd", "/bin/sh", "-c",
+                                       f"trap '' TERM; : > {shlex.quote(os.fspath(ready))}; while :; do sleep 1; done")
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            killed = self.job("cli-product-tests", "t4", 4, None, *recycle)
+            self.assertEqual(killed.returncode, 0, killed.stdout)
+            self.assertIn(f"testmanagerd: killed pid {wedged} (it ignored SIGTERM)", killed.stdout)
+            self.assertTrue(self.wait_gone(wedged))
+        finally:
+            for runner in ("t0", "t1", "t2", "t3", "t4"):
+                self.finish(runner)
+
+    def test_take_gui_recycles_testmanagerd_for_the_tests(self) -> None:
+        self.fleet()
+        e2e = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-e2e.yml@refs/heads/main"}
+        program = os.fspath(self.dir / "bin" / "testmanagerd")
+        try:
+            build = self.job("build", "e0", 8, None, "--recycle-testmanagerd", "--testmanagerd-program", program,
+                             *self.own_tests(), env=e2e)
+            self.assertEqual(build.returncode, 0, build.stdout)
+            self.assertNotIn("testmanagerd", build.stdout, "compile-gui takes the gui token later")
+            daemon = self.fake_process("testmanagerd", "/bin/sleep", "60")
+            took = self.take_gui("e0", "--recycle-testmanagerd", "--testmanagerd-program", program, *self.own_tests())
+            self.assertEqual(took.returncode, 0, took.stderr)
+            self.assertEqual(took.stdout.strip(), "")
+            self.assertRegex(took.stderr, rf"take-gui: testmanagerd: (stopped|killed) pid {daemon}\b")
+            self.assertTrue(self.wait_gone(daemon))
+        finally:
+            self.finish("e0")
+
+    def test_a_testmanagerd_that_outlives_sigkill_refuses_the_job(self) -> None:
+        self.assertIsNone(hook.XCTEST_RUNNING.search("/usr/bin/xcodebuild build -scheme cmux"))
+        self.assertIsNone(hook.XCTEST_RUNNING.search("/x/Debug/cmuxCLITests.xctest"))
+        for busy in ("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xctest /x/a.xctest",
+                     "/usr/bin/xcodebuild test-without-building -xctestrun a", "xcodebuild -scheme cmux test"):
+            self.assertIsNotNone(hook.XCTEST_RUNNING.search(busy), busy)
+        daemon, root = (4242, os.getuid(), "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
+
+        def recycle(*tables, error=None):
+            """recycle_testmanagerd against ps tables in turn (the last repeats), with os.kill recorded."""
+            seq = list(tables)
+            ps = mock.Mock(side_effect=error or (lambda: seq.pop(0) if len(seq) > 1 else seq[0]))
+            with mock.patch.object(hook, "_ps_table", ps), mock.patch.object(hook.os, "kill") as kill, \
+                    mock.patch.object(hook, "TESTMANAGERD_TERM_S", 0.3), mock.patch.object(hook, "TESTMANAGERD_KILL_S", 0.3):
+                return hook.recycle_testmanagerd(), [c.args for c in kill.call_args_list]
+
+        term, kill = hook.signal.SIGTERM, hook.signal.SIGKILL
+        note, kills = recycle([daemon, root])
+        self.assertEqual(note, f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL")
+        self.assertEqual(kills, [(4242, term), (4242, kill)], "only this user's daemon")
+        # a zombie is gone: an impostor whose parent never reaps it cannot make the mini refuse every job
+        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "Z", hook.TESTMANAGERD)])[0],
+                         "testmanagerd: stopped pid 4242")
+        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "SE", hook.TESTMANAGERD)])[0],
+                         "testmanagerd: stopped pid 4242", "exiting (macOS ps E) counts as gone")
+        # a test that starts while it ignores SIGTERM keeps it: no SIGKILL under a live run
+        note, kills = recycle([daemon], [daemon, (7, os.getuid(), "S", "/x/usr/bin/xctest /x/a.xctest")])
+        self.assertEqual(note, "testmanagerd: kept pid 4242 (ignored SIGTERM; a test started)")
+        self.assertEqual(kills, [(4242, term)])
+        self.assertEqual(recycle([], error=ValueError("bad bytes"))[0], "testmanagerd: not checked (ValueError)")
+        self.assertEqual(recycle(None)[0], "testmanagerd: not checked (ps failed)")
+        # ps failing after the signal is no proof it is stuck: never SIGKILL or refuse on a guess
+        note, kills = recycle([daemon], None)
+        self.assertEqual((note, kills), ("testmanagerd: sent SIGTERM to pid 4242 (not confirmed: ps failed)", [(4242, term)]))
+        note = f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL"
+        # job-started refuses and lets its capacity go: the hook itself, with only the daemon's answer stubbed
+        self.fleet()
+        stub = ("import importlib.machinery,importlib.util,sys\n"
+                f"loader=importlib.machinery.SourceFileLoader('h',{os.fspath(HOOK)!r})\n"
+                "spec=importlib.util.spec_from_loader('h',loader);h=importlib.util.module_from_spec(spec)\n"
+                "loader.exec_module(h)\n"
+                f"h.recycle_testmanagerd=lambda *a: {note!r}\n"
+                "sys.exit(h.main(sys.argv[1:]))\n")
+        push = event(self.dir, "push", {"repository": CMUX})
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), "GITHUB_EVENT_NAME": "push",
+                   "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux",
+                   "GITHUB_JOB": "app-host-unit-tests", "RUNNER_NAME": "s0"}
+        refused = subprocess.run([sys.executable, "-c", stub, "job-started", "--allowed-repo", "manaflow-ai/cmux",
+                                      "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                                      "--watch-pid", str(os.getpid()), "--capacity-units", "4",
+                                      "--capacity-dir", os.fspath(self.dir / "capacity"), "--recycle-testmanagerd"],
+                                     env=environ, capture_output=True, text=True, timeout=30, check=False)
+        try:
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn(f"refused: {note}", refused.stdout)
+            # no job-completed for s0 yet: the refusal itself let the gui token and root go
+            again = self.job("app-host-unit-tests", "s1", 4, None, "--gui-wait", "0")
+            self.assertEqual(again.returncode, 0, "the refused job let the gui token and root go: " + again.stdout)
+        finally:
+            self.finish("s0")
+            self.finish("s1")
+
+    def test_capacity_product_job_holds_the_gui_token(self) -> None:
+        # cli-product-tests runs XCTest through the same testmanagerd as the gui jobs: one at a time per mini
+        self.fleet()
+        try:
+            product = self.job("cli-product-tests", "p0")
+            self.assertEqual(product.returncode, 0, product.stdout)
+            self.assertIn("units+gui+root-1 for cli-product-tests (product", product.stdout)
+            self.finish("p0")
+            self.assertEqual(self.job("app-host-unit-tests", "p1").returncode, 0)
+            refused = self.job("cli-product-tests", "p2", 4, None, "--gui-wait", "0")
+            self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
+        finally:
+            for runner in ("p0", "p1", "p2"):
                 self.finish(runner)
 
     def test_capacity_gui_job_waits_for_the_gui_token(self) -> None:
@@ -3310,7 +3480,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--capacity-units 4 --compile-slots 2 --canonical-roots 2 --instance 0",
                       (hooks / "job-started.sh").read_text())  # instance 0 prefers root 1
         self.assertNotIn("--trusted-ref", (hooks / "job-started.sh").read_text())
-        self.assertIn("--test-keychain", (hooks / "job-started.sh").read_text())
+        self.assertIn("--test-keychain --recycle-testmanagerd", (hooks / "job-started.sh").read_text())
+        self.assertIn("--recycle-testmanagerd \"$@\"", (hooks / "glaeda-canonical-root").read_text(), "take-gui too")
         manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {
             "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
         path.write_text(json.dumps(manifest))
@@ -3318,6 +3489,8 @@ class RunnerTest(unittest.TestCase):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", (hooks / "job-started.sh").read_text())
         self.assertNotIn("--test-keychain", (hooks / "job-started.sh").read_text(), "a secret-holding host keeps its keychains")
+        self.assertNotIn("--recycle-testmanagerd", (hooks / "job-started.sh").read_text() +
+                         (hooks / "glaeda-canonical-root").read_text(), "a trusted-ref host runs no PR XCTest")
 
     def test_the_last_instance_is_the_gui_runner_with_only_the_gui_pool_label(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))

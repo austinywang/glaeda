@@ -800,6 +800,42 @@ class JobsTests(unittest.TestCase):
         self.assertEqual(fs.jobs_line(self.member(doc, "mini-b")["jobs"]), "no job records; console NO USER")
         self.assertIn("console LOCKED", fs.render_text(doc))
 
+    def test_a_stuck_testmanagerd_refusal_warns(self):
+        stuck = {"schema": "glaeda-cmux-job/v1", "event": "refused", "at": AT - 300, "job": "app-host-unit-tests",
+                 "decision": "testmanagerd: stuck: pid 4242 outlived SIGKILL"}
+        old = {**stuck, "at": AT - 3 * 86400}
+        other = {**stuck, "decision": "capacity: the gui token is taken"}
+        stdout = ("@jobs\n" + json.dumps(job_record()) + "\n@stuck\n" + "\n".join(json.dumps(r) for r in (stuck, old, other))
+                  + "\n@now\n" + str(AT) + "\n")
+        row = fs.parse_jobs(stdout, AT)
+        self.assertEqual((row["count"], row["testmanagerd_stuck"], row["testmanagerd_stuck_at"]), (1, 1, AT - 300))
+        doc = build(jobs=src({"hosts": {"mini-a": row}}))
+        [f] = by_id(doc, "jobs.testmanagerd_stuck@mini-a")
+        self.assertEqual(f["severity"], "warn")
+        self.assertIn("1 XCTest job(s) refused in 24 h", f["summary"])
+        self.assertEqual(f["action"]["command"], "ssh -- mini-a '/usr/bin/pgrep -lf testmanagerd'")
+        self.assertTrue(f["action"]["safe_to_apply"])
+        quiet = build(jobs=src({"hosts": {"mini-a": fs.parse_jobs(jobs_stdout(job_record()), AT)}}))
+        self.assertFalse(by_id(quiet, "jobs.testmanagerd_stuck"))
+
+    def test_jobs_script_keeps_only_stuck_testmanagerd_refusals(self):
+        with tempfile.TemporaryDirectory() as home:
+            logs = Path(home) / "Library" / "Logs"
+            logs.mkdir(parents=True)
+            compact = {"separators": (",", ":")}  # as the hook writes them
+            lines = [json.dumps(job_record(event="refused", decision="capacity: the gui token is taken"), **compact),
+                     json.dumps(job_record(event="refused", decision="testmanagerd: stuck: pid 1 outlived SIGKILL"),
+                                **compact),
+                     json.dumps(job_record(event="completed"), **compact)]
+            (logs / "glaeda-cmux-jobs.jsonl").write_text("\n".join(lines) + "\n")
+            out = subprocess.run(["/bin/sh", "-c", fs.JOBS_SCRIPT], env={"HOME": home, "PATH": "/usr/bin:/bin"},
+                                 capture_output=True, text=True, timeout=30).stdout
+        jobs, _, stuck = out.partition("@stuck")
+        self.assertEqual(jobs.count('"event":"completed"'), 1)
+        self.assertNotIn("refused", jobs)
+        self.assertEqual(stuck.count("testmanagerd: stuck"), 1)
+        self.assertNotIn("gui token", stuck)
+
     def test_jobs_probe_is_read_only_and_skips_never_touch(self):
         seen = []
         with mock.patch.object(fs, "jobs_host", side_effect=lambda h, u: seen.append(h) or {"reachable": True}):

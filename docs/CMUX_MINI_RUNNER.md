@@ -121,8 +121,9 @@ What `--apply` does:
      `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
      test-e2e's `build` (compile, then the selected tests in the console session) 2 units
      (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
-     unit plus the `gui` token,
-     `cli-product-tests`, `swift-package-tests` and the side lanes `cli-pipe-regressions`,
+     unit plus the `gui` token, `cli-product-tests` 1 unit plus the `gui` token (its XCTest
+     run shares the user's testmanagerd with the GUI jobs, see 2h2),
+     `swift-package-tests` and the side lanes `cli-pipe-regressions`,
      `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
      as a compile. When units or a token are taken it refuses at once with
      `refused: capacity: ...`, which the refusal rescue re-runs elsewhere; it never
@@ -483,7 +484,8 @@ in at the producer's root. So one root job per root per mini:
 - Root jobs are compile (macos-compile-admission and any unknown job id), compile-gui (test-e2e's `build`:
   a producer that takes the gui token later, in its own step with take-gui, and no persistent-dd: it only
   clones its root's kept state, which the root token already guards), gui (app-host-unit-tests,
-  tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests).
+  tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests,
+  which also holds the gui token).
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
 - Light jobs take no root.
@@ -598,6 +600,29 @@ can read it.
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.
+
+## 2h2. A fresh testmanagerd for each XCTest job
+
+Every macOS XCTest run on a mini goes through the runner user's `/usr/libexec/testmanagerd`, a launchd agent
+started on demand. On cmux7s (2026-09-25) it stopped half way through tearing down a control session. From
+then on it accepted xcodebuild's control connections without creating the IDE session, and every XCTest
+run there failed after about 7.5 minutes with `The test runner hung before establishing connection` (exit 65)
+for ten hours. `launchctl kickstart` is refused under SIP, and the wedged daemon ignored SIGTERM.
+
+- On PR runners (`--recycle-testmanagerd`, baked in beside `--test-keychain`), a job that takes the gui
+  token stops the user's testmanagerd, and launchd starts a fresh one at the job's first test. It happens at
+  job start for a job that holds the gui token from admission (gui and product jobs), and in `take-gui`
+  for test-e2e's `build`, whose tests start after it. The admission line (or take-gui's stderr) ends with
+  `testmanagerd: stopped pid N`, `killed pid N (it ignored SIGTERM)`, `not running` or `kept`.
+- It is kept while any `xctest` or `xcodebuild test`/`test-without-building` runs on the mini. The gui
+  token keeps the console-session XCTest jobs apart; this check covers the rest: `swift test` (xctest) in
+  swift-package-tests and the light side lanes, the simulator jobs' xcodebuild, and guests.
+- SIGTERM first; after 3 s, SIGKILL unless a test has started meanwhile (then it is kept for that run).
+  Zombies count as gone. A daemon that outlives SIGKILL by 5 s refuses the job
+  (`refused: testmanagerd: stuck: ...`) and frees its capacity, so the refusal rescue runs it elsewhere.
+  `glaeda-fleet-status` reports such refusals as `jobs.testmanagerd_stuck`; a person decides on a logout
+  or reboot.
+- The simulators' own testmanagerd (under the iOS runtime root) is never touched.
 
 ## 2i. Seeds over the LAN from the trusted seeder
 

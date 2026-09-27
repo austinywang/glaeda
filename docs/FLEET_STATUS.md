@@ -163,6 +163,7 @@ or the host?
 | `contended` (warn) | at least one job in 24 h ran contended | `tail -n 20 ~/Library/Logs/glaeda-cmux-jobs.jsonl` (safe) |
 | `console_locked` (warn) | the console session is screen-locked | a person unlocks it and turns off the lock |
 | `console_no_user` (warn) | nobody is logged in at the console | a person logs the console user in |
+| `testmanagerd_stuck` (warn) | in 24 h the hook refused an XCTest job because the user's testmanagerd outlived SIGKILL ([CMUX_MINI_RUNNER.md](CMUX_MINI_RUNNER.md), 2h2); the probe keeps those `refused` lines apart | `/usr/bin/pgrep -lf testmanagerd` (safe); a person decides on a logout or reboot |
 | `probe_failed` (info) | the probe timed out | a refresh |
 
 The same probe reads the console session from `ioreg -n Root -d1` (member field

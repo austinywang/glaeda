@@ -153,11 +153,14 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly.yml", "build-nightly-app"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
+# product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
+# holds the gui token too: one XCTest run at a time per mini, which lets a gui job restart that daemon
+# (recycle_testmanagerd) without cutting another job's run.
 # compile-gui takes no gui token at job start: the step that decides whether the build tests takes it with
 # glaeda-canonical-root take-gui (cmux#14705), and leaves the tests to test-e2e's `test` job when take-gui gives
 # way or times out. So its compile leaves the console session to other GUI jobs.
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
-    "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("root",)),
+    "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)),
     "isolated": (2, ()), "simulator": (2, ("simulator",)), "light": (1, ()), "seed": (2, ())}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
@@ -893,6 +896,109 @@ def runner_worker_pid() -> int | None:
 ROOT_SHIM = "glaeda-canonical-root"
 
 
+# The user's testmanagerd (a launchd agent started on demand) pairs xcodebuild with the xctest it launches.
+# On cmux7s (2026-09-25) it stopped half way through tearing down a control session and from then on
+# accepted xcodebuild's control connections without creating the IDE session, so every macOS XCTest run
+# there hung ("The test runner hung before establishing connection", exit 65) for 10 hours. launchctl
+# kickstart is refused under SIP, and the wedged daemon ignored SIGTERM. So a job taking the gui token
+# (every console-session XCTest job holds it) stops the daemon while no test runs, and launchd starts a
+# fresh one at the next connection. The simulators' own testmanagerd runs from the runtime root, not here.
+TESTMANAGERD = "/usr/libexec/testmanagerd"
+TESTMANAGERD_TERM_S = 3.0
+TESTMANAGERD_KILL_S = 5.0
+TESTMANAGERD_STUCK = "testmanagerd: stuck"
+# A process that may be talking to testmanagerd: an XCTest runner, or xcodebuild testing. A false match only
+# keeps the daemon, so these err wide.
+XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
+
+
+def _ps_table() -> list[tuple[int, int, str, str]] | None:
+    """(pid, uid, state, command) for every process, or None when ps fails. Arguments of other jobs' processes
+    are read to decide, never printed."""
+    try:
+        out = subprocess.run(["/bin/ps", "-Aww", "-o", "pid=,uid=,stat=,command="], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, errors="replace", timeout=5, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), parts[2], parts[3].strip()))
+    return rows
+
+
+def recycle_testmanagerd(program: str = TESTMANAGERD, busy: re.Pattern[str] = XCTEST_RUNNING) -> str:
+    """Stop this user's testmanagerd unless a test is running, so the next test starts a fresh one.
+    Returns a note, never raises. A daemon that outlives SIGKILL gives a note starting TESTMANAGERD_STUCK."""
+    try:
+        return _recycle_testmanagerd(program, busy)
+    except Exception as error:  # noqa: BLE001  (a failed recycle leaves the daemon; it never fails the job)
+        return f"testmanagerd: not checked ({type(error).__name__})"
+
+
+def _recycle_testmanagerd(program: str, test_running: re.Pattern[str]) -> str:
+    uid, me = os.getuid(), os.getpid()
+
+    def survey() -> tuple[set[int], bool] | None:
+        """This user's live daemons and whether a test runs. A zombie (Z) is gone: its parent just has not reaped
+        it; so is one macOS ps marks as exiting (E), which a loaded mini can take seconds to finish."""
+        rows = _ps_table()
+        if rows is None:
+            return None
+        daemons, busy = set(), False
+        for pid, owner, state, command in rows:
+            if pid == me or state.startswith("Z") or "E" in state:
+                continue
+            if owner == uid and (command == program or command.startswith(program + " ")):
+                daemons.add(pid)
+            elif test_running.search(command):
+                busy = True
+        return daemons, busy
+
+    first = survey()
+    if first is None:
+        return "testmanagerd: not checked (ps failed)"
+    daemons, busy = first
+    if not daemons:
+        return "testmanagerd: not running (launchd starts it at the next test)"
+    if busy:
+        return "testmanagerd: kept (a test is running on this mini)"
+    pids = " ".join(map(str, sorted(daemons)))
+
+    def left_of(wait_s: float) -> tuple[set[int], bool] | None:
+        """The daemons still alive after up to wait_s, and whether a test runs; None when ps failed last."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            now = survey()
+            alive = daemons & now[0] if now is not None else daemons
+            if (now is not None and not alive) or time.monotonic() >= deadline:
+                return None if now is None else (alive, now[1])
+            time.sleep(0.2)
+
+    for pid in daemons:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    after = left_of(TESTMANAGERD_TERM_S)
+    if after is None:  # unconfirmed: never SIGKILL or refuse on a guess
+        return f"testmanagerd: sent SIGTERM to pid {pids} (not confirmed: ps failed)"
+    alive, running = after
+    if not alive:
+        return f"testmanagerd: stopped pid {pids}"
+    killed = " ".join(map(str, sorted(alive)))
+    if running:  # a test started meanwhile and may be talking to it: leave it to that run
+        return f"testmanagerd: kept pid {killed} (ignored SIGTERM; a test started)"
+    for pid in alive:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    after = left_of(TESTMANAGERD_KILL_S)
+    if after is None:
+        return f"testmanagerd: sent SIGKILL to pid {killed} (not confirmed: ps failed)"
+    if after[0]:
+        return f"{TESTMANAGERD_STUCK}: pid {' '.join(map(str, sorted(after[0])))} outlived SIGKILL"
+    return f"testmanagerd: killed pid {killed} (it ignored SIGTERM)"
+
+
 TEST_KEYCHAIN = "cmux-ci.keychain-db"
 
 
@@ -1058,12 +1164,14 @@ def gui_holder_wants(capacity_dir: Path, roots: list[str]) -> str | None:
     return None
 
 
-def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
+def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path, recycle: str | None = None,
+             busy: re.Pattern[str] = XCTEST_RUNNING) -> int:
     """glaeda-canonical-root take-gui: hold this mini's gui token (one console session) for the rest of this
     job, waiting up to wait_s. A job that already holds it (from admission) is a no-op. Exits 0 when held, 1
     when still taken after the wait, TAKE_GUI_GAVE_WAY when the holder waits for a root this job holds (see
     TAKE_GUI_GAVE_WAY: the caller then leaves its console-session work to another job) or when the console session
-    is locked or has no user (console_refusal), 2 outside a job."""
+    is locked or has no user (console_refusal), 2 outside a job.
+    With `recycle` (the testmanagerd program), a newly taken token also restarts testmanagerd for its tests."""
     if not os.environ.get("RUNNER_NAME"):
         print(f"{PREFIX}: take-gui: RUNNER_NAME is not set (not a runner job step)", file=sys.stderr)
         return 2
@@ -1107,6 +1215,8 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
         release_holder(main.with_name(f"{main.stem}-gui.pid"))
         print(f"{PREFIX}: take-gui: cannot record the gui token ({type(error).__name__})", file=sys.stderr)
         return 1
+    if recycle:  # stdout stays empty for callers; a stuck daemon is only reported here, the tests will show it
+        print(f"{PREFIX}: take-gui: {recycle_testmanagerd(recycle, busy)}", file=sys.stderr)
     return 0
 
 
@@ -2825,6 +2935,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
     p.add_argument("--test-keychain", action="store_true",
                    help="give the job an unlocked, passwordless default keychain for tests (PR runner minis)")
+    p.add_argument("--recycle-testmanagerd", action="store_true",
+                   help="job-started, take-gui: a job taking the gui token restarts the user's testmanagerd "
+                        "while no test runs (PR runner minis); a daemon that outlives SIGKILL refuses the job")
+    p.add_argument("--testmanagerd-program", default=TESTMANAGERD, help=argparse.SUPPRESS)
+    p.add_argument("--xctest-pattern", type=re.compile, default=XCTEST_RUNNING, help=argparse.SUPPRESS)
     p.add_argument("--job-log", type=Path, default=JOB_LOG, help=argparse.SUPPRESS)
     p.add_argument("--min-free-gib", type=float, default=0, help="refuse a job below this much free disk")
     p.add_argument("--require-eligible", action="store_true",
@@ -2864,7 +2979,8 @@ def main(argv: list[str] | None = None) -> int:
             p.error("take-root needs --root")
         return take_root(args.root, args.wait, args.capacity_dir, args.state_dir, args.canonical_roots, args.switch)
     if args.phase == "take-gui":
-        return take_gui(args.wait, args.capacity_dir, args.state_dir)
+        return take_gui(args.wait, args.capacity_dir, args.state_dir,
+                        args.testmanagerd_program if args.recycle_testmanagerd else None, args.xctest_pattern)
     if args.phase == "check":
         why, want = node_refusal(args.fleet_class)
         if not why:
@@ -2955,6 +3071,13 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"
+        testmanagerd = None
+        if args.recycle_testmanagerd and gui_file(args.state_dir).exists():
+            testmanagerd = recycle_testmanagerd(args.testmanagerd_program, args.xctest_pattern)
+            if testmanagerd.startswith(TESTMANAGERD_STUCK):  # every XCTest run here would hang: go elsewhere
+                release_host_lock(args.state_dir)
+                return refused(testmanagerd)
+            note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
         if args.test_keychain:
             print(f"{PREFIX}: {ensure_test_keychain(Path.home())}", flush=True)
@@ -2965,6 +3088,8 @@ def main(argv: list[str] | None = None) -> int:
                 meta.update(decision=f"{reason}; {note}"[:400], wait_s=round(time.monotonic() - admit_start, 1),
                             units=taken.get("units"), roots=held_roots(args.state_dir),
                             gui=gui_file(args.state_dir).exists(), instance=args.instance)
+                if testmanagerd:
+                    meta["testmanagerd"] = testmanagerd[:120]
                 job_event("started", meta, args.job_log)
             except Exception:  # noqa: BLE001
                 pass

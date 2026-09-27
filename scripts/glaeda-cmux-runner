@@ -422,6 +422,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     python = shlex.quote(ctx.python or "/usr/bin/python3")
     hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
     scope = f"--allowed-owner {shlex.quote(ctx.org)}" if ctx.org else f"--allowed-repo {shlex.quote(ctx.repo or '')}"
+    recycle = ""
     if ctx.min_free_gib:
         scope += f" --min-free-gib {ctx.min_free_gib:g}"
     if ctx.member:  # a fleet member runs PR jobs only while it is an eligible node on its class toolchain
@@ -433,6 +434,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
                       f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
         else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
             scope += " --test-keychain"
+            # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)
+            recycle = " --recycle-testmanagerd"
+            scope += recycle
     if ctx.capacity_units:  # every runner on this mini shares these units (the hook's capacity ledger)
         scope += f" --capacity-units {int(ctx.capacity_units)}"
         slots = int((ctx.member or {}).get("compileSlots") or 1)
@@ -518,7 +522,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "case \"${1:-}\" in\n"
         "take) [ -n \"${2:-}\" ] || usage; root=$2; shift 2\n"
         f"    exec {python} {hook} take-root --root \"$root\" --canonical-roots {roots_n}{dirs} \"$@\" ;;\n"
-        f"take-gui) shift; exec {python} {hook} take-gui{dirs} \"$@\" ;;\n"
+        f"take-gui) shift; exec {python} {hook} take-gui{dirs}{recycle} \"$@\" ;;\n"
         "*) usage ;;\n"
         "esac\n"
     )
