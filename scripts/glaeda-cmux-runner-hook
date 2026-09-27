@@ -1172,6 +1172,9 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if not ok:
         print(f"{PREFIX}: take-root: {note}", file=sys.stderr)
         return 1
+    settled = settle_root(k)
+    if settled:
+        print(f"{PREFIX}: take-root: {settled}", file=sys.stderr)
     if held and not extra:  # a switch: ROOT is held, so the old roots can go, after the record stops naming them
         with contextlib.suppress(OSError):
             roots_file(state_dir).write_text(name + "\n")
@@ -1194,6 +1197,92 @@ def retake(path: Path) -> int | None:
     last try that meets a probe must not be the one that fails the job."""
     time.sleep(PROBE_RETRY_S)
     return lock_file(path, fcntl.LOCK_EX)
+
+
+# A root's token is free once its job is gone, but not every process of that job is. When a step ignores the
+# runner's SIGINT and SIGTERM, the runner kills the step's process tree, and processes xcodebuild started that are
+# no longer in that tree (its build service and compilers) keep working in the root for seconds after
+# job-completed released the token (manaflow-ai/cmux 36312829569: a cancelled compile's leftovers were still
+# writing <root>/src when the next holder, a test consumer, ran rm -rf on it: "Directory not empty"). So a job
+# that takes a root stops this user's leftovers still using it before the job goes on: a process working in the
+# root (lsof cwd) or naming a path inside it (ps) that no live job owns. A process under a live Runner.Worker is
+# spared even so: a job that switched roots (take --switch) may still name its old root in a running step's
+# arguments. The hook itself (its detached holders, and take-root waiters, which may name the root with a
+# trailing slash) is spared too. Tests point ROOT_PARENT at a temporary directory, so they never touch this
+# machine's own roots.
+ROOT_PARENT = os.environ.get("GLAEDA_CANONICAL_ROOT_PARENT") or "/private/tmp"
+ROOT_SETTLE_TERM_S = 3.0  # SIGTERM first, then SIGKILL
+ROOT_SETTLE_S = 15.0
+ROOT_SETTLE_POLL_S = 0.2
+ROOT_SETTLE_SPARED = ("glaeda-cmux-runner-hook", ROOT_SHIM)
+
+
+def settle_path(k: int) -> str:
+    return os.path.join(ROOT_PARENT, os.path.basename(canonical_root(k)))
+
+
+def root_users(path: str) -> list[int] | None:
+    """This user's leftover processes working in root `path` or naming a path inside it: none under a live
+    Runner.Worker, and not the hook. None when ps cannot tell."""
+    inside, uid = path.rstrip("/") + "/", str(os.getuid())
+    try:
+        listing = subprocess.run([PS, "-U", uid, "-ww", "-o", "pid=,ppid=,command="], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=10, check=False, env={"LC_ALL": "C"}).stdout
+        cwds = subprocess.run([LSOF, "-nP", "-w", "-a", "-u", uid, "-d", "cwd", "-Fpn"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    parent: dict[int, int] = {}
+    command: dict[int, str] = {}
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            parent[int(parts[0])], command[int(parts[0])] = int(parts[1]), parts[2] if len(parts) == 3 else ""
+    if not parent:
+        return None
+    users = {pid for pid, argv in command.items() if inside in argv}
+    pid = 0
+    for line in cwds.splitlines():
+        if line[:1] == "p" and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line[:1] == "n" and pid in command and (line[1:] == path or line[1:].startswith(inside)):
+            users.add(pid)
+
+    def in_live_job(pid: int) -> bool:
+        for _ in range(256):
+            if pid <= 1 or pid not in command:
+                return False
+            if os.path.basename(command[pid].split(" ", 1)[0]) == "Runner.Worker":
+                return True
+            pid = parent[pid]
+        return True  # a loop in the table: leave it alone
+
+    return sorted(pid for pid in users if pid != os.getpid() and not in_live_job(pid)
+                  and not any(name in command[pid] for name in ROOT_SETTLE_SPARED))
+
+
+def settle_root(k: int) -> str:
+    """Stop the leftover processes still using root k (root_users) before this job uses it; a note for the log."""
+    path = settle_path(k)
+    if not os.path.lexists(path):
+        return ""
+    start = time.monotonic()
+    stopped: set[int] = set()
+    while True:
+        users = root_users(path)
+        if users is None:
+            return f"cannot list the processes using {path}"
+        if not users:
+            return f"stopped {len(stopped)} leftover process(es) in {path}" if stopped else ""
+        elapsed = time.monotonic() - start
+        if elapsed >= ROOT_SETTLE_S:
+            return f"{len(users)} leftover process(es) still use {path} (pids {', '.join(map(str, users[:8]))})"
+        signum = signal.SIGTERM if elapsed < ROOT_SETTLE_TERM_S else signal.SIGKILL
+        for pid in users:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signum)
+        stopped.update(users)
+        time.sleep(ROOT_SETTLE_POLL_S)
 
 
 def holder_alive(pid_file: Path) -> bool:
@@ -3131,6 +3220,10 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"
+        for root in held_roots(args.state_dir):
+            settled = settle_root(int(root.rsplit("-", 1)[1]))
+            if settled:
+                note += f"; {settled}"
         testmanagerd = None
         if args.recycle_testmanagerd and gui_file(args.state_dir).exists():
             testmanagerd = recycle_testmanagerd(args.testmanagerd_program, args.xctest_pattern)

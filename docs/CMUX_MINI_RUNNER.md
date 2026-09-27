@@ -540,6 +540,15 @@ in at the producer's root. So one root job per root per mini:
   detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
   same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is
   still busy after the wait, and 2 for a bad root or outside a runner job.
+- A root's token comes free when its job ends, but its processes may not have. A step that ignores the
+  runner's SIGINT and SIGTERM has its process tree killed, and what xcodebuild started outside that tree
+  (its build service and compilers) keeps writing the root for seconds (cmux run 36312829569: the next
+  holder's `rm -rf <root>/src` failed with "Directory not empty"). So whenever a job takes a root, at
+  admission or with `take`, the hook first stops this user's leftovers still using it: a process with a
+  working directory in the root (lsof) or an argument naming a path inside it (ps) that is under no live
+  Runner.Worker. SIGTERM, then SIGKILL after 3 s, for up to 15 s. Processes of live jobs are spared (a
+  job that switched roots may still name its old one), and so is the hook itself. The admission line or
+  take-root's stderr says `stopped N leftover process(es) in <root>`.
 - A producer's root this mini does not have (a product compiled at `/private/tmp/cmux-ci-2` on a two-root
   mini, restored on a one-root mini) is still a valid path to alias: nothing compiles there on this mini.
   Every taker holds that root's `root-N.token`, so two jobs never own its alias at once. A consumer that

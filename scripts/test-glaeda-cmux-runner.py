@@ -34,6 +34,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "scripts" / "glaeda-cmux-runner-hook"
 WORKER_STEP_EXIT = "runner-worker-step-exit "  # the Runner.Worker stand-in's last stdout line (HookTest.take)
+# Where the hook looks for leftover processes in canonical roots (settle_root): nowhere real, so no test run
+# stops a process in this machine's own /private/tmp/cmux-ci. test_taking_a_root_stops_its_leftovers sets its own.
+NO_ROOTS = "/nonexistent/glaeda-test-canonical-roots"
 
 
 def load(name: str, path: Path):
@@ -239,7 +242,7 @@ class HookTest(unittest.TestCase):
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
-                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
         if event_name is not None:
             environ["GITHUB_EVENT_NAME"] = event_name
         if event_path is not None:
@@ -417,7 +420,7 @@ class HookTest(unittest.TestCase):
         result = subprocess.run([sys.executable, os.fspath(lonely / "glaeda-cmux-runner-hook"), "job-started",
                                  "--allowed-repo", "manaflow-ai/cmux", "--no-disk"], capture_output=True, text=True,
                                 timeout=30, env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir),
-                                                 "GLAEDA_FLEET_DIR": os.fspath(fleet), "GITHUB_EVENT_NAME": "push",
+                                                 "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet), "GITHUB_EVENT_NAME": "push",
                                                  "GITHUB_EVENT_PATH": os.fspath(push),
                                                  "GITHUB_REPOSITORY": "manaflow-ai/cmux"})
         self.assertEqual(result.returncode, 1)
@@ -583,13 +586,11 @@ class HookTest(unittest.TestCase):
     def take_gui(self, runner: str, *extra: str) -> subprocess.CompletedProcess:
         return self.step(["take-gui", *extra], runner)
 
-    def step(self, argv: list[str], runner: str, env: dict | None = None) -> subprocess.CompletedProcess:
-        """Run a hook phase as a job step would: under a process named Runner.Worker (its ancestor).
-        A real Runner.Worker outlives the step and the root holder watches it, so the stand-in reports
-        the step's exit status and then stays up until the test ends; one that exited with the step
-        would let the holder release the root within HOLDER_POLL_S."""
+    def runner_worker(self) -> Path:
+        """A real parent process named Runner.Worker (a copied /bin/sh is killed on macOS): it runs /bin/sh with
+        its arguments, reports the exit status and stays up until its stdin closes."""
         worker = self.dir / "Runner.Worker"
-        if not worker.exists():  # a real parent process named Runner.Worker (a copied /bin/sh is killed on macOS)
+        if not worker.exists():
             source = self.dir / "worker.c"
             source.write_text("#include <fcntl.h>\n#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>\n"
                               "int main(int c, char **v) {\n"
@@ -604,11 +605,19 @@ class HookTest(unittest.TestCase):
             if cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
                                             capture_output=True).returncode != 0:
                 self.skipTest("no C compiler to build a Runner.Worker stand-in")
+        return worker
+
+    def step(self, argv: list[str], runner: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        """Run a hook phase as a job step would: under a process named Runner.Worker (its ancestor).
+        A real Runner.Worker outlives the step and the root holder watches it, so the stand-in reports
+        the step's exit status and then stays up until the test ends; one that exited with the step
+        would let the holder release the root within HOLDER_POLL_S."""
+        worker = self.runner_worker()
         cmd = " ".join(shlex.quote(a) for a in [sys.executable, os.fspath(HOOK), *argv,
                                                 "--capacity-dir", os.fspath(self.dir / "capacity"),
                                                 "--state-dir", os.fspath(self.dir / "state")])
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "RUNNER_NAME": runner,
-                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), **(env or {})}
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), **(env or {})}
         proc = subprocess.Popen([os.fspath(worker), "-c", cmd], env=environ, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.end_worker, proc)
@@ -665,6 +674,81 @@ class HookTest(unittest.TestCase):
             for runner in ("p0", "c0", "c1"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
+
+    def test_taking_a_root_stops_its_leftovers(self) -> None:
+        # manaflow-ai/cmux 36312829569: a cancelled compile's processes outlived the runner's tree kill and its
+        # job, still writing /private/tmp/cmux-ci/src when a test consumer took root-1 and ran rm -rf on it
+        self.fleet()
+        parent = Path(os.path.realpath(self.dir)) / "roots"  # lsof reports resolved paths
+        env = {"GLAEDA_CANONICAL_ROOT_PARENT": os.fspath(parent)}
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        (self.dir / "capacity").mkdir()
+        for name in ("cmux-ci/src", "cmux-ci-2/derived", "cmux-ci-20"):
+            (parent / name).mkdir(parents=True)
+
+        def sleeper(*words: str) -> list[str]:  # one process, whose arguments stay what ps shows
+            return [sys.executable, "-c", "import time; time.sleep(60)", *words]
+
+        def leftover(argv: list[str], cwd: Path) -> int:
+            """An orphan, like a killed step's compilers: its parent exits at once, so it is under no Runner.Worker
+            even when this test runs in a GitHub Actions job."""
+            started = subprocess.run([sys.executable, "-c", "import subprocess, sys; print(subprocess.Popen("
+                                      "sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                                      "stderr=subprocess.DEVNULL, start_new_session=True).pid)", *argv],
+                                     cwd=cwd, capture_output=True, text=True, timeout=30, check=True)
+            pid = int(started.stdout)
+            self.addCleanup(end, pid)
+            return pid
+
+        def end(pid: int) -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+        def alive(pid: int, gone_within: float = 0.0) -> bool:
+            deadline = time.monotonic() + gone_within
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    return True
+                if time.monotonic() >= deadline:
+                    return True
+                time.sleep(0.05)  # a stopped orphan is reaped by its new parent, not by us
+
+        live_path = os.fspath(parent / "cmux-ci" / "derived" / "live.o")
+        # a running step of a live job that still names root 1 (a switcher that let it go keeps its arguments)
+        live = subprocess.Popen([os.fspath(self.runner_worker()), "-c", shlex.join(["exec", *sleeper(live_path)])],
+                                cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(live.wait)
+        self.addCleanup(live.stdin.close)
+        self.addCleanup(lambda: os.killpg(live.pid, signal.SIGKILL) if live.poll() is None else None)
+        working = leftover(sleeper(), parent / "cmux-ci" / "src")  # a compiler working in root 1
+        naming = leftover(sleeper(os.fspath(parent / "cmux-ci-2" / "derived" / "x.o")), self.dir)
+        neighbour = leftover(sleeper(), parent / "cmux-ci-20")  # a name that only starts like root 2
+        bystander = leftover(sleeper(os.fspath(parent / "cmux-ci")), self.dir)  # the root itself
+        try:
+            got = self.take("/private/tmp/cmux-ci", "c0", env=env)
+            self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci"), got.stderr)
+            self.assertIn("stopped 1 leftover process(es)", got.stderr)
+            self.assertFalse(alive(working, 5), "the process working in root 1 is stopped before the step goes on")
+            self.assertTrue(alive(naming), "root 2 is not this job's")
+            compile_ = self.job("macos-compile-admission", "p1", 8, None, *two, "--instance", "1", env=env)
+            self.assertIn("persistent-dd+root-2", compile_.stdout)
+            self.assertIn("stopped 1 leftover process(es)", compile_.stdout)
+            self.assertFalse(alive(naming, 5), "admission settles the root it takes as well")
+            for pid in (neighbour, bystander):
+                self.assertTrue(alive(pid), "neither another root's name nor the bare root path is inside it")
+            self.assertIsNone(live.poll(), "a live job's step is never a leftover")
+            found = subprocess.run(["/usr/bin/pgrep", "-f", live_path], capture_output=True, text=True).stdout
+            self.assertTrue(found.strip(), "nor is the process it runs")
+            quiet = self.take("2", "c1", "--wait", "0", env=env)
+            self.assertEqual(quiet.returncode, 1, "root 2 stays p1's")
+        finally:
+            for runner in ("c0", "p1", "c1"):
+                self.finish(runner)
 
     def test_one_root_consumer_restores_a_product_from_a_second_root(self) -> None:
         # manaflow-ai/cmux 36295033926: a product compiled at /private/tmp/cmux-ci-2 on a two-root mini, restored
@@ -892,7 +976,7 @@ class HookTest(unittest.TestCase):
         hooks.mkdir()
         shutil.copy(HOOK, hooks / "glaeda-cmux-runner-hook")
         (hooks / "glaeda-canonical-root").write_text("#!/bin/sh\n")
-        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_FLEET_DIR": os.fspath(fleet),
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet),
                    "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.dir, "push", {"repository": CMUX})),
                    "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "swift-package-tests", "RUNNER_NAME": "s0"}
         run = subprocess.run([sys.executable, os.fspath(hooks / "glaeda-cmux-runner-hook"), "job-started",
@@ -1506,7 +1590,7 @@ time.sleep(60)
                 "sys.exit(h.main(sys.argv[1:]))\n")
         push = event(self.dir, "push", {"repository": CMUX})
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
-                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), "GITHUB_EVENT_NAME": "push",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), "GITHUB_EVENT_NAME": "push",
                    "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux",
                    "GITHUB_JOB": "app-host-unit-tests", "RUNNER_NAME": "s0"}
         refused = subprocess.run([sys.executable, "-c", stub, "job-started", "--allowed-repo", "manaflow-ai/cmux",
@@ -3056,7 +3140,7 @@ class RunnerTest(unittest.TestCase):
                 result = subprocess.run(["/bin/bash", os.fspath(hooks / "job-started.sh")], capture_output=True,
                                         text=True, timeout=60, check=False, env={
                                             "PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home),
-                                            "GLAEDA_FLEET_DIR": os.fspath(self.home / "fleet"),
+                                            "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.home / "fleet"),
                                             "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": os.fspath(path),
                                             "GITHUB_REPOSITORY": (payload.get("repository") or {}).get("full_name", "")})
                 self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
@@ -3071,7 +3155,7 @@ class RunnerTest(unittest.TestCase):
         fleet = self.home / "fleet"
         fleet.mkdir()
         (fleet / "host.lock").touch()
-        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home), "GLAEDA_FLEET_DIR": os.fspath(fleet),
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home), "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet),
                "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.state, "push", SAMPLE_EVENTS["push"][1])),
                "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
         # No --watch-pid: the wrapper execs python, so the holder watches this test process, which lives on.
