@@ -629,7 +629,8 @@ Hook classes:
 - `mobile-core-package` and `ios-simulator-build` are `isolated` (2 units, own DerivedData or SwiftPM
   `.build`, no canonical root).
 - `ios-simulator` and `screenshots` are `simulator` (2 units plus the per-mini `simulator` token: they
-  reuse, erase and boot named devices in the user's one CoreSimulator service).
+  reuse, erase and boot named devices in the user's one CoreSimulator service). A job refused only for
+  that token waits `--gui-wait` (240 s) for it at job start, as a gui-token refusal does.
 - `validate` (ios-streamed-validate) stays on Blacksmith. It binds fixed ports, restarts a local Postgres
   under /tmp, changes the GUI session (open, launchctl setenv, system dark mode) and writes credentials
   to `$HOME`.

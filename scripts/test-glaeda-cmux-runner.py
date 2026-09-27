@@ -1292,9 +1292,17 @@ class HookTest(unittest.TestCase):
                 self.assertIn(f"holding 2/12 units for {job} (isolated", result.stdout)
             sim = self.job("ios-simulator", "i3", 12)
             self.assertIn("2/12 units+simulator for ios-simulator (simulator", sim.stdout)
-            second = self.job("screenshots", "i4", 12)
+            waited = time.monotonic()
+            second = self.job("screenshots", "i4", 12, None, "--gui-wait", "2")
             self.assertEqual(second.returncode, 1, "one simulator job per mini")
             self.assertIn("the simulator token is taken", second.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 2, "it waits for the token before it is refused")
+            self.finish("i4")
+            # the holder finishes within the wait: the waiting simulator job is admitted instead of refused
+            threading.Timer(1.0, self.finish, args=("i3",)).start()
+            later = self.job("screenshots", "i4", 12, None, "--gui-wait", "30")
+            self.assertEqual(later.returncode, 0, later.stdout)
+            self.assertIn("units+simulator for screenshots (simulator", later.stdout)
             self.assertIn("(validate is compile)", self.job("validate", "i5", 12).stdout,
                           "validate is unknown to the hook (compile class): it stays on Blacksmith")
         finally:

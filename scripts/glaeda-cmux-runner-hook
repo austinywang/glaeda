@@ -208,6 +208,11 @@ GUEST_POLL_S = 5.0
 # listener gate need not hold a root runner off for the gui token (hq#661 Workstream 7).
 GUI_WAIT_S = 240.0
 GUI_TOKEN_TAKEN = "capacity: the gui token is taken"
+# An iOS simulator job (ios-simulator, screenshots) refused only for the one simulator token waits the same
+# GUI_WAIT_S for it. Such a job holds it about 2 to 5 min (up to 12), and both such refusals on 2026-09-27
+# 14:00-17:30Z met a holder that finished within 4 min, while a refusal waits for its whole run to end before
+# the rescue re-runs it.
+SIMULATOR_TOKEN_TAKEN = "capacity: the simulator token is taken"
 # A side runner (an instance past --canonical-roots) listens while one unit is free, so a 2-unit isolated
 # side lane (cmux's release-build, reload-build, cmux-tui) can reach a mini with one unit left. A cmux job
 # refused there only for units waits for them for the same GUI_WAIT_S (--gui-wait): side-lane jobs are minutes
@@ -3263,7 +3268,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--guest-wait", type=float, default=GUEST_WAIT_S,
                    help="seconds a guest job waits for room on a full mini before it is refused")
     p.add_argument("--gui-wait", type=float, default=GUI_WAIT_S,
-                   help="seconds a home-repository job refused only for the gui token waits for it")
+                   help="seconds a home-repository job refused only for the gui or simulator token waits for it")
     p.add_argument("--allow-event", action="append", default=[],
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--trusted-ref", help="admit only push and schedule jobs on this ref (needs --trusted-repo)")
@@ -3407,14 +3412,15 @@ def main(argv: list[str] | None = None) -> int:
                                            warm_keys=job_warm_keys(event), taken_out=taken,
                                            warm_target=job_warm_target(event))
                 # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room.
-                # A cmux job refused only for the gui token waits for it too: the holder is a short GUI job.
+                # A cmux job refused only for the gui or simulator token waits for it too: the holder is a short job.
                 if held or not note.startswith("capacity:"):
                     break
-                # decided per try: a cmux job waits only while its latest refusal is the gui token, or, on a
+                # decided per try: a cmux job waits only while its latest refusal is the gui or simulator token, or, on a
                 # side runner (not the gui runner, whose gate holds it until a unit is free), units (UNITS_SHORT)
                 side = args.instance >= max(1, args.canonical_roots) and not args.gui_runner
                 wait = (args.guest_wait if guest else args.gui_wait
-                        if note.startswith(GUI_TOKEN_TAKEN) or side and UNITS_SHORT.match(note) else 0)
+                        if note.startswith((GUI_TOKEN_TAKEN, SIMULATOR_TOKEN_TAKEN)) or side and UNITS_SHORT.match(note)
+                        else 0)
                 left = start + wait - time.monotonic()
                 if left <= 0:
                     break
