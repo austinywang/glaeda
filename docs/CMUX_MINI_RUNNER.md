@@ -537,8 +537,11 @@ in at the producer's root. So one root job per root per mini:
   on a two-root mini; the admission line ends with `warm for <key>` when it did.
 - Before the exact keys, the hook ranks the free roots by predicted compile (cmux#14778,
   `warm_root_costs`): main's app Swift files between each kept build's merge base and the event's base
-  (the seed prefetch's blobless mirror `ci/.prefetch/cmux.git`, trees only, 5 s per diff), plus the kept
-  pull request's own files from its stamp (`pr_app_swift_files`) unless it is the same pull request, put
+  (the seed prefetch's blobless mirror `ci/.prefetch/cmux.git`, trees only, 3 s for all roots), plus the kept
+  pull request's own files from its stamp (`pr_app_swift_files`) and the job's own (the event's
+  `changed_files`, an upper bound), neither of which counts when the kept build is the same pull request's; a
+  build of the job's pull request parked on the root (`pr-builds/pr-<n>`, which admission swaps back in)
+  counts as that root's kept build. All that is put
   into the tiers of cmux's fitted model (`ci/warm-distance-model.json`, which admission copies there;
   near 140 s, far 267 s, rebuild 401 s by default). The cheapest root goes first, the runner's own root on
   a tie; the admission line ends with `predicted <s> s <tier>`, and the job gets the per-root predictions

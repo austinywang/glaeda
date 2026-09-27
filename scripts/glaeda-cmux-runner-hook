@@ -355,6 +355,8 @@ def warm_root_order(order: list[int], keys: tuple[str, ...], state_dir: str = ""
 # to the exact warm keys (warm_root_order). The model and stamps are written by jobs, so they are read as
 # untrusted and bounded, like the stamps above.
 WARM_MODEL = "warm-distance-model.json"
+WARM_PR_BUILDS = "pr-builds"
+WARM_PR_BUILD_HOURS = 6  # cmux owned_build_state.py PR_SLOT_HOURS: an older slot is never unparked
 WARM_MIRROR = os.path.join(".prefetch", "cmux.git")
 WARM_ROUTE_ENV = "GLAEDA_WARM_ROUTE"
 WARM_GIT_TIMEOUT_S = 2.0
@@ -421,10 +423,31 @@ def read_bounded(path: Path) -> bytes | None:
     return raw if len(raw) <= STAMP_MAX_BYTES else None
 
 
-def root_stamp(k: int, state_dir: str = "") -> dict[str, Any] | None:
-    """Root k's kept-build stamp when it is current (STATE_VERSION, DerivedData present), else None."""
+def root_stamp(k: int, state_dir: str = "", number: int | None = None) -> dict[str, Any] | None:
+    """Root k's kept-build stamp when it is current (STATE_VERSION, DerivedData present), else None.
+
+    With NUMBER, a build of that pull request parked on the root (cmux owned_build_state.py PR slots,
+    `pr-builds/pr-<n>`, which admission swaps back in before it reads the kept build) comes first, unless
+    the kept build is a main build, which admission keeps.
+    """
     base = Path(state_dir or OWNED_STATE_DIR)
     store = base if k == 1 else base / f"cmux-ci-{k}"
+    kept = root_stamp_at(store)
+    if number is not None and (kept is None or kept.get("pr")):
+        # admission's `check` swaps a parked build in only over another pull request's build (or none):
+        # a main build is never parked, so the job starts from it.
+        slot = store / WARM_PR_BUILDS / f"pr-{number}"
+        try:
+            fresh = time.time() - slot.stat().st_mtime <= WARM_PR_BUILD_HOURS * 3600
+        except OSError:
+            fresh = False
+        parked = root_stamp_at(slot) if fresh else None
+        if parked is not None and parked.get("pr") == number:
+            return parked
+    return kept
+
+
+def root_stamp_at(store: Path) -> dict[str, Any] | None:
     try:
         raw = read_bounded(store / "stamp.json")
         if raw is None or not (store / "derived-data").is_dir():
@@ -465,14 +488,16 @@ def main_changes(mirror: Path, old: str, new: str) -> tuple[set[str], bool] | No
     return files, package
 
 
-def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: str = "") -> tuple[list[int], dict]:
+def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: str = "",
+                    job_files: int = 0) -> tuple[list[int], dict]:
     """ORDER with the root of the lowest predicted compile first, and the per-root predictions; ([], {}) to fall back.
 
     A root's prediction is the tier of main's changes from its kept build's merge base to BASE plus the kept
-    pull request's own files (unless it is pull request NUMBER), at that tier's kept-start p50 when the model
-    has one (read_warm_model()). The job's own files are the same for every
-    root and are left out, so the exported seconds are a lower bound; roots of one tier rank by that file
-    count, then the runner's own root. A kept build that cannot be compared (a base past the mirror's depth,
+    pull request's own files and JOB_FILES, the job's own (the event's changed_files, an upper bound: the
+    mirror has no pull request heads), unless the kept build is pull request NUMBER's, which has both
+    built already (09-26: #14149's 124 files were predicted near from other pull requests' builds). It
+    costs that tier's kept-start p50 when the model has one (read_warm_model()). Roots of one tier rank
+    by that file count, then the runner's own root. A kept build that cannot be compared (a base past the mirror's depth,
     a stamp of an older cmux) costs the model's unknown start; a root with no kept build at all goes last.
     Falls back when no root could be compared, the mirror is missing, or WARM_BUDGET_S runs out.
     """
@@ -488,7 +513,7 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
     costs: dict[int, tuple[float, str, int]] = {}
     known = 0
     for copy in order:
-        stamp = root_stamp(copy + 1, state_dir)
+        stamp = root_stamp(copy + 1, state_dir, number)
         if stamp is None:
             costs[copy] = (cold, "cold", -1)
             continue
@@ -513,7 +538,7 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
         own_package = any(path.startswith(WARM_PACKAGE_SOURCES) for path in own_set) or extra > 0
         package = package or (own_package and interface is not False)
         changed = files | own_set
-        count = len(changed) + extra
+        count = len(changed) + extra + (0 if same else max(0, job_files))
         hot = bool(changed & set(model["hot_files"]))
         name = ("rebuild" if package or hot else "far" if count > model["near_app_swift_files"] else "near")
         costs[copy] = (model["kept"].get(name, model["tiers"][name]), name, count)
@@ -525,16 +550,18 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
                                          "app_swift_files": costs[copy][2]} for copy in order}
 
 
-def job_warm_target(event: Any) -> tuple[str, int | None]:
-    """A pull request event's base sha and number, or ("", None)."""
+def job_warm_target(event: Any) -> tuple[str, int | None, int]:
+    """A pull request event's base sha, number and changed file count, or ("", None, 0)."""
     pr = event.get("pull_request") if isinstance(event, dict) else None
     if not isinstance(pr, dict):
-        return "", None
+        return "", None, 0
     base = pr.get("base")
     sha = str(base.get("sha") or "").lower() if isinstance(base, dict) else ""
     number = pr.get("number")
     number = number if isinstance(number, int) and not isinstance(number, bool) and 0 < number < 10**9 else None
-    return (sha if WARM_SHA.fullmatch(sha) else ""), number
+    changed = pr.get("changed_files")
+    changed = changed if isinstance(changed, int) and not isinstance(changed, bool) and 0 <= changed < 10**6 else 0
+    return (sha if WARM_SHA.fullmatch(sha) else ""), number, changed
 
 
 def export_warm_route(route: dict) -> None:
@@ -1715,7 +1742,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
-                  warm_target: tuple[str, int | None] = ("", None), klass: str | None = None,
+                  warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log. klass, when given,
@@ -1794,7 +1821,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 own = instance % copies
                 order = [own, *(c for c in order if c != own)]
                 if job in WARM_JOBS:
-                    ranked, predicted = warm_root_costs(order, *warm_target, owned_state_dir)
+                    ranked, predicted = warm_root_costs(order, warm_target[0], warm_target[1], owned_state_dir,
+                                                        job_files=warm_target[2] if len(warm_target) > 2 else 0)
                     if ranked:
                         order, warm_route = ranked, {"predicted": predicted, "own": f"root-{own + 1}"}
                     else:

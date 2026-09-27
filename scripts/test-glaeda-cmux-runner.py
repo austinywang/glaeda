@@ -1227,8 +1227,52 @@ class HookTest(unittest.TestCase):
         (ci / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": old, "pr": 5}))
         order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
         self.assertEqual(predicted["root-1"]["tier"], "unknown")
-        self.assertEqual(hook.job_warm_target({"pull_request": {"base": {"sha": new.upper()}, "number": 5}}), (new, 5))
-        self.assertEqual(hook.job_warm_target({"pull_request": {"number": True}}), ("", None))
+        self.assertEqual(hook.job_warm_target({"pull_request": {"base": {"sha": new.upper()}, "number": 5,
+                                                                "changed_files": 12}}), (new, 5, 12))
+        self.assertEqual(hook.job_warm_target({"pull_request": {"number": True, "changed_files": "9"}}), ("", None, 0))
+
+    def test_warm_root_costs_count_the_job_and_find_its_parked_build(self) -> None:
+        ci = self.dir / "ci"
+        work = self.dir / "work"
+        work.mkdir()
+        git = ["git", "-C", os.fspath(work), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        (work / "A.swift").write_text("a")
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-qm", "0"], check=True)
+        base = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        (ci / ".prefetch").mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", os.fspath(work), os.fspath(ci / ".prefetch" / "cmux.git")],
+                       check=True)
+
+        def stamp(store: Path, pr: int) -> None:
+            (store / "derived-data").mkdir(parents=True, exist_ok=True)
+            (store / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base, "pr": pr,
+                                                          "pr_app_swift_files": ["Sources/X.swift"],
+                                                          "pr_package_interface": False}))
+
+        stamp(ci, 5)
+        stamp(ci / "cmux-ci-2", 6)
+        # The job's own 40 files make every other pull request's build far; its own build (root 1) stays near.
+        order, predicted = hook.warm_root_costs([1, 0], base, 5, os.fspath(ci), job_files=40)
+        self.assertEqual((order, predicted["root-1"]["tier"], predicted["root-2"]["tier"]), ([0, 1], "near", "far"))
+        self.assertEqual(predicted["root-2"]["app_swift_files"], 41)
+        # A build of pull request 7 parked on root 2 counts as its own build there.
+        stamp(ci / "cmux-ci-2" / "pr-builds" / "pr-7", 7)
+        order, predicted = hook.warm_root_costs([0, 1], base, 7, os.fspath(ci), job_files=40)
+        self.assertEqual((order, predicted["root-2"]["tier"]), ([1, 0], "near"))
+        # A parked stamp naming another pull request is not taken for this one.
+        stamp(ci / "cmux-ci-2" / "pr-builds" / "pr-8", 9)
+        self.assertEqual(hook.warm_root_costs([0, 1], base, 8, os.fspath(ci), job_files=40)[1]["root-2"]["tier"], "far")
+        # Over a main build admission keeps the main build, so the parked one does not count.
+        (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base}))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), None)
+        # An expired slot is never unparked either.
+        (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base,
+                                                                "pr": 6}))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 7)
+        os.utime(ci / "cmux-ci-2" / "pr-builds" / "pr-7", (1, 1))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 6)
 
     def test_job_warm_keys_come_from_the_pull_request(self) -> None:
         sha = "ABCDEF0123456789abcdef0123456789abcdef01"
