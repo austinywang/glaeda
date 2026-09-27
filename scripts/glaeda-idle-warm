@@ -79,6 +79,10 @@ LOAD_PER_CORE = 0.25
 MIN_FREE_BYTES = 136 * 1024**3
 BUILD_TIMEOUT_S = 45 * 60
 GIT_TIMEOUT_S = 1800  # the first clone of cmux and its submodules
+# Commits of main the checkout keeps: the head the seed prefetch mirror names (minutes behind main) plus the
+# 50 first-parent ancestors cmux's seed lookup walks (seed_derived_data.py ANCESTOR_LIMIT): a mirror up to 150
+# commits behind main still finds every seed candidate.
+CLONE_DEPTH = 200
 FAILURE_BACKOFF_S = 6 * 3600  # after FAILURES_TO_PAUSE failed builds in a row
 FAILURES_TO_PAUSE = 3
 KEEP_LOGS = 12
@@ -415,19 +419,26 @@ def git(checkout: Path, *args: str, timeout: int = GIT_TIMEOUT_S) -> None:
 
 
 def prepare_checkout(work: Path, head: str) -> None:
-    """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after."""
+    """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after.
+
+    Shallow and blobless: main's newest CLONE_DEPTH commits, their trees, and the blobs of what is checked
+    out; submodules at depth 1, as a job's checkout takes them. A full clone is 2.4 GB, and on
+    cmux-austin-mini-0 GitHub sent it at about 0.6 MB/s (0.9 GB in 25 minutes, 2026-09-27), so the
+    30-minute timeout ended every first clone and the next run started it over. The build reads only the
+    checkout, and the seed lookup only main's first 50 first-parent ancestors (CMUX_SEED_GIT_DIR); git fetches
+    any other blob on demand. Each fetch re-cuts the history at CLONE_DEPTH, so it stays small."""
     checkout = work / "cmux"
     if not (checkout / ".git").is_dir():
         shutil.rmtree(checkout, ignore_errors=True)
-        subprocess.run([GIT, "clone", "-q", "--no-checkout", REPO_URL, os.fspath(checkout)], check=True,
-                       capture_output=True, timeout=GIT_TIMEOUT_S,
+        subprocess.run([GIT, "clone", "-q", f"--depth={CLONE_DEPTH}", "--filter=blob:none", "--no-checkout",
+                        REPO_URL, os.fspath(checkout)], check=True, capture_output=True, timeout=GIT_TIMEOUT_S,
                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
-    git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    git(checkout, "fetch", "-q", f"--depth={CLONE_DEPTH}", "origin", "+refs/heads/main:refs/remotes/origin/main")
     git(checkout, "cat-file", "-e", f"{head}^{{commit}}", timeout=60)
     git(checkout, "-c", "advice.detachedHead=false", "checkout", "-q", "--force", "--detach", head)
     git(checkout, "clean", "-ffdxq")
     git(checkout, "submodule", "sync", "-q", "--recursive")
-    git(checkout, "submodule", "update", "-q", "--init", "--recursive", "--force")
+    git(checkout, "submodule", "update", "-q", "--init", "--recursive", "--force", "--depth=1")
     git(checkout, "submodule", "foreach", "-q", "--recursive", "git clean -ffdxq")
 
 

@@ -334,6 +334,43 @@ class YieldTest(Base):
         script.chmod(0o755)
 
 
+class CheckoutTest(unittest.TestCase):
+    def test_first_clone_is_shallow_blobless_and_checks_out_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source, work = Path(tmp) / "source", Path(tmp) / "work"
+            run = lambda *args, cwd=source: subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+            source.mkdir()
+            run("init", "-q", "-b", "main")
+            run("config", "uploadpack.allowFilter", "true")
+            for text in ("zero\n", "one\n"):  # two commits, so a depth-1 clone is shallow
+                (source / "a.txt").write_text(text)
+                run("add", "a.txt")
+                run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", text.strip())
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+            work.mkdir()
+            saved, saved_depth = warm.REPO_URL, warm.CLONE_DEPTH
+            self.addCleanup(setattr, warm, "CLONE_DEPTH", saved_depth)
+            warm.CLONE_DEPTH = 1
+            warm.REPO_URL = source.as_uri()
+            try:
+                warm.prepare_checkout(work, head)
+            finally:
+                warm.REPO_URL = saved
+            checkout = work / "cmux"
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n")
+            partial = subprocess.run(["git", "config", "remote.origin.partialclonefilter"], cwd=checkout,
+                                     capture_output=True, text=True).stdout.strip()
+            self.assertEqual(partial, "blob:none")
+            self.assertTrue((checkout / ".git" / "shallow").is_file())
+            warm.REPO_URL = source.as_uri()
+            try:
+                warm.prepare_checkout(work, head)  # the next run fetches into the kept clone
+            finally:
+                warm.REPO_URL = saved
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n")
+
+
 class NoEmDashTest(unittest.TestCase):
     def test_no_em_dashes(self) -> None:
         self.assertNotIn("—", (ROOT / "scripts" / "glaeda-idle-warm").read_text())
