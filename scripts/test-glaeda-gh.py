@@ -139,6 +139,10 @@ class FakeGitHub:
 
 class Base(unittest.TestCase):
     def setUp(self) -> None:
+        # watch files carry real mtimes, so the fake clock starts at each test, not at import:
+        # a test reached 20 s into the suite saw its registrations as newer than NOW + 10 ticks
+        global NOW
+        NOW = float(int(time.time()))
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE)
         gg.BASE = Path(self.tmp.name) / "gh"
@@ -258,6 +262,9 @@ class ControllerTest(Base):
         self.daemon.tick(NOW)
         self.daemon.tick(NOW + gg.REST_SAFETY - gg.CYCLE)
         self.assertEqual(len(self.gh.rest_calls()), 0)
+        # the waiting reader keeps touching its watch; without that it expires at IDLE_EXPIRY,
+        # which equals REST_SAFETY (the test passed only while NOW trailed the registration)
+        self.age_watch(gg.parse_key("run", "o/r/22"), -(gg.REST_SAFETY - gg.CYCLE))
         self.daemon.tick(NOW + gg.REST_SAFETY + 1)
         self.assertEqual(len(self.gh.rest_calls()), 1)
 
@@ -267,6 +274,7 @@ class ControllerTest(Base):
         key = gg.parse_key("run", "o/r/23")
         gg.register(key)
         self.daemon.tick(NOW)
+        self.age_watch(key, -(gg.REST_SAFETY - gg.CYCLE))  # a reader is still waiting (see above)
         self.daemon.tick(NOW + gg.REST_SAFETY + 1)
         self.daemon.tick(NOW + gg.REST_SAFETY + 1 + gg.TICK)
         self.assertEqual(gg.read_cache(key)["data"]["conclusion"], "success")
@@ -786,16 +794,28 @@ class ClientTest(Base):
 
     def wait(self, kind: str, target: str, until: str = "green", timeout: float = 0.5, fill: tuple | None = None,
              sha: str | None = None, grace: float = gg.RESCUE_GRACE) -> tuple[int, str]:
-        """Wait while a stand-in daemon writes `fill` (data, extra) shortly after the wait begins."""
+        """Wait while a stand-in daemon keeps writing `fill` (data, extra), as the real one refreshes.
+
+        One write at a fixed delay raced the wait's own start: resolving a short --sha runs git,
+        which took 0.15 s on a loaded host, so the write landed before the wait began and was
+        (rightly) ignored as older data."""
         key = gg.parse_key(kind, target)
-        timer = threading.Timer(0.1, lambda: self.put(key, fill[0], **fill[1])) if fill else None
-        if timer:
-            timer.start()
+        done = threading.Event()
+
+        def daemon() -> None:
+            while not done.wait(0.05):
+                self.put(key, fill[0], **fill[1])
+        writer = threading.Thread(target=daemon) if fill else None
+        if writer:
+            writer.start()
         out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            code = gg.cmd_wait(kind, target, until, timeout, False, False, sha, grace)
-        if timer:
-            timer.join()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = gg.cmd_wait(kind, target, until, timeout, False, False, sha, grace)
+        finally:
+            done.set()
+            if writer:
+                writer.join()
         return code, out.getvalue()
 
     def test_wait_exit_codes(self) -> None:
