@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""glaeda-local-guard: stop test and build runs that outlived their agent session on a laptop.
+
+    glaeda-local-guard                 plan: which orphaned runs would be stopped, and why the rest are kept
+    glaeda-local-guard --apply         stop them (the LaunchAgent runs this every 30 seconds)
+    glaeda-local-guard --status        override state and the most recent stops
+    glaeda-local-guard --allow 45m     stop nothing for 45 minutes (also 2h, 90s; 0 ends it)
+
+When a Claude Code session ends or moves on, the tests and builds it started can keep running,
+reparented to launchd, with nobody to read their result. On 2026-09-27 such orphans helped drive
+Air Blue to a load of ~345 on 10 cores. This guard stops them. A run whose session is still alive
+is never touched, however heavy or long: that is the session's business.
+
+Scope: only a Mac set up with `glaeda-mini-setup --hygiene-only` (a personal machine, not a fleet
+build host), read from ~/.config/glaeda/update.json. Anywhere else, or without that file, the
+guard does nothing. The LaunchAgent is installed on every Mac like the other glaeda agents.
+
+A run is one of these, matched on the process's own executable and arguments (never on a shell's
+`-c` string, so `grep "swift test"` is not a run); only the topmost match of a chain counts, so
+merge-main.sh speaks for the swift test it started:
+    swift-build, swift-test, `swift build`, `swift test`
+    xcodebuild with an action (build, test, build-for-testing, test-without-building, archive, analyze)
+    cargo build/test/bench/nextest (also b, t)
+    python tests/test_*.py, bash|sh|zsh tests/test_*.sh
+    scripts/merge-main.sh, scripts/ci/merge_main.py, verify-local.py
+
+It is an orphan, and is stopped, when all of these hold:
+    it belongs to this user and no ancestor is a live agent session (a `claude` or `codex` process);
+    its topmost ancestor below launchd is a shell or wrapper, or the run itself: the tool shell a
+    session left behind. cmux, Terminal, tmux, sshd and Xcode are not shells, so Leo's own runs in
+    them are never orphans;
+    its cwd is under ~/Projects or /private/tmp/claude-*;
+    no ancestor is a GitHub Actions runner (Runner.Listener, Runner.Worker, the local cmux runner in
+    ~/Projects/cmux/.local/runner) or glaeda-apple, and its cwd is not inside a runner;
+    this guard already saw it orphaned at least 25 seconds ago (the previous run), so a process
+    reparented a moment ago is not raced;
+    no override is active.
+
+Its whole process tree gets SIGTERM, and whatever still runs 5 seconds later with the same identity
+gets SIGKILL. The root is observed again right before the signal and must still have the same
+parent, start time and command.
+
+Every stop appends an intent and an outcome record (time, pid, reason, rule, command cut at 300
+characters, cwd) to ~/Library/Logs/glaeda-local-guard.jsonl.
+
+Override: ~/.config/glaeda/allow-local-heavy-until holds a Unix time; until then nothing is
+stopped. `--allow DURATION` writes it; `echo $(( $(date +%s) + 3600 )) > FILE` does the same by hand.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Callable
+
+SCHEMA = "glaeda-local-guard/v1"
+HOME = Path.home()
+
+
+def _load_procs():
+    """glaeda-procs is installed beside this tool and owns process observation."""
+    path = Path(__file__).resolve().parent / "glaeda-procs"
+    loader = importlib.machinery.SourceFileLoader("glaeda_procs", os.fspath(path))
+    spec = importlib.util.spec_from_loader("glaeda_procs", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["glaeda_procs"] = module
+    loader.exec_module(module)
+    return module
+
+
+gp = _load_procs()
+# ps took 15 s on Air Blue at load 300, past glaeda-procs' 20 s cap: the guard matters most then.
+# launchd never starts a second copy while one runs, so a slow pass only delays the next.
+gp.TIMEOUT = 90
+Proc = gp.Proc
+NoEvidence = gp.NoEvidence
+
+UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
+ALLOW_FILE = HOME / ".config/glaeda/allow-local-heavy-until"
+SEEN = HOME / ".local/state/glaeda/local-guard-seen.json"
+LOG = HOME / "Library/Logs/glaeda-local-guard.jsonl"
+LSOF = "/usr/sbin/lsof"
+GRACE_SECONDS = 25  # one LaunchAgent interval, less scheduling slack
+KILL_AFTER_SECONDS = 5.0
+COMMAND_LIMIT = 300
+
+AGENTS = {"claude", "codex"}
+RUNNERS = {"Runner.Listener", "Runner.Worker"}
+RUNNER_PATH = "/.local/runner/"  # the local cmux runner, ~/Projects/cmux/.local/runner
+MANAGED = re.compile(r"glaeda-apple|apple_build\.py")
+SHELLS = {"bash", "sh", "zsh", "dash"}
+# what may sit between launchd and an orphaned run: the shell a session's tool call left behind,
+# or a wrapper it ran the command under
+ORPHAN_TOPS = SHELLS | {"env", "nohup", "timeout", "gtimeout", "caffeinate", "xcrun", "make"}
+XCODE_ACTIONS = {"build", "test", "build-for-testing", "test-without-building", "archive", "analyze"}
+CARGO_RUNS = {"build", "b", "test", "t", "bench", "nextest"}
+SCRIPTS = {"merge_main.py": "merge-main", "verify-local.py": "verify-local", "verify_local.py": "verify-local",
+           "merge-main.sh": "merge-main"}
+TEST_PY = re.compile(r"test_[\w.-]*\.py")
+TEST_SH = re.compile(r"test_[\w.-]*\.sh")
+
+
+# ---------------------------------------------------------------- matching
+
+
+def first_operand(args: list[str]) -> str | None:
+    """The first argument that is not an option, or None when a -c/-m/-e string runs instead."""
+    for arg in args:
+        if arg in ("-c", "-m", "-e", "--command"):
+            return None
+        if not arg.startswith("-") and not arg.startswith("+"):
+            return arg
+    return None
+
+
+def in_tests_dir(path: str) -> bool:
+    parts = path.split("/")
+    return len(parts) >= 2 and parts[-2] == "tests"
+
+
+def rule(p: Proc) -> str | None:
+    """Which test or build run this process is, from its own executable and arguments, else None."""
+    exe = p.exe
+    args = p.command.split()[1:]
+    if exe in ("swift-build", "swift-test"):
+        return exe
+    if exe == "swift":
+        op = first_operand(args)
+        return f"swift-{op}" if op in ("build", "test") else None
+    if exe == "xcodebuild":
+        return "xcodebuild" if any(a in XCODE_ACTIONS for a in args) else None
+    if exe == "cargo":
+        op = first_operand(args)
+        return f"cargo-{op}" if op in CARGO_RUNS else None
+    if exe.lower().startswith("python") or exe in SHELLS:
+        script = first_operand(args)
+        if script is None:
+            return None
+        name = os.path.basename(script)
+        if name in SCRIPTS:
+            return SCRIPTS[name]
+        pattern = TEST_SH if exe in SHELLS else TEST_PY
+        return "tests" if pattern.fullmatch(name) and in_tests_dir(script) else None
+    return None
+
+
+def under(path: str | None, roots: list[str]) -> bool:
+    return bool(path) and any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def claude_tmp(path: str | None) -> bool:
+    return bool(path) and re.match(r"/private/tmp/claude-[^/]+(/|$)", path) is not None
+
+
+def identity(p: Proc) -> str:
+    return f"{p.pid} {p.start}"
+
+
+def survey(procs: list[Proc], uid: int, cwds: Callable[[list[int]], dict[int, str]],
+           home: Path = HOME) -> dict:
+    """Orphaned runs, and every other run with the reason it is kept."""
+    by_pid = {p.pid: p for p in procs}
+    children: dict[int, list[Proc]] = {}
+    for p in procs:
+        children.setdefault(p.ppid, []).append(p)
+
+    def ancestors(p: Proc) -> list[Proc]:
+        chain, seen = [], set()
+        while p.ppid in by_pid and p.ppid not in seen and p.ppid != p.pid and p.ppid > 1:
+            seen.add(p.ppid)
+            p = by_pid[p.ppid]
+            chain.append(p)
+        return chain
+
+    def tree(p: Proc) -> list[Proc]:
+        out, stack, seen = [], [p], set()
+        while stack:
+            q = stack.pop()
+            if q.pid in seen:
+                continue
+            seen.add(q.pid)
+            out.append(q)
+            stack.extend(children.get(q.pid, []))
+        return out
+
+    roots = []
+    for p in procs:
+        r = rule(p)
+        if r is None or p.uid != uid or p.stat.startswith("Z"):
+            continue
+        chain = ancestors(p)
+        if any(rule(a) for a in chain):
+            continue  # the topmost run speaks for its chain
+        roots.append((p, r, chain))
+
+    # only runs with no live session can be orphans; only those need a cwd
+    def sessionless(chain: list[Proc]) -> bool:
+        return not any(a.exe in AGENTS for a in chain)
+
+    wanted = [p.pid for p, _, chain in roots if sessionless(chain)]
+    found = cwds(wanted) if wanted else {}
+    projects = [os.path.realpath(home / "Projects")]
+    orphans, kept = [], []
+    for p, r, chain in roots:
+        cwd = found.get(p.pid)
+        entry = {"pid": p.pid, "rule": r, "elapsed_seconds": p.elapsed, "cwd": cwd,
+                 "command": p.command[:COMMAND_LIMIT], "_proc": p}
+        top = chain[-1] if chain else p
+        if any(a.exe in RUNNERS or RUNNER_PATH in a.command for a in [p, *chain]) or \
+                (cwd and RUNNER_PATH in cwd + "/"):
+            kept.append({**entry, "reason": "ci-runner"})
+        elif any(MANAGED.search(a.command) for a in chain):
+            kept.append({**entry, "reason": "glaeda-apple"})
+        elif not sessionless(chain):
+            kept.append({**entry, "reason": "live-session"})
+        elif top.ppid != 1 or not (top is p or top.exe in ORPHAN_TOPS):
+            kept.append({**entry, "reason": "not-agent"})
+        elif cwd is None:
+            kept.append({**entry, "reason": "cwd-unknown"})
+        elif not (under(cwd, projects) or claude_tmp(cwd)):
+            kept.append({**entry, "reason": "outside-projects"})
+        else:
+            members = tree(p)
+            orphans.append({**entry, "reason": "orphan", "processes": len(members), "_tree": members})
+    return {"orphans": orphans, "kept": kept}
+
+
+def settle(orphans: list[dict], seen_before: dict[str, float], now: float,
+           grace: float = GRACE_SECONDS) -> tuple[list[dict], dict[str, float]]:
+    """Orphans first seen at least grace seconds ago, and the seen map to keep for the next run."""
+    seen = {}
+    due = []
+    for o in orphans:
+        key = identity(o["_proc"])
+        first = seen_before.get(key, now)
+        seen[key] = first
+        if now - first >= grace:
+            due.append({**o, "orphaned_seconds": int(now - first)})
+    return due, seen
+
+
+def read_seen(path: Path = SEEN) -> dict[str, float]:
+    try:
+        doc = json.loads(path.read_text())
+        return {str(k): float(v) for k, v in doc.items()}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
+
+
+def write_seen(seen: dict[str, float], path: Path = SEEN) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(seen))
+    tmp.replace(path)
+
+
+# ---------------------------------------------------------------- host facts
+
+
+def lsof_cwds(pids: list[int]) -> dict[int, str]:
+    """cwd of each pid that still exists; an unreadable lsof yields nothing, so nothing is stopped."""
+    try:
+        out = subprocess.run([LSOF, "-a", "-d", "cwd", "-n", "-P", "-Fpn", "-p", ",".join(map(str, pids))],
+                             capture_output=True, text=True, timeout=gp.TIMEOUT, env=gp.CHILD_ENV)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return parse_lsof(out.stdout)
+
+
+def parse_lsof(text: str) -> dict[int, str]:
+    found: dict[int, str] = {}
+    pid = None
+    for line in text.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            found[pid] = line[1:]
+    return found
+
+
+def laptop(config: Path = UPDATE_CONFIG) -> bool:
+    """A Mac set up with the hygiene-only profile, as recorded for glaeda-update."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        doc = json.loads(config.read_text())
+    except (OSError, ValueError):
+        return False
+    return "--hygiene-only" in (doc.get("setupArgs") or [])
+
+
+def allowed_until(path: Path = ALLOW_FILE) -> float | None:
+    try:
+        text = path.read_text().split()
+        return float(text[0]) if text else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def parse_duration(text: str) -> int:
+    m = re.fullmatch(r"(\d+)([smh]?)", text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"not a duration: {text!r} (use 90s, 45m, 2h)")
+    return int(m.group(1)) * {"": 60, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+# ---------------------------------------------------------------- apply
+
+
+def public(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if not k.startswith("_")}
+
+
+def apply(due: list[dict], log: Path,
+          look: Callable[[int], Proc | None] = gp.observe,
+          kill: Callable[[int, int], None] = os.kill,
+          fresh: Callable[[], list[Proc]] = gp.snapshot,
+          sleep: Callable[[float], None] = time.sleep,
+          wait_seconds: float = KILL_AFTER_SECONDS) -> list[dict]:
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(record: dict) -> None:
+        with log.open("a") as out:
+            out.write(json.dumps(record) + "\n")
+
+    signalled: list[tuple[dict, list[Proc]]] = []
+    results = []
+    for entry in due:
+        root: Proc = entry["_proc"]
+        record = {"schema": SCHEMA, "time": int(time.time()), **public(entry)}
+        try:
+            now = look(root.pid)
+        except NoEvidence:
+            now, outcome = root, "no-evidence"
+        else:
+            outcome = None if now is not None and root.same_process(now) else ("gone" if now is None else "skipped-changed")
+        if outcome:
+            results.append({**record, "outcome": outcome})
+            write(results[-1])
+            continue
+        write({**record, "outcome": "signalling"})
+        for q in entry["_tree"]:
+            try:
+                kill(q.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        signalled.append((record, entry["_tree"]))
+
+    if signalled:
+        sleep(wait_seconds)
+        try:
+            alive = {p.pid: p for p in fresh()}
+        except NoEvidence:
+            alive = None
+        for record, members in signalled:
+            if alive is None:
+                outcome = "terminated-unconfirmed"
+            else:
+                left = [q for q in members if q.same_process(alive.get(q.pid)) and not alive[q.pid].stat.startswith("Z")]
+                for q in left:
+                    try:
+                        kill(q.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                outcome = "killed" if left else "terminated"
+            results.append({**record, "time": int(time.time()), "outcome": outcome})
+            write(results[-1])
+    return results
+
+
+# ---------------------------------------------------------------- output
+
+
+def recent(log: Path, count: int) -> list[dict]:
+    try:
+        lines = log.read_text().splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if doc.get("outcome") != "signalling":
+            records.append(doc)
+    return records[-count:]
+
+
+def when(epoch: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def header(active: bool, now: float, until: float | None) -> list[str]:
+    lines = [f"guard {'active' if active else 'inactive (not a hygiene-only Mac)'}"]
+    if until and until > now:
+        lines.append(f"override: nothing is stopped until {when(until)} ({int((until - now) // 60)} min left)")
+    else:
+        lines.append(f"override: none ({ALLOW_FILE})")
+    return lines
+
+
+def render_status(lines: list[str], records: list[dict]) -> str:
+    lines = list(lines)
+    if not records:
+        lines.append("no stops recorded")
+    for r in records:
+        lines.append(f"{when(r['time'])}  {r['outcome']:<10} {r.get('reason', '?')} {r['rule']:<12} pid {r['pid']} "
+                     f"{r.get('elapsed_seconds', 0)}s  cwd {r.get('cwd') or '?'}")
+        lines.append(f"    {r.get('command', '')[:160]}")
+    return "\n".join(lines)
+
+
+def render_plan(lines: list[str], s: dict) -> str:
+    lines = list(lines)
+    lines.append(f"orphaned runs (stopped once seen for {GRACE_SECONDS}s) {len(s['orphans'])}:")
+    for e in s["orphans"]:
+        lines.append(f"  {e['rule']:<12} pid {e['pid']} {e['elapsed_seconds']}s, {e['processes']} processes  cwd {e['cwd']}")
+    if s["kept"]:
+        lines.append(f"kept {len(s['kept'])}:")
+        for e in s["kept"]:
+            lines.append(f"  {e['rule']:<12} pid {e['pid']} {e['elapsed_seconds']}s: {e['reason']}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="glaeda-local-guard", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="stop orphaned runs (default is plan only)")
+    ap.add_argument("--status", action="store_true", help="override state and recent stops")
+    ap.add_argument("--allow", type=parse_duration, metavar="DURATION",
+                    help="stop nothing for DURATION (90s, 45m, 2h; a bare number is minutes; 0 ends it)")
+    ap.add_argument("--json", action="store_true", help="print one JSON object")
+    ap.add_argument("--count", type=int, default=20, help="records --status shows (default 20)")
+    a = ap.parse_args(argv)
+    now = time.time()
+
+    if a.allow is not None:
+        ALLOW_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if a.allow == 0:
+            ALLOW_FILE.unlink(missing_ok=True)
+            print("override ended")
+        else:
+            ALLOW_FILE.write_text(f"{int(now + a.allow)}\n")
+            print(f"nothing is stopped until {when(now + a.allow)}")
+        return 0
+
+    active = laptop()
+    until = allowed_until()
+    lines = header(active, now, until)
+    if a.status:
+        records = recent(LOG, a.count)
+        if a.json:
+            print(json.dumps({"schema": SCHEMA, "active": active, "allowedUntil": until, "recent": records}, indent=2))
+        else:
+            print(render_status(lines, records))
+        return 0
+
+    if a.apply and not active:
+        return 0
+    try:
+        procs = gp.snapshot()
+    except NoEvidence as e:
+        print(f"glaeda-local-guard: cannot observe processes ({e}); nothing done", file=sys.stderr)
+        return 2
+    s = survey(procs, os.getuid(), lsof_cwds)
+    if a.apply:
+        due, seen = settle(s["orphans"], read_seen(), now)
+        write_seen(seen)  # the grace clock runs during an override too
+        if until and until > now:
+            return 0
+        for r in apply(due, LOG):
+            print(json.dumps(r))
+        return 0
+    if a.json:
+        print(json.dumps({"schema": SCHEMA, "active": active, "allowedUntil": until,
+                          "orphans": [public(e) for e in s["orphans"]], "kept": [public(e) for e in s["kept"]]},
+                         indent=2))
+    else:
+        print(render_plan(lines, s))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

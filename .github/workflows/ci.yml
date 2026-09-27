@@ -140,6 +140,8 @@ jobs:
               Path("scripts/test-glaeda-disk.py"),
               Path("scripts/glaeda-procs"),
               Path("scripts/test-glaeda-procs.py"),
+              Path("scripts/glaeda-local-guard"),
+              Path("scripts/test-glaeda-local-guard.py"),
               Path("scripts/glaeda-update"),
               Path("scripts/glaeda_release.py"),
               Path("scripts/test-glaeda-update.py"),
@@ -195,6 +197,7 @@ jobs:
           python3 scripts/test-hot-observe.py
           python3 scripts/test-glaeda-disk.py
           python3 scripts/test-glaeda-procs.py
+          python3 scripts/test-glaeda-local-guard.py
           python3 scripts/test-glaeda-update.py
           python3 scripts/test-glaeda-fleet-cas-prune.py
           python3 scripts/test-glaeda-seed-prefetch.py

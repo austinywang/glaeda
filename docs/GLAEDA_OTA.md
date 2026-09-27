@@ -1,7 +1,7 @@
 # Over-the-air glaeda updates
 
 Status: live for the glaeda host tools (glaeda-disk, glaeda-worktree-reclaim, glaeda-fleet-cas-prune,
-glaeda-update itself, and the LaunchAgents and systemd units that run them). Owner issues: #525
+glaeda-local-guard, glaeda-update itself, and the LaunchAgents and systemd units that run them). Owner issues: #525
 (releases) and #149 (updates on hosts). The fleet runtime bundle is published in the same release
 but still installs through `glaeda-mini-fleet upgrade` (below).
 

@@ -26,6 +26,8 @@ GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
     ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
+    ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
+                                               agent session on a hygiene-only Mac; a no-op on build hosts)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
@@ -42,7 +44,7 @@ What --apply installs (templated for the current user):
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
-                                  idle-warm,mini-health,update,gh-watch}.plist
+                                  idle-warm,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -696,6 +698,17 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-mini-health.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-mini-health.err"),
         },
+        # Tests and builds that outlived their agent session on a personal Mac (scripts/glaeda-local-guard): every
+        # 30 seconds it ends the orphaned ones. It exits at once on a build host. Not ProcessType Background:
+        # it has to get CPU while the orphans it stops hold the machine.
+        LABEL_PREFIX + "local-guard": {
+            "Label": LABEL_PREFIX + "local-guard",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-local-guard"), "--apply"],
+            "StartInterval": 30,
+            "RunAtLoad": True,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-local-guard.log"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-local-guard.err"),
+        },
         # The compiled-product LAN broker (scripts/glaeda-lan-fetch serve-local): CI steps descend from
         # non-Apple processes (Runner.Listener), so Local Network Privacy keeps them off the LAN; they ask this
         # agent over a private Unix socket instead. Apple's python3 is what lets its ssh reach the peers.
@@ -875,7 +888,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-procs", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
@@ -1007,7 +1020,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-procs", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
