@@ -76,19 +76,25 @@ source-observation limits and the bounded request history.
 
 ## Verify
 
-Use the repository profiles:
+The full suites run in GitHub Actions (`.github/workflows/ci.yml`, the Verify
+workflow), which shards the heavy ones: `scripts/test-glaeda-cmux-runner.py` runs
+as four shards there. Do not run full suites on a workstation. Several agent
+sessions share one laptop, and a full runner-hook suite spawns dozens of fake
+runner processes for minutes; parallel copies of it (and orphans left by a
+crashed session) have driven the owner's Mac past load 150.
+
+Locally, run only what the change touches:
 
 ```bash
-./scripts/verify fast
-./scripts/verify full-tests
+./scripts/verify focused                  # compile, format, repo-query test
+python3 scripts/test-<file>.py -k <name>  # only the cases you changed or added
 ```
 
-For final code verification, run:
-
-```bash
-./scripts/bootstrap
-./scripts/verify required
-```
+Run one test file or `-k` selection at a time, in the foreground, with a
+timeout, and never leave a test process behind when the session ends. Then push
+the branch and let the Verify workflow run the full suites; its result is the
+final verification. Use `./scripts/verify fast`, `full-tests` or `required`
+locally only when the owner asks, or on a fleet mini rather than a workstation.
 
 Documentation-only changes follow the repository docs-only policy. Record when
 GitHub's normal Verify workflow is intentionally absent for Markdown/`docs/**`
