@@ -2,7 +2,7 @@
 """glaeda-idle-warm: while an owned cmux mini is idle, build main's head into a root whose kept build is far.
 
     glaeda-idle-warm              plan: would this mini warm now, which root, and why not
-    glaeda-idle-warm --apply      warm (the 5-minute LaunchAgent from glaeda-mini-setup)
+    glaeda-idle-warm --apply      warm (the 1-minute LaunchAgent from glaeda-mini-setup)
 
 cmux compile admission on an owned mini starts from the root's kept build (cmux owned_build_state.py) or a
 kept seed. What it compiles depends on how far that start is from the job's tree (cmux warm_distance.py):
@@ -19,7 +19,9 @@ It runs only when all of these hold, cheapest check first, and says which one st
     run the fleet coordinator) and has no KILL_SWITCH file;
   * glaeda runners in capacity mode (--capacity-units), none trusted-only (a seeder), whose deployed hook yields
     to jobs (its WARM_HOLDER); the hook is loaded from the runner, so the model and locks are the ones jobs use;
-  * no job or build running (Runner.Worker, xcodebuild) and none started or ended in the last IDLE_S;
+  * no compile or Xcode test running (xcodebuild, SWBBuildService) and no compile-class job started or
+    ended in the last IDLE_S (other jobs may run: the load and capacity gates and admission's preemption
+    keep them first);
   * 1-minute load under LOAD_PER_CORE per core, thermal pressure nominal,
     no reservation or fleet build on the host lock;
   * a root whose kept build the hook predicts far or rebuild for main's head (the seed prefetch's mirror),
@@ -66,8 +68,11 @@ NEVER_HOSTS = ("cmuxs-mac-mini-5",)
 NEVER_HOST_WORDS = ("lawrence",)
 KILL_SWITCH = HOME / ".config/glaeda/idle-warm.disabled"
 JOB_LOG = HOME / "Library/Logs/glaeda-cmux-jobs.jsonl"
-BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
-                  r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
+# A compile or an Xcode test run. Other jobs (guards, package tests, light lanes) no longer stop a catch-up:
+# on 2026-09-27 a running Runner.Worker stopped 60% of runs on the std minis, which are almost never without
+# one, so roots stayed on other pull requests' builds. The load and capacity gates still hold, and every
+# job's admission preempts a catch-up.
+BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)")
 # No job started or ended for this long. 12 PR minis, 2026-09-25/27 (glaeda-cmux-jobs.jsonl, 1286 gaps between
 # busy spells, catch-up builds 135 to 630 s): 600 s left 334 gaps eligible and finished about 190 catch-ups;
 # 180 s leaves 657 and finishes about 330, with 35% of starts preempted by a job instead of 29%. A preempted
@@ -83,6 +88,10 @@ CLONE_DEPTH = 200
 FAILURE_BACKOFF_S = 6 * 3600  # after FAILURES_TO_PAUSE failed builds in a row
 FAILURES_TO_PAUSE = 3
 KEEP_LOGS = 12
+# Main's head: an ls-remote each run, and a mirror fetch like glaeda-seed-prefetch's when main moved.
+LS_REMOTE_TIMEOUT_S = 20
+MIRROR_DEPTH = 60  # glaeda-seed-prefetch DEPTH
+MIRROR_FETCH_TIMEOUT_S = 180
 PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 GIT = shutil.which("git", path=PATH) or "/usr/bin/git"
 
@@ -178,6 +187,52 @@ def running() -> str:
     return ""
 
 
+# Job classes (glaeda-cmux-runner-hook) whose start or end restarts the quiet window: the compiles and the
+# simulator builds, which a catch-up would slow most. Light, product and gui test jobs no longer do.
+QUIET_CLASSES = ("compile", "compile-gui", "simulator", "isolated")
+
+
+def compile_state(path: Path = JOB_LOG, now: float | None = None) -> tuple[float | None, str]:
+    """(when the last compile-class job started or ended, one still running) from the jobs log.
+
+    A compile admitted before the quiet window, and still before xcodebuild (checkout, seed download),
+    shows no busy process, and its admission has already passed, so nothing would preempt a catch-up:
+    a started event without its completed one (at most BUILD_TIMEOUT_S old) counts as running."""
+    now = time.time() if now is None else now
+    try:
+        with open(path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - 262144))
+            lines = log.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None, ""
+    last = None
+    open_jobs: dict[tuple, str] = {}
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("class") not in QUIET_CLASSES:
+            continue
+        times = [event.get(key) for key in ("ended_at", "at", "started_at")]
+        times = [t for t in times if isinstance(t, (int, float))]
+        if times:
+            last = max(times) if last is None else max(last, *times)
+        key = tuple(event.get(field) for field in ("runner", "run_id", "run_attempt", "job"))
+        if event.get("event") == "started" and times and now - max(times) < BUILD_TIMEOUT_S:
+            open_jobs[key] = f"{event.get('job')} on {event.get('runner')}"
+        else:
+            open_jobs.pop(key, None)
+    return last, next(iter(open_jobs.values()), "")
+
+
+def last_compile_at(path: Path = JOB_LOG) -> float | None:
+    """When the last compile-class job on this mini started or ended (its telemetry log), or None."""
+    return compile_state(path)[0]
+
+
 def last_job_at(path: Path = JOB_LOG) -> float | None:
     """When the last job on this mini started or ended (its telemetry log), or None if none ever did."""
     try:
@@ -204,9 +259,11 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     busy = running()
     if busy:
         return f"busy: {busy}"
-    last = last_job_at()
+    last, open_job = compile_state(now=now)
+    if open_job:
+        return f"a compile is running: {open_job}"
     if last is not None and now - last < IDLE_S:
-        return f"a job ran {int(now - last)} s ago (idle after {IDLE_S} s)"
+        return f"a compile ran {int(now - last)} s ago (idle after {IDLE_S} s)"
     try:
         load = os.getloadavg()[0]
     except OSError:
@@ -231,9 +288,7 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
 # ---------------------------------------------------------------- which root
 
 
-def main_head(state: Path) -> str:
-    """Main's head as the seed prefetch last fetched it (its blobless mirror), or ''."""
-    mirror = state / ".prefetch" / "cmux.git"
+def mirror_head(mirror: Path) -> str:
     try:
         out = subprocess.run([GIT, "-C", os.fspath(mirror), "rev-parse", "refs/remotes/origin/main"],
                              capture_output=True, text=True, timeout=30)
@@ -241,6 +296,45 @@ def main_head(state: Path) -> str:
         return ""
     head = out.stdout.strip()
     return head if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
+def remote_head() -> str:
+    """Main's head on GitHub (one unauthenticated ls-remote, no API quota), or '' when it cannot say."""
+    try:
+        out = subprocess.run([GIT, "ls-remote", REPO_URL, "refs/heads/main"], capture_output=True, text=True,
+                             timeout=LS_REMOTE_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    head = out.stdout.split()[0] if out.returncode == 0 and out.stdout.split() else ""
+    return head if re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
+def main_head(state: Path) -> str:
+    """Main's head in the seed prefetch's blobless mirror, brought up to GitHub's first, or ''.
+
+    The mirror moves only when glaeda-seed-prefetch runs, 4 to 26 minutes behind main on 2026-09-27, so a
+    push waited that long plus this agent's interval before an idle root rebuilt it. Now each run asks
+    GitHub for main's head (ls-remote) and, when the mirror lacks it, fetches main into the mirror the way
+    the prefetch does, under the prefetch's own lock (skipped while the prefetch holds it: it is fetching)."""
+    mirror = state / ".prefetch" / "cmux.git"
+    head = mirror_head(mirror)
+    remote = remote_head()
+    if not remote or remote == head or not (mirror / "HEAD").is_file():
+        return head
+    lock = None
+    try:
+        lock = os.open(mirror.parent / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        subprocess.run([GIT, "-C", os.fspath(mirror), "fetch", "-q", "--filter=blob:none",
+                        f"--depth={MIRROR_DEPTH}", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+                       capture_output=True, timeout=MIRROR_FETCH_TIMEOUT_S,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        if lock is not None:
+            os.close(lock)
+    return mirror_head(mirror)
 
 
 # Which far root first: a known rebuild, then far, then a kept build the hook could not compare, then a root with
@@ -270,10 +364,22 @@ def pick_root(hook: Any, roots: int, head: str, state: Path, memory: dict[str, A
         last = done.get(str(copy + 1))
         if isinstance(last, dict) and last.get("head") == head:
             continue  # built, or tried, for this head already
-        far.append((TIER_ORDER[tier], -(guess.get("app_swift_files") or 0), copy))
+        # A root that keeps main comes first: cmux keeps one per multi-root mini at main (owned_build_state.py
+        # holds_last_main) as every pull request's near start, and nothing but this agent moves it forward.
+        far.append((0 if keeps_main(hook, copy + 1, state) else 1, TIER_ORDER[tier],
+                    -(guess.get("app_swift_files") or 0), copy))
     if not far:
         return "every root is near main's head, or was warmed for it"
-    return sorted(far)[0][2] + 1, predicted
+    return sorted(far)[0][-1] + 1, predicted
+
+
+def keeps_main(hook: Any, root: int, state: Path) -> bool:
+    """Root ROOT's kept build is a build of main (a stamp with no pull request)."""
+    try:
+        stamp = hook.root_stamp(root, os.fspath(state))
+    except Exception:  # noqa: BLE001 - an older hook, or an unreadable stamp: rank as before
+        return False
+    return isinstance(stamp, dict) and not stamp.get("pr")
 
 
 # ---------------------------------------------------------------- locks

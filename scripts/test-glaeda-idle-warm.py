@@ -113,18 +113,64 @@ class GateTest(Base):
         os.utime(log, (50, 50))
         self.assertEqual(warm.last_job_at(log), 200)
 
-    def test_idle_after_three_quiet_minutes(self) -> None:
+    def test_idle_after_three_quiet_minutes_of_compiles(self) -> None:
         self.assertEqual(warm.IDLE_S, 180)
-        saved = warm.last_job_at
+        saved = warm.compile_state
         stub = types.SimpleNamespace(thermal_pressure_level=lambda: 1)
         try:
             warm.running = lambda: ""
-            warm.last_job_at = lambda: 1000.0
-            self.assertIn("a job ran 179 s ago", warm.idle_refusal(stub, 1179.0, self.state))
+            warm.compile_state = lambda now=None: (1000.0, "")
+            self.assertIn("a compile ran 179 s ago", warm.idle_refusal(stub, 1179.0, self.state))
             # Past IDLE_S a later gate (load, heat, disk) answers, never the job gate.
-            self.assertNotIn("a job ran", warm.idle_refusal(stub, 1181.0, self.state))
+            self.assertNotIn("a compile ran", warm.idle_refusal(stub, 1181.0, self.state))
+            warm.compile_state = lambda now=None: (1.0, "macos-compile-admission on m-glaeda")
+            self.assertIn("a compile is running", warm.idle_refusal(stub, 5000.0, self.state))
         finally:
-            warm.last_job_at = saved
+            warm.compile_state = saved
+
+    def test_only_compiles_and_xcode_runs_count_as_busy(self) -> None:
+        log = self.dir / "jobs.jsonl"
+        self.assertIsNone(warm.last_compile_at(log))
+        log.write_text("\n".join(json.dumps(event) for event in (
+            {"class": "compile", "event": "completed", "started_at": 100, "ended_at": 200},
+            {"class": "gui", "event": "started", "at": 900},
+            {"class": "light", "event": "completed", "ended_at": 950}, "not json")) + "\n")
+        self.assertEqual(warm.last_compile_at(log), 200)
+        with open(log, "a") as handle:
+            handle.write(json.dumps({"class": "compile", "event": "started", "at": 5000, "runner": "r",
+                                     "run_id": "1", "job": "macos-compile-admission"}) + "\n")
+        self.assertEqual(warm.compile_state(log, now=5100), (5000, "macos-compile-admission on r"))
+        with open(log, "a") as handle:
+            handle.write(json.dumps({"class": "compile", "event": "completed", "ended_at": 5300, "runner": "r",
+                                     "run_id": "1", "job": "macos-compile-admission"}) + "\n")
+        self.assertEqual(warm.compile_state(log, now=5400), (5300, ""))
+        worker = "/Users/cmux/actions-runner-glaeda-2/bin.2.330.0/Runner.Worker spawnclient 1 2"
+        self.assertIsNone(warm.BUSY.search(worker), "another job no longer stops a catch-up")
+        self.assertIsNotNone(warm.BUSY.search("/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test"))
+
+    def test_main_head_catches_the_mirror_up_to_github(self) -> None:
+        mirror = self.state / ".prefetch" / "cmux.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(mirror)], check=True)
+        heads = {"mirror": HEAD}
+        calls = []
+        saved = (warm.mirror_head, warm.remote_head, warm.subprocess.run)
+        try:
+            warm.mirror_head = lambda _mirror: heads["mirror"]
+            warm.remote_head = lambda: "b" * 40
+            def fetch(args, **_kwargs):
+                calls.append(args)
+                heads["mirror"] = "b" * 40
+                return subprocess.CompletedProcess(args, 0)
+            warm.subprocess.run = fetch
+            self.assertEqual(warm.main_head(self.state), "b" * 40)
+            self.assertIn("+refs/heads/main:refs/remotes/origin/main", calls[0])
+            # Up to date, or GitHub unreachable: no fetch, the mirror's head.
+            self.assertEqual(warm.main_head(self.state), "b" * 40)
+            warm.remote_head = lambda: ""
+            self.assertEqual(warm.main_head(self.state), "b" * 40)
+            self.assertEqual(len(calls), 1)
+        finally:
+            warm.mirror_head, warm.remote_head, warm.subprocess.run = saved
 
     def test_pick_root_warms_the_farthest_root_once_per_head(self) -> None:
         predicted = {"root-1": {"seconds": 140.0, "tier": "near", "app_swift_files": 2},
@@ -132,6 +178,10 @@ class GateTest(Base):
                      "root-3": {"seconds": 400.7, "tier": "rebuild", "app_swift_files": 3}}
         stub = types.SimpleNamespace(warm_root_costs=lambda order, base, number, state: (order, predicted))
         self.assertEqual(warm.pick_root(stub, 3, HEAD, self.state, {})[0], 3)
+        # The root that keeps main is refreshed first, even when another root is farther.
+        mains = types.SimpleNamespace(warm_root_costs=stub.warm_root_costs,
+                                      root_stamp=lambda k, _state: {"merged_onto": HEAD, **({} if k == 2 else {"pr": 5})})
+        self.assertEqual(warm.pick_root(mains, 3, HEAD, self.state, {})[0], 2)
         memory = {"roots": {"3": {"head": HEAD}}}
         self.assertEqual(warm.pick_root(stub, 3, HEAD, self.state, memory)[0], 2)
         memory["roots"]["2"] = {"head": HEAD}

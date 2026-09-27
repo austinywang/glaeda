@@ -679,7 +679,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
         LABEL_PREFIX + "idle-warm": {
             "Label": LABEL_PREFIX + "idle-warm",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-warm"), "--apply"],
-            "StartInterval": 300,
+            # Every minute, so a main push reaches an idle root within minutes: a busy mini stops at `ps`,
+            # an idle one asks GitHub for main's head (ls-remote, no API quota).
+            "StartInterval": 60,
             "Nice": 5,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-warm.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-warm.err"),

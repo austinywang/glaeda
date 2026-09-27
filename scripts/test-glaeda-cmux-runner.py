@@ -1266,9 +1266,9 @@ class HookTest(unittest.TestCase):
         # A parked stamp naming another pull request is not taken for this one.
         stamp(ci / "cmux-ci-2" / "pr-builds" / "pr-8", 9)
         self.assertEqual(hook.warm_root_costs([0, 1], base, 8, os.fspath(ci), job_files=40)[1]["root-2"]["tier"], "far")
-        # Over a main build admission keeps the main build, so the parked one does not count.
+        # Over a main build admission adopts from the parked one, so it counts there too.
         (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base}))
-        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), None)
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 7)
         # An expired slot is never unparked either.
         (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base,
                                                                 "pr": 6}))
