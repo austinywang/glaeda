@@ -70,6 +70,9 @@ FAKE_SCP = """#!{python}
 import json, os, sys
 open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "scp", "argv": sys.argv[1:]}}) + "\\n")
 dest = sys.argv[-1]
+for src in sys.argv[1:-1]:
+    if src.endswith(".glaeda-source.json"):
+        open(os.environ["FAKE_LOG"] + "." + dest.split(":")[0] + ".stamp", "w").write(open(src).read())
 if dest.endswith("mini-fleet.json"):
     src = sys.argv[-2]
     open(os.environ["FAKE_LOG"] + "." + dest.split(":")[0] + ".manifest", "w").write(open(src).read())
@@ -157,6 +160,12 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(set(staged["hosts"]), {"mini-a"})
         self.assertEqual(set(staged["defaults"]), {"xcode", "disk", "ios_simulator"},
                          "no other hosts, keys or people; ios_simulator gates glaeda-ios-sim on the mini")
+        # the staged copy says which commit it is, so glaeda-cmux-runner and glaeda-update can tell it from a stale one
+        stamp = json.loads((self.dir / "calls.jsonl.mini-a.stamp").read_text())
+        head = subprocess.run(["env", "TZ=UTC", "git", "-C", os.fspath(TOOL.parents[1]), "log", "-1",
+                               "--format=%H %cd", "--date=format-local:%Y-%m-%d"],
+                              capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual((stamp["by"], stamp["source"], stamp["date"]), ("glaeda-cmux-runner-fleet", *head))
 
     def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))

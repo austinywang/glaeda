@@ -66,10 +66,13 @@ class Server:
 
     def publish(self, source: str, health_code: int = 0, archive: bytes | None = None) -> dict:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
+        runner = {f"glaeda/scripts/{name}": (f"{name} at {source}".encode(), 0o755 if "." not in name else 0o644)
+                  for name in gu.RUNNER_FILES}
         archive = archive or tar_gz({
             "glaeda/scripts/glaeda-mini-setup": (FAKE_SETUP.encode(), 0o755),
             "glaeda/scripts/health-code": (str(health_code).encode(), 0o644),
             "bin/glaeda-worktree-reclaim": (b"binary", 0o755),
+            **runner,
         })
         name = gr.hygiene_asset(TARGET)
         release_raw = gr.canonical(gr.release_manifest(source, tag, {name: archive}))
@@ -125,6 +128,35 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("--reclaim-binary", runs)
         self.assertEqual(runs[-1], "1")  # setup knows glaeda-update is running it
         self.assertEqual(self.run_update()["result"], "current")
+
+    def test_a_stale_runner_copy_is_refreshed_and_an_operators_newer_copy_kept(self) -> None:
+        copy = self.root / "glaeda-runner/scripts"
+        self.assertEqual(gu.refresh_runner_scripts(self.state, copy), "absent")  # not a runner mini: nothing made
+        self.assertFalse(copy.exists())
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        copy.mkdir(parents=True)
+        for name in gu.RUNNER_FILES:  # a Sep 24 copy with no stamp, as cmux15 had
+            (copy / name).write_text("old " + name)
+        self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {entry['tag']}")
+        self.assertEqual((copy / "glaeda-cmux-runner").read_text(), f"glaeda-cmux-runner at {SOURCES[0]}")
+        self.assertTrue(os.access(copy / "glaeda-cmux-runner", os.X_OK))
+        stamp = json.loads((copy / gu.SOURCE_STAMP).read_text())
+        self.assertEqual((stamp["by"], stamp["tag"], stamp["source"], stamp["date"]),
+                         ("glaeda-update", entry["tag"], SOURCES[0], "2026-09-25"))
+        self.assertEqual(gu.refresh_runner_scripts(self.state, copy), "current")
+        # an operator staged main the same day (fleet runner relabel): kept, never downgraded
+        (copy / "glaeda-cmux-runner").write_text("operator main")
+        (copy / gu.SOURCE_STAMP).write_text(json.dumps({"by": "fleet", "date": "2026-09-25", "source": "d" * 40}))
+        self.assertIn("kept", gu.refresh_runner_scripts(self.state, copy))
+        self.assertEqual((copy / "glaeda-cmux-runner").read_text(), "operator main")
+        # the same operator copy is older than the next day's release: refreshed
+        (copy / gu.SOURCE_STAMP).write_text(json.dumps({"by": "fleet", "date": "2026-09-24", "source": "d" * 40}))
+        self.assertIn("refreshed", gu.refresh_runner_scripts(self.state, copy))
+        # a copy this updater wrote is always brought to the newer release, even on the same day
+        newer = self.server.publish(SOURCES[1])
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {newer['tag']}")
 
     def test_unhealthy_release_rolls_back_and_is_quarantined(self) -> None:
         good = self.server.publish(SOURCES[0])

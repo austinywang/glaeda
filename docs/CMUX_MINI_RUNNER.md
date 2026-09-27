@@ -328,6 +328,24 @@ passes neither `--labels` nor `--manifest` keeps the labels and name it register
 and never relabels. If `--replace` itself was interrupted after GitHub assigned the
 new id, the id check blocks; pass `--replace` to take the name back.
 
+The plan names every label drift on the register step: `label drift (receipt)` or
+`label drift (GitHub)`, "registered labels differ from what this version would
+register: +added -removed". A re-run without `--manifest` still reports GitHub drift,
+and says to pass `--manifest` and `--member` to re-register.
+
+**Never relabel from a stale copy.** A copy's labels come from its own code: the Sep 24
+copy in cmux15's `~/glaeda-runner/scripts` planned "unchanged" because it predated the
+`glaeda-runner-<name>` label. On a mini with an OTA release installed (`glaeda-update`),
+a copy whose runner files differ from that release and are older (by its
+`.glaeda-source.json` stamp, its release tag, or its git commit date; unknown counts as
+older) fails the `scriptCopy` preflight: the plan is not ready, `--apply` is refused, the
+note names the release's own copy to run, and the release's plan labels are shown as
+`label drift (release ...)`. `--allow-stale` overrides. `glaeda-cmux-runner-fleet`
+writes the stamp when it stages; `glaeda-update` refreshes an older staged copy from the
+installed release every hour, and keeps a copy an operator staged on the release's day
+or later. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
+`origin/main` in a temporary directory and does the whole relabel.
+
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
 to a member whose name `<member>-glaeda` differs is a different install: the
 command refuses it as a conflict until `--uninstall --apply` removes the old one,
@@ -751,8 +769,21 @@ Expect `status: "online"` and labels `self-hosted, macOS, ARM64, glaeda-mini`.
 
 ## 4. Route
 
-The plan prints these; it never runs them. Start with one variable, watch a few
-jobs, then add the rest:
+**Fleet members (`--manifest`) route through cmux's PR pool picker**, which already sends jobs
+to their pool labels (`CI_PR_POOL_OWNED`, `CI_OWNED_POOL_SLOTS`); nothing is set per runner,
+and their plan prints no `MACOS_RUNNER_*` line. Setting those variables to `glaeda-mini`
+would bypass the picker and send every PR job to the generic label. A trusted member
+(section 2e) prints the nightly pair instead, with its rollback:
+
+```bash
+gh variable set CI_SEED_TRUSTED_POOL --body glaeda-trusted-std-xcode-26.6 --repo manaflow-ai/cmux
+gh variable set CI_NIGHTLY_TRUSTED_RUNNER --body glaeda-runner-cmux15-glaeda --repo manaflow-ai/cmux
+gh variable delete CI_NIGHTLY_TRUSTED_RUNNER --repo manaflow-ai/cmux   # rollback: nightly on Blacksmith
+```
+
+The rest of this section is for a single `--labels` runner outside the fleet. The plan
+prints these; it never runs them. Start with one variable, watch a few jobs, then add
+the rest:
 
 ```bash
 gh variable set MACOS_RUNNER_15 --body glaeda-mini --repo manaflow-ai/cmux

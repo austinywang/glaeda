@@ -35,9 +35,19 @@ on the operator's own machine, so no GitHub credential ever lands on the mini:
 Without gh the release is read from the public API with curl, a name collision is left to
 config.sh (which refuses one), and step 5 is confirmed locally from the runner log instead.
 
-Routing is never automated: the plan prints the `gh variable set` commands that point cmux
-workflows at the glaeda-mini label, and the `gh variable delete` commands that roll back.
+Routing is never automated. A --labels runner's plan prints the `gh variable set` commands that
+point cmux workflows at the glaeda-mini label, and the `gh variable delete` commands that roll back.
+A fleet member (--manifest, or a receipt that recorded one) prints no MACOS_RUNNER_* line: cmux's PR
+pool picker already routes to its pool labels, and those variables would bypass the picker. A trusted
+member prints the nightly variables (CI_SEED_TRUSTED_POOL, CI_NIGHTLY_TRUSTED_RUNNER) instead.
 The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
+
+Stale copies and label drift. On a host with an over-the-air release installed (glaeda-update), a copy
+of this script whose runner files differ from that release's and are older than it (by its
+.glaeda-source.json stamp, its release, or its git commit date; unknown counts as older) blocks: the
+plan says which copy to run instead, and the release's plan labels are compared with this copy's.
+--allow-stale overrides. The register step lists every label drift it sees: the receipt's or GitHub's
+registered labels against what this version would register.
 """
 
 from __future__ import annotations
@@ -95,6 +105,14 @@ TOKEN_RE = r"[A-Za-z0-9_.\-]+"
 LISTENING = "Listening for Jobs"
 IOS_SIM_JOB_LABEL = "glaeda-ios-sim"  # glaeda_fleet_labels.IOS_SIM_LABEL
 GATE_HELD = "glaeda-cmux-runner-gate: holding the listener off"  # the gate's line while the fleet has the host
+# Stale-copy check: the OTA install (glaeda-update) and the runner files a staged copy carries
+# (glaeda-cmux-runner-fleet STAGED). The stamp says where a staged copy came from.
+UPDATE_STATE = ".local/state/glaeda/update"
+RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+SOURCE_STAMP = ".glaeda-source.json"
+NO_RELEASE_CHECK = "GLAEDA_CMUX_RUNNER_NO_RELEASE_CHECK"  # set for the release copy's own plan (no recursion)
+RELEASE_TAG_RE = r"r-(\d{4})(\d{2})(\d{2})-[0-9a-f]{12}"
+DAY_RE = r"\d{4}-\d{2}-\d{2}"
 
 
 # ---------------------------------------------------------------- small helpers
@@ -591,12 +609,131 @@ def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
     return None if code == 0 else "launchctl bootstrap failed: " + out
 
 
-def routing(ctx: Context) -> dict[str, list[str]]:
+def routing(ctx: Context) -> dict[str, Any]:
     repo = shlex.quote(ctx.route_repo)
-    return {
-        "route": [f"gh variable set {v} --body {MINI_LABEL} --repo {repo}" for v in ROUTE_VARIABLES],
-        "rollback": [f"gh variable delete {v} --repo {repo}" for v in ROUTE_VARIABLES],
-    }
+    member = ctx.member
+    if not member:
+        return {
+            "route": [f"gh variable set {v} --body {MINI_LABEL} --repo {repo}" for v in ROUTE_VARIABLES],
+            "rollback": [f"gh variable delete {v} --repo {repo}" for v in ROUTE_VARIABLES],
+        }
+    if not member.get("trustedRef"):
+        # MACOS_RUNNER_* would send every PR job to the generic glaeda-mini label, past cmux's picker.
+        return {"route": [], "rollback": [],
+                "note": "fleet member: cmux's PR pool picker routes to its pool labels (CI_PR_POOL_OWNED, "
+                        "CI_OWNED_POOL_SLOTS); nothing is set per runner. Never set MACOS_RUNNER_* to glaeda-mini: "
+                        "that bypasses the picker"}
+    runner = next((label for label in ctx.labels if label.startswith(RUNNER_LABEL_PREFIX)), None)
+    pool = next(iter(member.get("pools") or []), None)
+    note = ("trusted member: only cmux's nightly app build and seed run here, while CI_PR_POOL_OWNED is 1 and "
+            "both variables below name it; PR jobs never do. Never set MACOS_RUNNER_* to glaeda-mini")
+    if not (runner and pool):
+        return {"route": [], "rollback": [], "note": note + " (this instance carries no runner label)"}
+    return {"route": [f"gh variable set CI_SEED_TRUSTED_POOL --body {shlex.quote(pool)} --repo {repo}",
+                      f"gh variable set CI_NIGHTLY_TRUSTED_RUNNER --body {shlex.quote(runner)} --repo {repo}"],
+            "rollback": [f"gh variable delete CI_NIGHTLY_TRUSTED_RUNNER --repo {repo}"],
+            "note": note}
+
+
+# ---------------------------------------------------------------- stale copies and label drift
+
+
+def day(text: object) -> str | None:
+    found = re.match(DAY_RE, str(text or ""))
+    return found.group(0) if found else None
+
+
+def script_source(script_dir: Path) -> dict[str, Any] | None:
+    """Where this copy of the runner scripts came from: {date, source, tag, via}, or None when unknown.
+    Its stamp (written by whoever staged it), else the OTA release it sits in, else its git checkout."""
+    try:
+        stamp = json.loads((script_dir / SOURCE_STAMP).read_text())
+    except (OSError, ValueError):
+        stamp = None
+    if isinstance(stamp, dict) and day(stamp.get("date")):
+        return {"date": day(stamp["date"]), "source": str(stamp.get("source") or "")[:40],
+                "tag": str(stamp.get("tag") or "") or None, "via": f"stamp by {str(stamp.get('by') or '?')[:40]}"}
+    try:
+        release = json.loads((script_dir.parent.parent / "release.json").read_text())
+        found = re.fullmatch(RELEASE_TAG_RE, str(release.get("tag")))
+    except (OSError, ValueError, AttributeError):
+        found = None
+    if found:
+        return {"date": "-".join(found.groups()), "source": str(release.get("source") or "")[:40],
+                "tag": found.group(0), "via": "release"}
+    if (script_dir.parent / ".git").exists():
+        code, out = run(["env", "TZ=UTC", "git", "-C", os.fspath(script_dir.parent), "log", "-1",
+                          "--format=%H %cd", "--date=format-local:%Y-%m-%d"])  # UTC, like release tags
+        parts = out.split() if code == 0 else []
+        if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40}", parts[0]) and day(parts[1]):
+            return {"date": parts[1], "source": parts[0], "tag": None, "via": "git"}
+    return None
+
+
+def installed_release(home: Path) -> dict[str, Any] | None:
+    """The release glaeda-update installed here, with its copy of the runner scripts, or None."""
+    root = home / UPDATE_STATE
+    try:
+        tag = str(json.loads((root / "state.json").read_text()).get("current") or "")
+    except (OSError, ValueError, AttributeError):
+        return None
+    found = re.fullmatch(RELEASE_TAG_RE, tag)
+    scripts = root / "generations" / tag / "glaeda/scripts"
+    if not found or not (scripts / "glaeda-cmux-runner").is_file():
+        return None
+    return {"tag": tag, "date": "-".join(found.groups()), "scripts": scripts}
+
+
+def copy_check(ctx: Context) -> dict[str, Any] | None:
+    """How this copy compares with the installed release: None when there is none, or it is this copy."""
+    if os.environ.get(NO_RELEASE_CHECK):
+        return None
+    release = installed_release(ctx.home)
+    if release is None or os.path.realpath(release["scripts"]) == os.path.realpath(SCRIPT_DIR):
+        return None
+    if all(sha256_file(SCRIPT_DIR / name) == sha256_file(release["scripts"] / name) for name in RUNNER_FILES):
+        return None
+    own = script_source(SCRIPT_DIR)
+    stale = own is None or own["date"] < release["date"] or bool(own.get("tag") and own["tag"] != release["tag"])
+    return {"state": "stale" if stale else "differs", "release": release["tag"], "copy": own,
+            "releaseScript": ctx.show(release["scripts"] / "glaeda-cmux-runner"),
+            "releaseScriptPath": os.fspath(release["scripts"] / "glaeda-cmux-runner")}
+
+
+def release_plan_labels(script: str, argv: list[str]) -> list[str] | None:
+    """The labels the release's copy would register for these same arguments: its read-only plan."""
+    plan: list[str] = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg == "--output":
+            skip = True
+        elif arg not in ("--apply", "--allow-stale") and not arg.startswith("--output="):
+            plan.append(arg)
+    python = sys.executable or "/usr/bin/python3"
+    code, out = run([python, script, *plan, "--output", "json"], timeout=180,
+                    env={**os.environ, NO_RELEASE_CHECK: "1"})
+    try:
+        doc = json.loads(out[out.find("{"):])
+        reg = next(a for a in doc.get("actions", []) if a.get("kind") == "register")
+    except (ValueError, StopIteration, AttributeError):
+        return None
+    labels = reg.get("labels")
+    return labels if isinstance(labels, list) else None
+
+
+def label_drift(against: str, registered: list[str], wanted: list[str]) -> dict[str, Any] | None:
+    """How `wanted` (this version's labels) differs from `registered`; None when they match."""
+    added = sorted(set(wanted) - set(registered))
+    removed = sorted(set(registered) - set(wanted))
+    if not (added or removed):
+        return None
+    return {"against": against, "added": added, "removed": removed}
+
+
+def drift_text(drift: dict[str, Any]) -> str:
+    return " ".join([*(f"+{label}" for label in drift["added"]), *(f"-{label}" for label in drift["removed"])])
 
 
 # ---------------------------------------------------------------- plan
@@ -683,6 +820,18 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             reg.update(state="create", existing=existing)
     if own_name and reg["state"] == "create":
         reg.update(replace=True, note="re-registers this install's own name with --replace")
+    drifts = []
+    if ours and configured and had is not None:
+        drifts.append(label_drift("receipt", had, ctx.labels))
+        if ctx.gh is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
+            listed, found = lookup_runner(ctx)
+            if listed and found is not None:
+                drifts.append(label_drift("github", found.get("labels") or [], ctx.labels))
+    if any(drifts):
+        reg["drift"] = [d for d in drifts if d]
+        if reg["state"] == "unchanged":
+            reg["note"] = ("registered labels differ from what this version would register; pass --manifest and "
+                           "--member (or --labels) to re-register")
     actions.append(reg)
 
     prior = {a.get("path"): a.get("ownedSha256") for a in (receipt or {}).get("actions", [])
@@ -1095,6 +1244,16 @@ def preflight(ctx: Context) -> dict[str, Any]:
             app / "Contents/Developer")})[1].replace("\n", " ") if app.is_dir() and not app.is_symlink() else ""
         check("xcodeApp", bool(version) and "Build version" in version, version or f"{app} missing or a symlink",
               "cmux jobs routed here will fail; install that Xcode at exactly this path")
+    copy = getattr(ctx, "copy", None)
+    if copy is not None:
+        own = copy.get("copy") or {}
+        what = f"{own.get('via')} {own.get('source', '')[:12]} {own.get('date')}" if own else "unknown source"
+        if copy["state"] == "stale":
+            check("scriptCopy", False, f"older than release {copy['release']} ({what})",
+                  f"run {copy['releaseScript']} instead, stage main (fleet runner relabel), or pass --allow-stale",
+                  blocking=not ctx.allow_stale)
+        else:
+            check("scriptCopy", None, f"differs from release {copy['release']} ({what})", "not older; used as is")
     disk = which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),))
     check("glaedaDisk", disk is not None or None, disk or "not installed",
           "optional: glaeda-mini-setup --apply installs it; hooks skip disk pressure without it")
@@ -1118,11 +1277,24 @@ def render(ctx: Context, receipt: dict[str, Any]) -> str:
             target = f"v{act.get('version')} sha256:{act['sha256'][:12]}..."
         note = f"  ({act['note']})" if act.get("note") else ""
         lines.append(f"  {act['state']:<9} {act['kind']:<10} {target}{note}")
+        for drift in act.get("drift") or []:
+            lines.append(f"            label drift ({'GitHub' if drift['against'] == 'github' else 'receipt'}): "
+                         f"registered labels differ from what this version would register: {drift_text(drift)}")
+    copy = receipt.get("scriptCopy")
+    if copy and copy.get("labelDrift"):
+        lines.append(f"label drift (release {copy['release']}): the installed release would register "
+                     f"{drift_text(copy['labelDrift'])} against this copy")
+    elif copy and copy.get("releaseLabels") is None and copy["state"] == "stale":
+        lines.append(f"label drift (release {copy['release']}): unknown; its plan did not run")
     if mode == "install":
-        lines.append(f"route cmux jobs to this runner (printed only; run one at a time, {ctx.route_repo} admin):")
-        lines.extend(f"  {c}" for c in receipt["routing"]["route"])
-        lines.append("rollback (jobs fall back to Blacksmith immediately):")
-        lines.extend(f"  {c}" for c in receipt["routing"]["rollback"])
+        route = receipt["routing"]
+        if route.get("note"):
+            lines.append(f"routing: {route['note']}")
+        if route["route"]:
+            lines.append(f"route cmux jobs to this runner (printed only; run one at a time, {ctx.route_repo} admin):")
+            lines.extend(f"  {c}" for c in route["route"])
+            lines.append("rollback (jobs fall back to Blacksmith immediately):")
+            lines.extend(f"  {c}" for c in route["rollback"])
     lines.append("ready: " + ("yes" if receipt["ready"] else "no, blocking: " + ", ".join(receipt["blocking"])))
     if receipt["applied"]:
         written = ctx.state / "uninstall-receipt.json" if mode == "uninstall" else ctx.receipt_path
@@ -1166,10 +1338,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--xcode-app", help="check the Xcode that routed jobs select (the value of the repo's "
                    "CMUX_CI_XCODE_APP_PR variable, such as /Applications/Xcode_26.6.app); a warning, never a block")
     p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
+    p.add_argument("--allow-stale", action="store_true",
+                   help="apply from a copy older than the installed OTA release (default: that blocks)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser().parse_args(argv)
     if DARWIN_REQUIRED and platform.system() != "Darwin":
         print("glaeda-cmux-runner: macOS only", file=sys.stderr)
@@ -1275,6 +1450,13 @@ def main(argv: list[str] | None = None) -> int:
             ctx.labels = registered["labels"]
         if not args.name and not args.member and registered.get("name"):
             ctx.name = registered["name"]
+    ctx.allow_stale = args.allow_stale
+    ctx.copy = None if args.uninstall else copy_check(ctx)
+    if ctx.copy is not None and ctx.copy["state"] == "stale":
+        labels = release_plan_labels(ctx.copy["releaseScriptPath"], raw_argv)
+        ctx.copy["releaseLabels"] = labels
+        if labels is not None:
+            ctx.copy["labelDrift"] = label_drift("release", ctx.labels, labels)
     pre = preflight(ctx)
     doc: dict[str, Any] = {
         "schema": SCHEMA,
@@ -1290,6 +1472,8 @@ def main(argv: list[str] | None = None) -> int:
         "preflight": pre,
         "member": ctx.member or ((prior or {}).get("member") if owned_dir(ctx, prior) else None),
     }
+    if ctx.copy is not None:
+        doc["scriptCopy"] = {k: v for k, v in ctx.copy.items() if k != "releaseScriptPath"}
     if args.uninstall:
         actions = plan_uninstall(ctx, prior)
         if ctx.gh is None and not ctx.token_stdin and \

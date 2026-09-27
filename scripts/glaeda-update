@@ -30,8 +30,16 @@ What one run does, and what it refuses:
 5. On a canary host with reportStatus and an authenticated `gh`, the outcome is posted as the commit
    status `glaeda-ota/<host>` on the release's source commit. Promotion to stable waits for those.
 
+6. A mini that runs GitHub runners keeps the copy of glaeda-cmux-runner it is re-registered from in
+   ~/glaeda-runner/scripts (glaeda-cmux-runner-fleet stages it). After an update, and on every run that
+   finds the release current, that copy is brought to the installed release's four runner files when
+   it is older, so a relabel never runs from a stale copy. A copy an operator staged (its
+   .glaeda-source.json stamp not written here) dated the release's day or later is kept. Only that
+   directory, and only when it already exists; the runners' installed hooks are not touched.
+
 It never runs two at a time (a lock under the state directory), never touches anything but what
-setup installs, and keeps the current and previous release under ~/.local/state/glaeda/update.
+setup installs (and the runner copy in step 6), and keeps the current and previous release under
+~/.local/state/glaeda/update.
 """
 from __future__ import annotations
 
@@ -74,6 +82,11 @@ HOME = Path.home()
 CONFIG = HOME / ".config/glaeda/update.json"
 STATE_DIR = HOME / ".local/state/glaeda/update"
 BIN = HOME / ".local/bin"
+# The runner copy glaeda-cmux-runner-fleet stages (its STAGED and REMOTE_DIR), refreshed in step 6.
+RUNNER_SCRIPTS = HOME / "glaeda-runner/scripts"
+RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+SOURCE_STAMP = ".glaeda-source.json"
+STAMP_BY = "glaeda-update"
 
 
 class UpdateError(RuntimeError):
@@ -377,6 +390,45 @@ def download(state_dir: Path, entry: dict, target: str, ring: str) -> Path:
     return gen
 
 
+def tag_date(tag: str) -> str:
+    day = tag.split("-")[1]
+    return f"{day[:4]}-{day[4:6]}-{day[6:]}"
+
+
+def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS) -> str:
+    """Step 6: bring the staged runner copy to the installed release when it is older. Returns what it did."""
+    if not target.is_dir():
+        return "absent"
+    tag = load_state(state_dir)["current"]
+    gen = generation(state_dir, tag) if tag else None
+    if gen is None or not (gen / ".complete").is_file():
+        return "no installed release"
+    src = gen / "glaeda/scripts"
+    if not all((src / name).is_file() for name in RUNNER_FILES):
+        return f"{tag} has no runner scripts"
+    if all((target / name).is_file() and (target / name).read_bytes() == (src / name).read_bytes()
+           for name in RUNNER_FILES):
+        return "current"
+    try:
+        stamp = json.loads((target / SOURCE_STAMP).read_text())
+    except (OSError, ValueError):
+        stamp = None
+    if (isinstance(stamp, dict) and stamp.get("by") != STAMP_BY
+            and str(stamp.get("date") or "")[:10] >= tag_date(tag)):
+        return f"kept (staged {str(stamp.get('source') or '?')[:12]} on {str(stamp['date'])[:10]}, not older than {tag})"
+    for name in RUNNER_FILES:
+        data, dest = (src / name).read_bytes(), target / name
+        tmp = target / f".{name}.glaeda-update"
+        tmp.write_bytes(data)
+        tmp.chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+        os.replace(tmp, dest)
+    source = json.loads((gen / "release.json").read_text()).get("source")
+    tmp = target / f".{SOURCE_STAMP}.glaeda-update"
+    tmp.write_text(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
+    os.replace(tmp, target / SOURCE_STAMP)
+    return f"refreshed to {tag}"
+
+
 def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
            channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN) -> dict:
     state = load_state(state_dir)
@@ -460,6 +512,11 @@ def main(argv: list[str] | None = None) -> int:
                 result = update(True, config)
                 if result["result"] in ("updated", "current", "idle"):
                     result["promotion"] = nudge_promotion(config)
+                if result["result"] in ("updated", "current"):
+                    try:
+                        result["runnerScripts"] = refresh_runner_scripts()
+                    except (OSError, ValueError, UpdateError) as e:  # never fails the update itself
+                        result["runnerScripts"] = f"not refreshed ({type(e).__name__}: {e})"[:300]
         result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(json.dumps(result, sort_keys=True))
         return 1 if result["result"] in ("rolled-back", "refused") else 0

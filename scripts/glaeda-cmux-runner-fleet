@@ -24,7 +24,9 @@ Every member runs at once, and so does every instance on a member. First the mem
 runs read-only (`glaeda-cmux-runner-hook check`, sent over SSH on stdin, so the plan changes nothing on the
 mini); a member that is not eligible is skipped, so a mini joins the pools on the first run after it is
 onboarded and never takes jobs only to refuse them. Then --apply copies this checkout's glaeda-cmux-runner,
-its hook and their two modules into ~/glaeda-runner/scripts with a manifest trimmed to that member (its own
+its hook and their two modules into ~/glaeda-runner/scripts, with a .glaeda-source.json stamp naming the
+commit and its date (glaeda-cmux-runner blocks a copy older than the mini's OTA release; glaeda-update
+refreshes one), and a manifest trimmed to that member (its own
 entry and the xcode, disk and runner defaults: never other hosts, keys or people), mints one registration token
 per instance here and pipes it over SSH (never an argv or a file), and applies --instance K for every K.
 The gate checks the manifest's first Xcode for the member; if that app is missing there, the member reads as
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
 import importlib.machinery
 import importlib.util
 import json
@@ -51,6 +54,7 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGED = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
 REMOTE_DIR = "glaeda-runner"
+SOURCE_STAMP = ".glaeda-source.json"  # glaeda-cmux-runner script_source reads it
 DEFAULT_REPO = "manaflow-ai/cmux"
 DEFAULT_MANIFEST = Path.home() / ".config/glaeda/mini-fleet.json"
 WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -165,15 +169,48 @@ def group_refusal(org: str, group: str, repo: str | None) -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=1)
+def source_stamp() -> dict[str, Any] | None:
+    """Where these scripts come from, for the staged copy's stamp: an existing stamp, the OTA release they sit
+    in, or this git checkout's HEAD. None when unknown (the copy then reads as older than any release)."""
+    try:
+        stamp = json.loads((SCRIPT_DIR / SOURCE_STAMP).read_text())
+        if isinstance(stamp, dict) and re.match(r"\d{4}-\d{2}-\d{2}", str(stamp.get("date") or "")):
+            return stamp
+    except (OSError, ValueError):
+        pass
+    try:
+        release = json.loads((SCRIPT_DIR.parent.parent / "release.json").read_text())
+        found = re.fullmatch(r"r-(\d{4})(\d{2})(\d{2})-[0-9a-f]{12}", str(release.get("tag")))
+        if found:
+            return {"by": "glaeda-cmux-runner-fleet", "date": "-".join(found.groups()),
+                    "source": release.get("source"), "tag": found.group(0)}
+    except (OSError, ValueError, AttributeError):
+        pass
+    code, out, _ = run(["env", "TZ=UTC", "git", "-C", os.fspath(SCRIPT_DIR.parent), "log", "-1",
+                          "--format=%H %cd", "--date=format-local:%Y-%m-%d"], 30)  # UTC, like release tags
+    parts = out.split() if code == 0 else []
+    if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
+        return {"by": "glaeda-cmux-runner-fleet", "date": parts[1], "source": parts[0]}
+    return None
+
+
 def stage(member: str, manifest: dict[str, Any], scratch: Path) -> str | None:
-    """Copy the scripts and the member's trimmed manifest. Returns why it failed, or None."""
+    """Copy the scripts, their source stamp and the member's trimmed manifest. Returns why it failed, or None."""
     local = scratch / f"{member}.manifest.json"
     local.write_text(json.dumps(trimmed(manifest, member), indent=1) + "\n")
+    files = [os.fspath(SCRIPT_DIR / f) for f in STAGED]
+    stamp = source_stamp()
+    if stamp is not None:
+        (scratch / member).mkdir(exist_ok=True)
+        (scratch / member / SOURCE_STAMP).write_text(json.dumps(stamp, sort_keys=True) + "\n")
+        files.append(os.fspath(scratch / member / SOURCE_STAMP))
     code, _, err = run(["ssh", *SSH_OPTIONS, member, f"mkdir -p ~/{REMOTE_DIR}/scripts"], 60)
     if code != 0:
         return f"ssh: {err.strip()[-200:]}"
-    code, _, err = run(["scp", "-q", *SSH_OPTIONS, *[os.fspath(SCRIPT_DIR / f) for f in STAGED],
-                        f"{member}:{REMOTE_DIR}/scripts/"], 300)
+    if stamp is None:  # an old stamp would vouch for these new files
+        run(["ssh", *SSH_OPTIONS, member, f"rm -f ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP}"], 60)
+    code, _, err = run(["scp", "-q", *SSH_OPTIONS, *files, f"{member}:{REMOTE_DIR}/scripts/"], 300)
     if code == 0:
         code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local), f"{member}:{REMOTE_DIR}/mini-fleet.json"], 60)
     return None if code == 0 else f"scp: {err.strip()[-200:]}"

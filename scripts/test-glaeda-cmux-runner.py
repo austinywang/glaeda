@@ -3359,6 +3359,137 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("glaeda-class-std", saved["registration"]["labels"])
         self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
 
+    def human(self, *args: str) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO("")):
+            cr.main(["--gh", os.fspath(self.gh), "--python", sys.executable, *args])
+        return out.getvalue()
+
+    def test_a_fleet_member_gets_no_macos_runner_hint(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std")
+            text = self.human("--manifest", self.manifest(), "--member", "mini-std")
+        self.assertEqual((plan["routing"]["route"], plan["routing"]["rollback"]), ([], []))
+        self.assertIn("pool picker", plan["routing"]["note"])
+        self.assertNotIn("gh variable set MACOS_RUNNER", text)
+        self.assertIn("routing: fleet member", text)
+        self.assertIn("Never set MACOS_RUNNER_*", text)
+
+    def test_a_trusted_member_prints_the_nightly_variables(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        path = self.state / "trusted.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plan = self.invoke("--manifest", os.fspath(path), "--member", "mini-std")
+        self.assertEqual(plan["routing"]["route"], [
+            "gh variable set CI_SEED_TRUSTED_POOL --body glaeda-trusted-std-xcode-26.6 --repo manaflow-ai/cmux",
+            "gh variable set CI_NIGHTLY_TRUSTED_RUNNER --body glaeda-runner-mini-std-glaeda --repo manaflow-ai/cmux"])
+        self.assertEqual(plan["routing"]["rollback"], ["gh variable delete CI_NIGHTLY_TRUSTED_RUNNER --repo manaflow-ai/cmux"])
+        self.assertNotIn("MACOS_RUNNER_15 --body", json.dumps(plan["routing"]))
+
+    def test_label_drift_against_the_receipt_and_github_is_reported(self) -> None:
+        self.invoke("--apply", "--labels", "ram48")
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std", "--name", "mini-test-glaeda")
+            text = self.human("--manifest", self.manifest(), "--member", "mini-std", "--name", "mini-test-glaeda")
+        drift = self.by_kind(plan)["register"]["drift"]
+        self.assertEqual({d["against"] for d in drift}, {"receipt", "github"})
+        receipt_drift = next(d for d in drift if d["against"] == "receipt")
+        self.assertEqual(receipt_drift["removed"], ["ram48"])
+        self.assertIn("glaeda-runner-mini-test-glaeda", receipt_drift["added"])
+        self.assertIn("registered labels differ from what this version would register: +glaeda-class-std", text)
+        # GitHub lost a label behind the receipt's back: a plain re-run (labels from the receipt) still says so
+        runners = json.loads((self.state / "runners.json").read_text())
+        runners["runners"][0]["labels"] = [label for label in runners["runners"][0]["labels"] if label["name"] != "ram48"]
+        (self.state / "runners.json").write_text(json.dumps(runners))
+        again = self.by_kind(self.invoke())["register"]
+        self.assertEqual(again["state"], "unchanged")
+        self.assertEqual(again["drift"], [{"against": "github", "added": ["ram48"], "removed": []}])
+        self.assertIn("registered labels differ", again["note"])
+        self.assertTrue(all(e["argv"][:3] != ["api", "-X", "POST"] for e in self.log()[-6:] if e["tool"] == "gh"))
+
+    def installed_release(self, labels: list[str], same_files: bool = False) -> Path:
+        """An OTA release on this fake HOME whose plan registers `labels`; returns the log of its argv."""
+        tag = "r-20260926-abcdefabcdef"
+        root = self.home / ".local/state/glaeda/update"
+        scripts = root / "generations" / tag / "glaeda/scripts"
+        scripts.mkdir(parents=True)
+        (root / "state.json").write_text(json.dumps({"current": tag, "previous": None, "quarantined": []}))
+        seen = self.state / "release-plan.jsonl"
+        if same_files:
+            for name in cr.RUNNER_FILES:
+                shutil.copy2(cr.SCRIPT_DIR / name, scripts / name)
+            return seen
+        make_executable(scripts / "glaeda-cmux-runner", f"""#!/usr/bin/env python3
+import json, os, sys
+with open({os.fspath(seen)!r}, "a") as f:
+    f.write(json.dumps({{"argv": sys.argv[1:], "guard": os.environ.get("{cr.NO_RELEASE_CHECK}")}}) + "\\n")
+print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
+""")
+        return seen
+
+    def test_a_copy_older_than_the_installed_release_blocks_and_shows_its_labels(self) -> None:
+        seen = self.installed_release(["self-hosted", "macOS", "ARM64", "glaeda-mini", "glaeda-runner-new"])
+        old = {"date": "2026-09-24", "source": "a" * 40, "tag": None, "via": "stamp by fleet"}
+        with mock.patch.object(cr, "script_source", return_value=old):
+            plan = self.invoke("--token-stdin", expect=0)
+            self.assertFalse(plan["ready"])
+            self.assertIn("scriptCopy", plan["preflight"]["blocking"])
+            self.assertEqual(plan["scriptCopy"]["state"], "stale")
+            self.assertEqual(plan["scriptCopy"]["labelDrift"],
+                             {"against": "release", "added": ["glaeda-runner-new"], "removed": []})
+            self.assertIn(".local/state/glaeda/update/generations/r-20260926-abcdefabcdef/glaeda/scripts/glaeda-cmux-runner",
+                          plan["preflight"]["checks"]["scriptCopy"]["note"])
+            text = self.human("--token-stdin")
+            self.assertIn("the installed release would register +glaeda-runner-new against this copy", text)
+            # the release's plan ran read-only, with the same arguments, and without re-checking itself
+            calls = [json.loads(line) for line in seen.read_text().splitlines()]
+            self.assertTrue(all("--apply" not in c["argv"] and c["guard"] == "1" for c in calls), calls)
+            self.assertIn("--token-stdin", calls[0]["argv"])
+            blocked = self.invoke("--apply", "--token-stdin", stdin=REG_TOKEN + "\n", expect=1)
+            self.assertFalse([e for e in self.log() if e["tool"] == "config.sh"], "a stale copy registered")
+            self.assertEqual(self.by_kind(blocked)["register"]["state"], "blocked")
+            self.assertFalse(any(c["argv"].count("--apply") for c in
+                                 (json.loads(line) for line in seen.read_text().splitlines())))
+            forced = self.invoke("--apply", "--allow-stale")
+            self.assertEqual(forced["preflight"]["checks"]["scriptCopy"]["level"], "warn")
+            self.assertEqual(self.by_kind(forced)["verify"]["state"], "ok")
+
+    def test_a_newer_or_identical_copy_is_not_stale(self) -> None:
+        self.installed_release(["self-hosted"])
+        newer = {"date": "2026-09-27", "source": "b" * 40, "tag": None, "via": "git"}
+        with mock.patch.object(cr, "script_source", return_value=newer):
+            plan = self.invoke()
+        self.assertEqual(plan["scriptCopy"]["state"], "differs")
+        self.assertEqual(plan["preflight"]["checks"]["scriptCopy"]["level"], "info")
+        self.assertTrue(plan["ready"])
+        # a copy of an older release is stale even from the same day
+        other = {"date": "2026-09-26", "source": "c" * 40, "tag": "r-20260926-000000000000", "via": "release"}
+        with mock.patch.object(cr, "script_source", return_value=other):
+            self.assertEqual(self.invoke()["scriptCopy"]["state"], "stale")
+        with mock.patch.object(cr, "script_source", return_value=None):  # unknown origin counts as older
+            self.assertEqual(self.invoke()["scriptCopy"]["state"], "stale")
+
+    def test_the_release_copy_itself_is_never_checked(self) -> None:
+        shutil.rmtree(self.home / ".local", ignore_errors=True)
+        self.installed_release([], same_files=True)
+        self.assertNotIn("scriptCopy", self.invoke())
+
+    def test_script_source_reads_a_stamp_a_release_or_git(self) -> None:
+        base = Path(self.tmp.name)
+        staged = base / "glaeda-runner/scripts"
+        staged.mkdir(parents=True)
+        (staged / cr.SOURCE_STAMP).write_text(json.dumps({"by": "fleet runner relabel", "date": "2026-09-26T10:00:00Z",
+                                                          "source": "d" * 40}))
+        self.assertEqual(cr.script_source(staged)["date"], "2026-09-26")
+        gen = base / "generations/r-20260925-0123456789ab"
+        (gen / "glaeda/scripts").mkdir(parents=True)
+        (gen / "release.json").write_text(json.dumps({"tag": "r-20260925-0123456789ab", "source": "e" * 40}))
+        self.assertEqual(cr.script_source(gen / "glaeda/scripts")["tag"], "r-20260925-0123456789ab")
+        self.assertIsNone(cr.script_source(base / "nowhere"))
+
     def test_relabel_starts_a_stopped_agent_exactly_once(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
