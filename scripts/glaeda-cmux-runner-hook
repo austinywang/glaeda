@@ -71,6 +71,7 @@ import importlib.util
 import json
 import math
 import os
+import plistlib
 import re
 import select
 import shutil
@@ -1037,6 +1038,41 @@ def ensure_test_keychain(home: Path) -> str:
         return f"test keychain {TEST_KEYCHAIN} unlocked and default"
     except (OSError, subprocess.SubprocessError) as error:
         return f"test keychain: {type(error).__name__}"
+
+
+GUI_UNLOCK_LABEL = "com.teamleaderleo.glaeda.test-keychain-unlock"
+
+
+def unlock_test_keychain_in_gui(home: Path, uid: int | None = None) -> str:
+    """Unlock the test keychain in the GUI (Aqua) security session too. Unlock state is per security session,
+    and each runner's LaunchAgent has SessionCreate, so the job-started unlock never reaches the desktop:
+    there the user's default keychain stays locked and Spotlight asks for its password over UI tests.
+    A LaunchAgent limited to Aqua runs the unlock in that session: RunAtLoad covers every login, and the
+    kickstart here covers a keychain made since. Best effort; without a GUI login there is nothing to fix."""
+    uid = os.getuid() if uid is None else uid
+    keychain = os.fspath(home / "Library/Keychains" / TEST_KEYCHAIN)
+    plist = home / "Library/LaunchAgents" / f"{GUI_UNLOCK_LABEL}.plist"
+    data = plistlib.dumps({"Label": GUI_UNLOCK_LABEL, "LimitLoadToSessionType": "Aqua", "RunAtLoad": True,
+                           "ProgramArguments": ["/usr/bin/security", "unlock-keychain", "-p", "", keychain]},
+                          sort_keys=True)
+
+    def launchctl(*args: str) -> int:
+        return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True, timeout=15).returncode
+
+    try:
+        if not plist.is_file() or plist.read_bytes() != data:
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            aside = plist.with_name(f".{plist.name}.{os.getpid()}")
+            aside.write_bytes(data)
+            os.replace(aside, plist)  # runner instances write it at once
+        service = f"gui/{uid}/{GUI_UNLOCK_LABEL}"
+        # Not loaded yet: bootstrap runs it (RunAtLoad). Another instance may bootstrap first: kickstart again.
+        if launchctl("kickstart", service) and launchctl("bootstrap", f"gui/{uid}", os.fspath(plist)) \
+                and launchctl("kickstart", service):
+            return "test keychain: no GUI session to unlock it in"
+        return "test keychain: GUI session unlock started"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"test keychain: GUI unlock {type(error).__name__}"
 
 
 def ensure_root_shim(bin_dir: Path) -> None:
@@ -3081,6 +3117,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
         if args.test_keychain:
             print(f"{PREFIX}: {ensure_test_keychain(Path.home())}", flush=True)
+            print(f"{PREFIX}: {unlock_test_keychain_in_gui(Path.home())}", flush=True)
         if telemetry:
             meta: dict[str, Any] = {}
             try:  # observation must not fail an admitted job

@@ -597,6 +597,12 @@ fail with errSecInteractionNotAllowed. On PR runners (not trusted ones) the job-
 it first in the user search list and the user's default keychain. It holds test junk only, and every PR job
 can read it.
 
+Unlock state is per security session, and each runner's LaunchAgent has `SessionCreate`, so that unlock
+never reaches the desktop. There the default keychain stayed locked, and Spotlight put "Spotlight wants to
+use the cmux-ci keychain" over UI tests (cmux run 36309272077). The hook therefore also writes and kickstarts
+`com.teamleaderleo.glaeda.test-keychain-unlock`, a LaunchAgent limited to the Aqua session that runs
+`security unlock-keychain` on the test keychain. Its RunAtLoad unlocks it again at every login.
+
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.

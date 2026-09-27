@@ -3577,6 +3577,39 @@ class RunnerTest(unittest.TestCase):
             with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("security", 15)):
                 self.assertEqual(hook.ensure_test_keychain(home), "test keychain: TimeoutExpired")
 
+    def test_test_keychain_is_unlocked_in_the_gui_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            plist = home / "Library/LaunchAgents" / f"{hook.GUI_UNLOCK_LABEL}.plist"
+            service = f"gui/501/{hook.GUI_UNLOCK_LABEL}"
+            loaded: set[str] = set()
+            calls: list[list[str]] = []
+
+            def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+                calls.append(argv[1:])
+                verb = argv[1]
+                if verb == "bootstrap":
+                    loaded.add(service)
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 0 if argv[2] in loaded else 113, "", "")
+
+            with mock.patch.object(hook.subprocess, "run", side_effect=fake):
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
+                agent = plistlib.loads(plist.read_bytes())
+                self.assertEqual(agent["LimitLoadToSessionType"], "Aqua", "the unlock must run in the desktop's session")
+                self.assertTrue(agent["RunAtLoad"], "every login unlocks it again")
+                self.assertEqual(agent["ProgramArguments"], ["/usr/bin/security", "unlock-keychain", "-p", "",
+                                                             os.fspath(home / "Library/Keychains" / hook.TEST_KEYCHAIN)])
+                self.assertEqual(calls, [["kickstart", service], ["bootstrap", "gui/501", os.fspath(plist)]])
+                calls.clear()
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
+                self.assertEqual(calls, [["kickstart", service]], "loaded: a kickstart reruns the unlock")
+            with mock.patch.object(hook.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 5, "", "no gui")):
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: no GUI session to unlock it in")
+            with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 15)):
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI unlock TimeoutExpired")
+
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
