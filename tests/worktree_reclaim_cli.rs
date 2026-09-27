@@ -542,13 +542,49 @@ fn hidden_unique_state_is_never_eligible() {
     fs::create_dir(&source).expect("create submodule source");
     git(&source, &["init", "-b", "main"]);
     commit(&source, "source commit");
-    let absorbed = fixture.add("absorbed");
-    git_as_user(
-        &absorbed,
-        &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
-    );
-    git_as_user(&absorbed, &["commit", "-m", "add absorbed submodule"]);
+    commit(&source, "second source commit");
+    let add_submodule = |name: &str| {
+        let worktree = fixture.add(name);
+        git_as_user(
+            &worktree,
+            &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+        );
+        git_as_user(&worktree, &["commit", "-m", "add absorbed submodule"]);
+        worktree
+    };
+    // Clean, at the recorded commit, and on its remote: preserved, so it does not veto.
+    add_submodule("absorbed");
     fixture.age("absorbed");
+    // A submodule commit recorded by the superproject but never pushed.
+    let unpushed = add_submodule("sub-unpushed");
+    commit(&unpushed.join("sub"), "only this submodule has it");
+    git_as_user(
+        &unpushed,
+        &["commit", "-am", "record unpushed submodule commit"],
+    );
+    fixture.age("sub-unpushed");
+    // An untracked file inside the submodule, which superproject status does not see.
+    let dirty = add_submodule("sub-dirty");
+    fs::write(dirty.join("sub/scratch.txt"), "local\n").expect("write submodule scratch");
+    fixture.age("sub-dirty");
+    // A submodule checked out away from the commit the superproject records.
+    let moved = add_submodule("sub-moved");
+    git(&moved.join("sub"), &["checkout", "--detach", "HEAD~1"]);
+    fixture.age("sub-moved");
+    // A submodule with a linked worktree of its own, whose per-worktree state lives in the
+    // submodule repository that removal deletes.
+    let with_worktree = add_submodule("sub-worktree");
+    let submodule_worktree = fixture.root.join("submodule-own-worktree");
+    git(
+        &with_worktree.join("sub"),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            submodule_worktree.to_str().expect("UTF-8"),
+        ],
+    );
+    fixture.age("sub-worktree");
 
     // A per-worktree ref pointing at a commit nothing else reaches.
     let per_worktree = fixture.add("per-worktree");
@@ -610,10 +646,19 @@ fn hidden_unique_state_is_never_eligible() {
         vetoes_of(&entry_by_name(&fixture, &report, "embedded")),
         ["populated_submodules_present"]
     );
+    let absorbed = entry_by_name(&fixture, &report, "absorbed");
+    assert_eq!(absorbed["decision"]["decision"], "eligible", "{absorbed}");
     assert_eq!(
-        vetoes_of(&entry_by_name(&fixture, &report, "absorbed")),
-        ["populated_submodules_present"]
+        absorbed["decision"]["authority"],
+        "preserved_in_repository_and_submodule_remotes"
     );
+    for name in ["sub-unpushed", "sub-dirty", "sub-moved", "sub-worktree"] {
+        assert_eq!(
+            vetoes_of(&entry_by_name(&fixture, &report, name)),
+            ["populated_submodules_present"],
+            "{name}"
+        );
+    }
     assert_eq!(
         vetoes_of(&entry_by_name(&fixture, &report, "per-worktree")),
         ["per_worktree_refs_present"]
@@ -856,6 +901,49 @@ fn apply_reclaims_only_eligible_worktrees_and_pins_orphan_heads() {
     let again = document(&fixture.run(&fixture.main, &["--apply"]));
     assert_eq!(again["mutation_performed"], false);
     assert_eq!(again["repositories"][0]["summary"]["eligible"], 0);
+}
+
+/// Git refuses to remove any worktree with submodules; a preserved one is removed with its
+/// submodule repositories, and one whose submodule holds local data is kept.
+#[test]
+fn apply_reclaims_a_worktree_whose_submodules_are_on_their_remotes() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("submodule-source");
+    fs::create_dir(&source).expect("create submodule source");
+    git(&source, &["init", "-b", "main"]);
+    commit(&source, "source commit");
+    let add_submodule = |name: &str| {
+        let worktree = fixture.add(name);
+        git_as_user(
+            &worktree,
+            &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+        );
+        git_as_user(&worktree, &["commit", "-m", "add submodule"]);
+        worktree
+    };
+    let preserved = add_submodule("preserved");
+    fixture.age("preserved");
+    let dirty = add_submodule("dirty");
+    fs::write(dirty.join("sub/scratch.txt"), "local\n").expect("write submodule scratch");
+    fixture.age("dirty");
+
+    let receipt = document(&fixture.run(&fixture.main, &["--apply"]));
+    assert_eq!(receipt["circuit_breaker_tripped"], false);
+    assert_eq!(receipt["repositories"][0]["summary"]["reclaimed"], 1);
+    assert!(!preserved.exists(), "preserved worktree removed");
+    assert!(
+        !fixture.main.join(".git/worktrees/preserved").exists(),
+        "its submodule repositories went with it"
+    );
+    assert!(
+        dirty.join("sub/scratch.txt").exists(),
+        "dirty submodule kept"
+    );
+    assert!(
+        ref_exists(&source, "refs/heads/main"),
+        "the submodule's remote is untouched"
+    );
+    assert_eq!(fixture.linked_order(), ["dirty"]);
 }
 
 #[test]
