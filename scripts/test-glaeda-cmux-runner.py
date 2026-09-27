@@ -1773,11 +1773,12 @@ time.sleep(60)
             first = self.job("build", "e3", 8, None, *two, "--instance", "1", env=e2e)
             self.assertIn("units+root-1 for build (compile-gui", first.stdout)
             self.finish("e3")
-            # the fallback test job is a consumer: gui at job start, the producer's root from its restore step
+            # the fallback test job is a consumer: gui from its take-gui step, then the producer's root from its
+            # restore step
             test = self.job("test", "e2", 8, None, *two, env=e2e)
             self.assertEqual(test.returncode, 0, test.stdout)
-            self.assertIn("+gui for test (gui", test.stdout)
-            self.assertNotIn("root-", test.stdout.split("holding", 1)[1])
+            self.assertIn("holding 1/8 units for test (gui-step", test.stdout)
+            self.assertEqual(self.take_gui("e2").returncode, 0)
             self.assertEqual(self.take("/private/tmp/cmux-ci-2", "e2", "--wait", "0").returncode, 1,
                              "the compile admission still holds root 2")
             self.assertEqual(self.take("/private/tmp/cmux-ci", "e2").returncode, 0)
@@ -1815,6 +1816,26 @@ time.sleep(60)
             self.assertEqual(self.take_gui("s1").returncode, 0, "its step's take-gui is a no-op")
         finally:
             for runner in ("s0", "s1", "g0", "g1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_capacity_e2e_test_job_takes_the_gui_token_in_its_step(self) -> None:
+        # test-e2e's `test` runs when the build could not get the gui token: at job start it takes neither, so a
+        # busy token is waited for in its take-gui step instead of refusing the job after GUI_WAIT_S
+        self.fleet()
+        e2e = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-e2e.yml@refs/heads/main"}
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        try:
+            shard = self.job("tests-build-and-lag", "g0", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("+gui for tests-build-and-lag (gui", shard.stdout)
+            test = self.job("test", "t0", 8, None, *two, "--gui-wait", "0", env=e2e)
+            self.assertEqual(test.returncode, 0, test.stdout)
+            self.assertIn("holding 1/8 units for test (gui-step", test.stdout)
+            self.assertEqual(self.take_gui("t0", "--wait", "1").returncode, 1, "the GUI job still holds it")
+            self.finish("g0")
+            self.assertEqual(self.take_gui("t0", "--wait", "5").returncode, 0)
+        finally:
+            for runner in ("g0", "t0"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
@@ -1858,7 +1879,7 @@ time.sleep(60)
             self.assertEqual(hook.job_class(job, home, home), ("compile", True))
         # test-e2e runs its tests in the console session: build compiles and tests, test is the fallback
         self.assertEqual(hook.job_class("build", home, home, "test-e2e.yml"), ("compile-gui", False))
-        self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui", False))
+        self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui-step", False))
         self.assertEqual(hook.job_class("lint", home, home, "test-e2e.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", "someone/else", home, "test-e2e.yml"), ("isolated", False))
         self.assertEqual(hook.CLASS_COST["compile-gui"], (2, ("root",)),

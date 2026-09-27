@@ -163,7 +163,7 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("reload-build.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
-                        ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui",
+                        ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
@@ -181,7 +181,8 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # never holds a root while it waits for the token. A one-root mini gives it gui and the root at job start, as
 # for gui, so a shard there still waits GUI_WAIT_S for a sibling's token and take-gui is a no-op. A cmux
 # revision without the take-gui step would run its tests without the token, so this class ships after that
-# step (cmux#15012).
+# step (cmux#15012). test-e2e's `test` job is gui-step too (cmux#15037): it runs only when the build's take-gui
+# could not get the token, so asking for it again at job start waited GUI_WAIT_S and was refused.
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
