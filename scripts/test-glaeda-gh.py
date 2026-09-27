@@ -15,7 +15,9 @@ import sys
 import tempfile
 import threading
 import time
+import socket
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -465,6 +467,27 @@ class ControllerTest(Base):
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+class TransportErrorTest(unittest.TestCase):
+    """glaeda-gh's http() helper shadows the `http` package. An except clause naming
+    http.client raised AttributeError on the first connection failure and aborted every tick."""
+
+    @staticmethod
+    def closed_port() -> int:
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            return server.getsockname()[1]
+
+    def test_unreachable_controller_is_a_watch_error(self) -> None:
+        ctl = gg.Controller(f"http://127.0.0.1:{self.closed_port()}", None)
+        with self.assertRaises(gg.WatchError):
+            ctl.events(None)
+
+    def test_unreachable_github_is_a_watch_error(self) -> None:
+        api = f"http://127.0.0.1:{self.closed_port()}"
+        with mock.patch.object(gg, "API", api), self.assertRaises(gg.WatchError):
+            gg.http("GET", api + "/rate_limit", {})
 
 
 class DaemonTest(Base):
