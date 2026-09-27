@@ -98,7 +98,7 @@ HOLDER_MAX_S = 5 * 24 * 3600  # GitHub's limit for a self-hosted job; the job's 
 # takes one writer at a time, so a compile holds the persistent-dd token; GUI jobs share one console
 # session (and tests-build-and-lag runs pkill -x "cmux DEV"), so they hold the gui token. An unknown
 # job is treated as a compile: the safe side of both.
-JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui", "tests-build-and-lag": "gui",
+JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui-step", "tests-build-and-lag": "gui",
                "cli-product-tests": "product", "swift-package-tests": "light",
                # side lanes: no GUI, no persistent state. cli-pipe-regressions builds only cmux-cli, into
                # its own $RUNNER_TEMP DerivedData; remote-daemon-macos-tests is go test; claude-wrapper is node.
@@ -165,9 +165,17 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # compile-gui takes no gui token at job start: the step that decides whether the build tests takes it with
 # glaeda-canonical-root take-gui (cmux#14705), and leaves the tests to test-e2e's `test` job when take-gui gives
 # way or times out. So its compile leaves the console session to other GUI jobs.
+# gui-step (app-host-unit-tests) is a gui job that, on a mini with more than one root, takes the gui token itself,
+# with take-gui in the step before its restore step, instead of at job start. Its 70 to 230 s product fetch then
+# leaves the console session to other GUI jobs (a shard held the token for its whole job at about 0.13 cores,
+# cmux CI 2026-09-26). It takes the token before the producer's root, the order gui jobs take them in, so it
+# never holds a root while it waits for the token. A one-root mini gives it gui and the root at job start, as
+# for gui, so a shard there still waits GUI_WAIT_S for a sibling's token and take-gui is a no-op. A cmux
+# revision without the take-gui step would run its tests without the token, so this class ships after that
+# step (cmux#15012).
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
-    "compile-gui": (2, ("root",)),
+    "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
     "isolated": (2, ()), "simulator": (2, ("simulator",)), "light": (1, ()), "seed": (2, ())}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
 # never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
@@ -236,7 +244,7 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
 CANONICAL_ROOT_ENV = "CMUX_CI_CANONICAL_ROOT"
 # With more than one root, these restore a producer's product into the producer's root (#filePath is baked
 # in there), so they take that root from their restore step, not a token-chosen one at job start.
-ROOT_CONSUMERS = ("gui", "product")
+ROOT_CONSUMERS = ("gui", "product", "gui-step")
 # Producers whose admission root sits in a holder of its own (root_holder_file), so a step can swap it for the
 # root of a product the job reuses instead of compiling (glaeda-canonical-root take ROOT --switch): the old
 # root is let go once the new one is held, so a switch that times out leaves the job on its old root.
@@ -607,7 +615,7 @@ THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
 # GLAEDA_RUNNER_CONSOLE_GATE=0 turns all of it off.
 IOREG = os.environ.get("GLAEDA_RUNNER_IOREG") or "/usr/sbin/ioreg"
 CONSOLE_GATE = os.environ.get("GLAEDA_RUNNER_CONSOLE_GATE", "1") != "0"
-CONSOLE_CLASSES = ("gui",)  # job classes that run in the console session from their first step
+CONSOLE_CLASSES = ("gui", "gui-step")  # job classes whose tests need the console session
 GATE_CONSOLE_EVERY_S = 30.0
 
 
@@ -1711,6 +1719,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         # a consumer must use the producer's root, which only its restore step knows: it takes that root
         # itself with glaeda-canonical-root take (take-root below) instead of a token-chosen one here
         tokens = tuple(t for t in tokens if t != "root")
+        if klass == "gui-step":  # and the gui token, which its step takes before that root (take-gui)
+            tokens = tuple(t for t in tokens if t != "gui")
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
@@ -2003,7 +2013,7 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
 
 # A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
 # the costliest takes a persistent-dd and a root token, and a shard the gui token (CLASS_COST).
-ROOT_FIT_UNITS = max(CLASS_COST[k][0] for k in ("compile", "gui", "product", "compile-gui"))
+ROOT_FIT_UNITS = max(CLASS_COST[k][0] for k in ("compile", "gui", "product", "compile-gui", "gui-step"))
 
 
 def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None = None,

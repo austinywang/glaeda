@@ -756,7 +756,7 @@ class HookTest(unittest.TestCase):
         self.fleet()
         one = ("--canonical-roots", "1")
         try:
-            consumer = self.job("app-host-unit-tests", "g0", 4, None, *one)
+            consumer = self.job("tests-build-and-lag", "g0", 4, None, *one)
             self.assertIn("root-1", consumer.stdout)
             got = self.step(["take-root", "--root", "/private/tmp/cmux-ci-2", *one], "g0")
             self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci-2"), got.stderr)
@@ -770,7 +770,7 @@ class HookTest(unittest.TestCase):
             self.assertIn("still in use", waited.stderr)
             self.finish("g0")
             self.assertEqual(self.step(["take-root", "--root", "2", *one], "x0").returncode, 0, "released with g0")
-            late = self.job("app-host-unit-tests", "g1", 4, None, *one)
+            late = self.job("tests-build-and-lag", "g1", 4, None, *one)
             self.assertIn("root-1", late.stdout)
             blocked = self.step(["take-root", "--root", "2", "--wait", "1", *one], "g1")
             self.assertEqual(blocked.returncode, 1, "and a root-1 holder waits for x0 in turn")
@@ -844,7 +844,7 @@ class HookTest(unittest.TestCase):
         two = ("--canonical-roots", "2", "--compile-slots", "2")
         state = self.dir / "state"
         try:
-            self.assertEqual(self.job("app-host-unit-tests", "g0", 8, None, *two).returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "g0", 8, None, *two).returncode, 0)
             self.assertTrue((state / "host-lock-holder-g0.gui").exists())
             self.assertEqual(self.take_gui("g0").returncode, 0, "a job holding gui from admission: a no-op")
             self.assertEqual(self.job("macos-compile-admission", "c0", 8, None, *two).returncode, 0)
@@ -895,7 +895,7 @@ class HookTest(unittest.TestCase):
             # the gui runner's label brings only console jobs, whatever their id
             side = self.job("swift-package-tests", "g0", 8, None, "--gui-runner", env=locked)
             self.assertIn("refused: console:", side.stdout)
-            off = self.job("app-host-unit-tests", "g1", 8, None, env={**locked, "GLAEDA_RUNNER_CONSOLE_GATE": "0"})
+            off = self.job("tests-build-and-lag", "g1", 8, None, env={**locked, "GLAEDA_RUNNER_CONSOLE_GATE": "0"})
             self.assertEqual(off.returncode, 0, "the kill switch turns the check off")
             self.finish("g1")
             compile_ = self.job("macos-compile-admission", "c0", 8, None, env=locked)
@@ -906,7 +906,7 @@ class HookTest(unittest.TestCase):
             self.assertIn("take-gui: console: the console session (cmux) is screen-locked", gave.stderr)
             self.assertFalse((state / "host-lock-holder-c0-gui.pid").exists())
             self.finish("c0")  # its root
-            admitted = self.job("app-host-unit-tests", "g2", 8, None, env=self.fake_ioreg(False))
+            admitted = self.job("tests-build-and-lag", "g2", 8, None, env=self.fake_ioreg(False))
             self.assertEqual(admitted.returncode, 0, admitted.stdout)
             self.assertIn("+gui", admitted.stdout)
         finally:
@@ -921,7 +921,7 @@ class HookTest(unittest.TestCase):
         results: dict[str, subprocess.CompletedProcess] = {}
         try:
             self.assertIn("root-1", self.job("macos-compile-admission", "c0", 8, None, *two).stdout)
-            self.assertEqual(self.job("app-host-unit-tests", "g0", 8, None, *two).returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "g0", 8, None, *two).returncode, 0)
             waiter = threading.Thread(target=lambda: results.setdefault("g0", self.take("1", "g0", "--wait", "40")))
             waiter.start()
             deadline = time.monotonic() + 15
@@ -1278,7 +1278,7 @@ class HookTest(unittest.TestCase):
         self.fleet()
         try:
             self.assertEqual(self.job("tests-build-and-lag", "g0").returncode, 0)
-            other = self.job("app-host-unit-tests", "g1", 4, None, "--gui-wait", "0")
+            other = self.job("tests-build-and-lag", "g1", 4, None, "--gui-wait", "0")
             self.assertIn("refused: capacity: the gui token is taken", other.stdout)
             for n, lane in enumerate(("cli-pipe-regressions", "remote-daemon-macos-tests", "claude-wrapper")):
                 side = self.job(lane, f"s{n}", units=8)
@@ -1302,7 +1302,7 @@ class HookTest(unittest.TestCase):
             first = self.job("macos-compile-admission", "c0", 4, None, *slots, "--instance", "0")
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertIsNone(hook.mini_full(capacity, 4, root), "2 units, pdd-1 and root-2 are free")
-            shard = self.job("app-host-unit-tests", "g1", 4, None, *slots, "--instance", "1", "--gui-wait", "0")
+            shard = self.job("tests-build-and-lag", "g1", 4, None, *slots, "--instance", "1", "--gui-wait", "0")
             self.assertEqual(shard.returncode, 0, shard.stdout + shard.stderr)
             # 1 unit left: the next compile would be refused, so root runners stop; a light side job still fits
             self.assertEqual(hook.mini_full(capacity, 4, root),
@@ -1502,13 +1502,13 @@ time.sleep(60)
             self.finish("t1")
             os.kill(xctest, 9)
             self.assertTrue(self.wait_gone(xctest))
-            shard = self.job("app-host-unit-tests", "t2", 4, None, *recycle)
+            shard = self.job("tests-build-and-lag", "t2", 4, None, *recycle)
             self.assertEqual(shard.returncode, 0, shard.stdout)
             self.assertRegex(shard.stdout, rf"testmanagerd: (stopped|killed) pid {daemon}\b")  # killed: a slow exit
             self.assertTrue(self.wait_gone(daemon))
             self.finish("t2")
             # none running: launchd starts one at the next test
-            none = self.job("app-host-unit-tests", "t3", 4, None, *recycle)
+            none = self.job("tests-build-and-lag", "t3", 4, None, *recycle)
             self.assertIn("testmanagerd: not running", none.stdout)
             self.finish("t3")
             # a wedged daemon that ignores SIGTERM is killed
@@ -1592,7 +1592,7 @@ time.sleep(60)
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
                    "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), "GITHUB_EVENT_NAME": "push",
                    "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux",
-                   "GITHUB_JOB": "app-host-unit-tests", "RUNNER_NAME": "s0"}
+                   "GITHUB_JOB": "tests-build-and-lag", "RUNNER_NAME": "s0"}
         refused = subprocess.run([sys.executable, "-c", stub, "job-started", "--allowed-repo", "manaflow-ai/cmux",
                                       "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
                                       "--watch-pid", str(os.getpid()), "--capacity-units", "4",
@@ -1602,7 +1602,7 @@ time.sleep(60)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
             self.assertIn(f"refused: {note}", refused.stdout)
             # no job-completed for s0 yet: the refusal itself let the gui token and root go
-            again = self.job("app-host-unit-tests", "s1", 4, None, "--gui-wait", "0")
+            again = self.job("tests-build-and-lag", "s1", 4, None, "--gui-wait", "0")
             self.assertEqual(again.returncode, 0, "the refused job let the gui token and root go: " + again.stdout)
         finally:
             self.finish("s0")
@@ -1616,7 +1616,7 @@ time.sleep(60)
             self.assertEqual(product.returncode, 0, product.stdout)
             self.assertIn("units+gui+root-1 for cli-product-tests (product", product.stdout)
             self.finish("p0")
-            self.assertEqual(self.job("app-host-unit-tests", "p1").returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "p1").returncode, 0)
             refused = self.job("cli-product-tests", "p2", 4, None, "--gui-wait", "0")
             self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
         finally:
@@ -1626,7 +1626,7 @@ time.sleep(60)
     def test_capacity_gui_job_waits_for_the_gui_token(self) -> None:
         self.fleet()
         try:
-            self.assertEqual(self.job("app-host-unit-tests", "w0").returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "w0").returncode, 0)
             waited = time.monotonic()
             busy = self.job("tests-build-and-lag", "w1", 4, None, "--gui-wait", "3")
             self.assertEqual(busy.returncode, 1, busy.stdout)
@@ -1636,14 +1636,14 @@ time.sleep(60)
             release = threading.Timer(2.0, self.finish, args=("w0",))
             release.start()
             try:
-                admitted = self.job("app-host-unit-tests", "w2", 4, None, "--gui-wait", "30")
+                admitted = self.job("tests-build-and-lag", "w2", 4, None, "--gui-wait", "30")
             finally:
                 release.join()
             self.assertEqual(admitted.returncode, 0, admitted.stdout)
             self.assertIn("+gui", admitted.stdout)
             # the wait never overshoots its deadline by a poll interval
             waited = time.monotonic()
-            self.job("app-host-unit-tests", "w5", 4, None, "--gui-wait", "1")
+            self.job("tests-build-and-lag", "w5", 4, None, "--gui-wait", "1")
             self.assertLess(time.monotonic() - waited, 4.5, "the last try starts by the deadline")
             # only the gui token is waited for: any other refusal is still immediate
             self.finish("w2")
@@ -1706,8 +1706,8 @@ time.sleep(60)
             # its own restore step re-takes the root it holds: a no-op
             self.assertEqual(self.take("/private/tmp/cmux-ci", "e0").returncode, 0)
             # while it compiles, a GUI job runs beside it, and so does a compile admission in the other root
-            shard = self.job("app-host-unit-tests", "g0", 8, None, *two, "--gui-wait", "0")
-            self.assertIn("+gui for app-host-unit-tests (gui", shard.stdout)
+            shard = self.job("tests-build-and-lag", "g0", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("+gui for tests-build-and-lag (gui", shard.stdout)
             self.assertIn("persistent-dd+root-2", self.job("macos-compile-admission", "e1", 8, None, *two).stdout)
             # the build's tests wait for that shard's token, then take it
             self.assertEqual(self.take_gui("e0", "--wait", "1").returncode, 1, "the shard still holds it")
@@ -1734,11 +1734,43 @@ time.sleep(60)
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_capacity_shard_takes_the_gui_token_before_its_restore(self) -> None:
+        # an app-host shard (gui-step) fetches its product without the gui token and takes it with take-gui in
+        # the step before its restore takes the producer's root: gui, then root, the order gui jobs take them in
+        self.fleet()
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        state = self.dir / "state"
+        try:
+            shard = self.job("app-host-unit-tests", "s0", 8, None, *two, "--gui-wait", "0")
+            self.assertEqual(shard.returncode, 0, shard.stdout)
+            self.assertIn("holding 1/8 units for app-host-unit-tests (gui-step", shard.stdout)
+            self.assertFalse((state / "host-lock-holder-s0.gui").exists())
+            # while the shard fetches, another GUI job takes the console session
+            other = self.job("tests-build-and-lag", "g0", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("+gui for tests-build-and-lag (gui", other.stdout)
+            self.assertEqual(self.take_gui("s0", "--wait", "1").returncode, 1, "the GUI job still holds it")
+            self.finish("g0")
+            self.assertEqual(self.take_gui("s0", "--wait", "5").returncode, 0)
+            self.assertTrue((state / "host-lock-holder-s0.gui").exists())
+            self.assertEqual(self.take_gui("s0").returncode, 0, "a second take-gui is a no-op")
+            self.assertEqual(self.take("/private/tmp/cmux-ci", "s0").returncode, 0)
+            refused = self.job("tests-build-and-lag", "g1", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
+            self.assertIn("the gui token holder released", self.finish("s0"))
+            # a one-root mini gives the shard gui and its root at job start, as for a gui job
+            one = self.job("app-host-unit-tests", "s1", 8, None, "--gui-wait", "0")
+            self.assertIn("holding 1/8 units+gui+root-1 for app-host-unit-tests (gui-step", one.stdout)
+            self.assertEqual(self.take_gui("s1").returncode, 0, "its step's take-gui is a no-op")
+        finally:
+            for runner in ("s0", "s1", "g0", "g1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_capacity_gui_wait_stops_once_the_refusal_is_not_the_gui_token(self) -> None:
         self.fleet()
         release = None
         try:
-            self.assertEqual(self.job("app-host-unit-tests", "x0", 4).returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "x0", 4).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "x1", 4).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "x2", 4).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "x5", 4).returncode, 0)

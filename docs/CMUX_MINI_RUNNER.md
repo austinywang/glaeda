@@ -117,8 +117,11 @@ What `--apply` does:
      plus units and tokens under `/Users/Shared/cmux-build-fleet/capacity`, all as
      `flock`s held by the job's detached holder, so a crash frees them. The cost comes
      from `GITHUB_JOB`: `macos-compile-admission` 2 units plus the `persistent-dd`
-     token (one writer of the kept DerivedData at a time), `app-host-unit-tests` and
-     `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
+     token (one writer of the kept DerivedData at a time), `tests-build-and-lag` 1 unit
+     plus the `gui` token (one console session), `app-host-unit-tests` 1 unit (on a mini
+     with more than one root it takes the `gui` token itself with take-gui in the step
+     before its restore, so its product fetch leaves the console session to other GUI
+     jobs; a one-root mini gives it the token at job start),
      test-e2e's `build` (compile, then the selected tests in the console session) 2 units
      (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
      unit plus the `gui` token, `cli-product-tests` 1 unit plus the `gui` token (its XCTest
@@ -486,9 +489,10 @@ in at the producer's root. So one root job per root per mini:
 
 - Root jobs are compile (macos-compile-admission and any unknown job id), compile-gui (test-e2e's `build`:
   a producer that takes the gui token later, in its own step with take-gui, and no persistent-dd: it only
-  clones its root's kept state, which the root token already guards), gui (app-host-unit-tests,
-  tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests,
-  which also holds the gui token).
+  clones its root's kept state, which the root token already guards), gui (tests-build-and-lag,
+  app-host-test-rerun's `rerun`, test-e2e's `test`), gui-step (app-host-unit-tests: a gui job that takes
+  the gui token with take-gui before its restore step takes the root, the order gui jobs take them in) and
+  product (cli-product-tests, which also holds the gui token).
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
 - Light jobs take no root.
@@ -532,7 +536,8 @@ in at the producer's root. So one root job per root per mini:
   gui token and GitHub gave the second GUI job to the other root runner, which waited up to 240 s and
   refused (10 of 17 refusals in the hour to 2026-09-26 03:40Z). It is never a root runner, so
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
-  gui token, and the producer's root in its restore step.
+  gui token (an app-host shard in the step before its restore instead), and the producer's root in its
+  restore step.
 - `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
 - `declared_pools` and glaeda-route count only the pool labels; the root and side labels split each mini's
   runners between them.
