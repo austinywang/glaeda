@@ -68,8 +68,8 @@ What `--apply` does:
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
-     so a PR job never lands on a mini that is busy with other work. It is refused fast,
-     so the pool picker re-runs it elsewhere, when the host is reserved
+     so a PR job never lands on a mini that is busy with other work. It is refused, so
+     cmux's rescue re-runs it on Blacksmith, when the host is reserved
      (`reservation.json`, `glaeda-reservation/v1` with integer Unix-second `since` and
      `until`, active while now is before `until`, whoever owns it; an unreadable or
      invalid marker also refuses, an expired one is ignored; parsed by
@@ -128,11 +128,14 @@ What `--apply` does:
      run shares the user's testmanagerd with the GUI jobs, see 2h2),
      `swift-package-tests` and the side lanes `cli-pipe-regressions`,
      `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
-     as a compile. When units or a token are taken it refuses at once with
-     `refused: capacity: ...`, which the refusal rescue re-runs elsewhere; it never
-     waits. Because `flock` gives no preference to the exclusive waiter, it also
-     refuses while another process (the build worker in `with-host-lock`) is waiting
-     for `host.lock`, so the worker gets the host as soon as the running PR jobs end.
+     as a compile. When units or a token are taken it retries for `--gui-wait` (240 s,
+     inside cmux's 360 s refusal window), then refuses with `refused: capacity: ...`,
+     which the refusal rescue re-runs on Blacksmith once the run ends. The listener gate
+     let the runner listen, so the mini had room a moment earlier and the wait usually
+     outlasts the job that took it. Because `flock` gives no preference to the exclusive waiter, it also
+     takes nothing while another process (the build worker in `with-host-lock`) is waiting
+     for `host.lock`: it retries through the same wait, so the worker gets the host as soon
+     as the running PR jobs end.
      Admissions on one mini are serialized for a moment (`capacity/admission.lock`),
      so two jobs never split the free units between them.
    - The toolchain check also requires `gh` on the job PATH: cmux's CI scripts call
@@ -217,8 +220,8 @@ What `--apply` does:
        (`--gui-wait`, inside cmux's 360 s refusal window) instead of refusing.
        (cmuxterm-hq#661, Workstream 7.) A side runner listens with one unit free, so
        a 2-unit side lane (cmux's release-build, reload-build, cmux-tui) that finds
-       fewer units than it needs waits for them the same 240 s instead of refusing;
-       a root runner still refuses at once.
+       fewer units than it needs waits for them the same 240 s instead of refusing,
+       as does a root runner that lost a race for its units.
      - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
@@ -234,6 +237,17 @@ What `--apply` does:
      rescue re-runs it elsewhere, and makes `take-gui` give way (exit 3), so test-e2e's
      build leaves its tests to the `test` job. An unreadable state changes nothing;
      `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
+   - **When free disk is under the floor** (every runner). The gate reads the
+     `--min-free-gib` of the runner's own job-started hook and `statvfs` on every poll,
+     and holds the listener while free disk is below it, since job-started would refuse
+     every job. On 2026-09-27, 68 of the fleet's 151 refusals in 24 h were this one,
+     mostly seeds on cmuxs-mac-mini-6 at 134 of 150 GiB. A hold ends only 2 GiB above the
+     floor, so a mini at the edge does not flap. `glaeda-disk --pressure` reads the highest
+     floor among the user's runner hooks (`~/actions-runner*`, the default runner dirs) and,
+     on HOME's volume, starts freeing at floor + 4 GiB, up to floor + 20 GiB (never past half
+     the disk), whatever its `--low` and `--target`: otherwise a 460 GiB mini between the default
+     low (about 115 GiB) and a 150 GiB floor would stay held with nothing freed. A hold past
+     30 min logs once that space must be freed by hand.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as

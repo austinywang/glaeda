@@ -38,8 +38,9 @@ re-runs it elsewhere) when:
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
 With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2d) it takes a weighted
-share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity, and refuses
-with "refused: capacity: ..." rather than wait when they are taken (take_capacity).
+share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity). When
+they are taken it retries for --gui-wait seconds (--guest-wait for another repository's job, CAPACITY_WAIT), then
+refuses with "refused: capacity: ...".
 Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
 
 An admitted job also gets a detached host sampler (unless --no-telemetry): it records load, the cores used by
@@ -65,7 +66,8 @@ host lock, a reservation, or a fleet build waiting for the lock), every capacity
 taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
 down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
-(console_refusal). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
+(console_refusal). Every runner also stops listening while free disk is under its job-started hook's --min-free-gib
+(Gate.low_disk). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
 for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
 
@@ -208,18 +210,13 @@ GUEST_POLL_S = 5.0
 # a refusal. 240 s covers a sibling shard's gui hold (about 90 s, up to about 4 min on a loaded mini), so the
 # listener gate need not hold a root runner off for the gui token (hq#661 Workstream 7).
 GUI_WAIT_S = 240.0
-GUI_TOKEN_TAKEN = "capacity: the gui token is taken"
-# An iOS simulator job (ios-simulator, screenshots) refused only for the one simulator token waits the same
-# GUI_WAIT_S for it. Such a job holds it about 2 to 5 min (up to 12), and both such refusals on 2026-09-27
-# 14:00-17:30Z met a holder that finished within 4 min, while a refusal waits for its whole run to end before
-# the rescue re-runs it.
-SIMULATOR_TOKEN_TAKEN = "capacity: the simulator token is taken"
-# A side runner (an instance past --canonical-roots) listens while one unit is free, so a 2-unit isolated
-# side lane (cmux's release-build, reload-build, cmux-tui) can reach a mini with one unit left. A cmux job
-# refused there only for units waits for them for the same GUI_WAIT_S (--gui-wait): side-lane jobs are minutes
-# long, while a refusal waits for the whole run to finish before the rescue re-runs it. Root runners keep
-# refusing at once: their listener gate already holds them until a root job's units are free.
-UNITS_SHORT = re.compile(r"capacity: [0-9]+ of [0-9]+ units free, ")
+# CAPACITY_WAIT: every capacity refusal of a cmux job waits the same GUI_WAIT_S (--gui-wait) before it refuses,
+# not only the gui token's. That covers units, the simulator token (an iOS job holds it about 2 to 5 min), root
+# and persistent-dd tokens and a fleet build on the host lock. The listener gate let this runner listen, so the
+# mini had room a moment ago and another runner's job took it first, a race the gate cannot close. cmux's rescue
+# re-runs a refused job only after its whole run ends (cmux#14766), on Blacksmith (cmux#15035), so refusing fast
+# gains nothing, and the wait usually outlasts the other job's hold. Units, token and host-lock refusals were
+# 40 of the fleet's 151 refusals in the 24 h to 2026-09-27 18:00Z, besides 35 gui-token ones already waited for.
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -2120,13 +2117,15 @@ def runner_units(runner_dir: Path) -> int:
 
 class RunnerScope(NamedTuple):
     """What this runner's job-started hook admits with: its --capacity-units, --compile-slots and
-    --canonical-roots, whether it is a root runner (instance below canonical roots, glaeda-cmux-runner) and
-    whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner)."""
+    --canonical-roots, whether it is a root runner (instance below canonical roots, glaeda-cmux-runner),
+    whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner) and its
+    --min-free-gib disk floor (0: none)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
     root: bool = False
     gui: bool = False
+    min_free_gib: float = 0.0
 
 
 def listen_fit_units(runner_dir: Path) -> int:
@@ -2157,7 +2156,22 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     roots = max(1, flag("canonical-roots", 1))
     gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots, instance < roots and not gui,
-                       gui)
+                       gui, min_free_gib(text))
+
+
+def min_free_gib(text: str) -> float:
+    """The last unquoted --min-free-gib in a job-started hook script, as glaeda-cmux-runner writes it (:g, so 1e+03
+    is a valid form), or 0 without one or when it is not a finite number. glaeda-disk's runner_floor_gib reads the
+    same pattern (MIN_FREE_GIB_RE there; a test keeps the two equal)."""
+    values = re.findall(MIN_FREE_GIB_RE, text)
+    try:
+        value = float(values[-1]) if values else 0.0
+    except ValueError:
+        return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"
 
 
 # A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
@@ -2435,6 +2449,10 @@ def source_identity() -> tuple[int, int, int] | None:
     return st.st_ino, st.st_mtime_ns, st.st_size
 
 
+GATE_DISK_RESUME_GIB = 2.0  # a disk hold ends only this far above the floor
+GATE_DISK_NOTE_S = 30 * 60  # two glaeda-disk --pressure runs (every 15 min) that did not end the hold
+
+
 class Gate:
     """run.sh under the listener gate. The whole runner tree (run.sh, run-helper.sh, Runner.Listener and a
     job's Runner.Worker) stays in the gate's process group, so launchd's group cleanup still covers it. A
@@ -2463,6 +2481,8 @@ class Gate:
         self.load_waived = False  # a hold ran past GATE_LOAD_MAX_HOLD_S; ignored until the load falls
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
         self.console_at = -GATE_CONSOLE_EVERY_S
+        self.disk_since: float | None = None  # when the current disk hold began
+        self.disk_noted = False  # the hold ran past GATE_DISK_NOTE_S and said so once
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -2509,7 +2529,8 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
+        return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
+                or self.low_disk())
 
     def yield_to_fleet(self) -> None:
         """A fleet build waiting for the host lock waits for every holder, the idle catch-up's shared hold
@@ -2579,7 +2600,35 @@ class Gate:
             self.load_since = None
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
-                or self.locked(fresh=True))
+                or self.locked(fresh=True) or self.low_disk())
+
+    def low_disk(self) -> str | None:
+        """Why job-started would refuse every job for free disk (disk_refusal against this runner's own
+        --min-free-gib), or None. A listening runner under the floor took every job its label brought and refused
+        it: 68 of the fleet's 151 refusals in the 24 h to 2026-09-27 18:00Z, mostly seeds on cmuxs-mac-mini-6 at
+        134 of 150 GiB. Held off, the job goes to another runner or waits in GitHub's queue while glaeda-disk
+        --pressure frees space. statvfs is cheap, so every poll reads it.
+        A hold resumes only at GATE_DISK_RESUME_GIB above the floor, so a mini at the edge does not flap. glaeda-disk
+        --pressure reads the same floor and frees space up to it; a hold past GATE_DISK_NOTE_S logs once that it could
+        not, so an operator frees space by hand."""
+        # the margin and the hold timer apply only while the listener is actually held off for disk, so a
+        # listening runner that dips once is stopped only on two readings under the floor itself
+        holding = self.child is None and (self.held or "").startswith("disk:")
+        if not holding:
+            self.disk_since, self.disk_noted = None, False
+        floor = runner_scope(self.runner_dir).min_free_gib
+        why = disk_refusal(os.path.dirname(self.host_lock), floor + GATE_DISK_RESUME_GIB if floor > 0 and holding
+                           else floor)
+        if why is None or not holding:
+            return f"disk: {why}" if why else None
+        now = time.monotonic()
+        if self.disk_since is None:
+            self.disk_since = now
+        elif not self.disk_noted and now - self.disk_since >= GATE_DISK_NOTE_S:
+            gate_log(f"held for free disk over {GATE_DISK_NOTE_S / 60:g} min ({why}): glaeda-disk --pressure has not "
+                     "freed enough yet (it also waits while a CI job runs here); check with glaeda-disk --top 25")
+            self.disk_noted = True
+        return f"disk: {why}"
 
     def locked(self, fresh: bool = False) -> str | None:
         """For the gui runner only: why its console session cannot run a GUI job (console_refusal), read at most
@@ -3412,16 +3461,11 @@ def main(argv: list[str] | None = None) -> int:
                                            workflow=job_workflow(),
                                            warm_keys=job_warm_keys(event), taken_out=taken,
                                            warm_target=job_warm_target(event))
-                # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room.
-                # A cmux job refused only for the gui or simulator token waits for it too: the holder is a short job.
+                # A guest has no rescue workflow, so it waits GUEST_WAIT_S for room. A cmux job waits GUI_WAIT_S
+                # for any capacity refusal (CAPACITY_WAIT).
                 if held or not note.startswith("capacity:"):
                     break
-                # decided per try: a cmux job waits only while its latest refusal is the gui or simulator token, or, on a
-                # side runner (not the gui runner, whose gate holds it until a unit is free), units (UNITS_SHORT)
-                side = args.instance >= max(1, args.canonical_roots) and not args.gui_runner
-                wait = (args.guest_wait if guest else args.gui_wait
-                        if note.startswith((GUI_TOKEN_TAKEN, SIMULATOR_TOKEN_TAKEN)) or side and UNITS_SHORT.match(note)
-                        else 0)
+                wait = args.guest_wait if guest else args.gui_wait
                 left = start + wait - time.monotonic()
                 if left <= 0:
                     break

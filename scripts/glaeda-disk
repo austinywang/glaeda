@@ -54,6 +54,7 @@ import argparse
 import json
 import os
 import platform
+import math
 import re
 import shutil
 import stat
@@ -1193,8 +1194,32 @@ class Fs:
         return self.free < self.low
 
 
+# A glaeda runner's listener gate holds the runner while free disk is under its job-started hook's --min-free-gib,
+# and resumes only GATE_DISK_RESUME_GIB (2 GiB) above it. Pressure on a disk must start by then, or a 460 GiB mini
+# between the default low (25%:60-200, about 115 GiB) and a 150 GiB floor stays held with nothing freed. The
+# target sits RUNNER_FLOOR_TARGET_GIB higher, so one run lifts the mini well clear of the floor.
+RUNNER_FLOOR_LOW_GIB = 4.0
+RUNNER_FLOOR_TARGET_GIB = 20.0
+RUNNER_HOOKS = "actions-runner*/glaeda-hooks/job-started.sh"  # glaeda-cmux-runner's default --runner-dir
+MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"  # the hook's min_free_gib reads the same
+
+
+def runner_floor_gib(home: Path = HOME) -> float:
+    """The highest --min-free-gib among this user's glaeda runner hooks (the last one in each), or 0."""
+    floor = 0.0
+    for hook in home.glob(RUNNER_HOOKS):
+        try:
+            values = re.findall(MIN_FREE_GIB_RE, hook.read_text())
+            value = float(values[-1]) if values else 0.0
+            if math.isfinite(value):
+                floor = max(floor, value)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+    return floor
+
+
 def filesystems(fams: list[Family], low: str, target: str,
-                tmpfs_low: str = "75%", tmpfs_target: str = "90%") -> dict[int, Fs]:
+                tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0) -> dict[int, Fs]:
     out: dict[int, Fs] = {}
     for f in fams:
         dev = f.root.stat().st_dev
@@ -1202,8 +1227,13 @@ def filesystems(fams: list[Family], low: str, target: str,
             free, total = free_bytes(f.root)
             tmpfs = not DARWIN and fs_type(f.root) == "tmpfs"
             lo, tg = (tmpfs_low, tmpfs_target) if tmpfs else (low, target)
-            out[dev] = Fs(dev, str(mount_point(f.root)), free, total,
-                          space(lo, total), space(tg, total), tmpfs)
+            lo_b, tg_b = space(lo, total), space(tg, total)
+            # a runner's disk floor (runner_floor_gib) lifts both on HOME's volume, where the gate measures it,
+            # never past half the disk, as space() keeps a small disk from permanent pressure
+            if floor_gib > 0 and not tmpfs and dev == HOME.stat().st_dev:
+                lo_b = max(lo_b, min(int((floor_gib + RUNNER_FLOOR_LOW_GIB) * GIB), total // 2))
+                tg_b = max(tg_b, min(int((floor_gib + RUNNER_FLOOR_TARGET_GIB) * GIB), total // 2))
+            out[dev] = Fs(dev, str(mount_point(f.root)), free, total, lo_b, tg_b, tmpfs)
     return out
 
 
@@ -1516,7 +1546,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
-                          a.tmpfs_low, a.tmpfs_target)
+                          a.tmpfs_low, a.tmpfs_target, runner_floor_gib())
         space(a.emergency, GIB)
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
