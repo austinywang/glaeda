@@ -1497,6 +1497,94 @@ time.sleep(60)
             holder.stdout.close()
 
     @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_capacity_preempts_a_yielding_fleet_build(self) -> None:
+        """A fleet build that wrote <host lock>.yield (cmuxterm-hq's catch-up fill) gives way: the job
+        writes .preempted, SIGTERMs it and is admitted once the lock is free. Like the fill, it passes the
+        lock fd to a build in a new session, which lsof lists too."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,signal,subprocess,sys,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\n"
+                                   "build=subprocess.Popen([sys.executable,'-c','import time; time.sleep(300)'],"
+                                   "pass_fds=(fd,),start_new_session=True,stdout=subprocess.DEVNULL)\n"
+                                   "def stop(*a):\n os.killpg(build.pid,signal.SIGTERM); build.wait(); sys.exit(0)\n"
+                                   "signal.signal(signal.SIGTERM, stop)\n"
+                                   "print('held',flush=True)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            (fleet / "host.lock.yield").write_text(f"{holder.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f"preempted the yielding fleet build (pid {holder.pid})", result.stdout)
+            self.assertEqual(holder.wait(timeout=10), 0)
+            note = json.loads((fleet / "host.lock.preempted").read_text())
+            self.assertEqual((note["by"], note["pid"]), ("cli-product-tests", holder.pid))
+        finally:
+            self.finish("w0")
+            with contextlib.suppress(OSError):
+                holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_capacity_never_preempts_a_fill_waiting_behind_another_build(self) -> None:
+        """The fill marks itself yielding while it waits; if another fleet build holds the lock, the job is
+        refused at once and the waiting fill is left alone."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        self.assertEqual(holder.stdout.readline().strip(), "held")  # before the waiter, which must not win
+        waiter = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "print('open',flush=True)\nfcntl.flock(fd,fcntl.LOCK_EX)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(waiter.stdout.readline().strip(), "open")
+            (fleet / "host.lock.yield").write_text(f"{waiter.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+            self.assertIsNone(waiter.poll(), f"the waiting fill was not signalled ({waiter.returncode})")
+            self.assertFalse((fleet / "host.lock.preempted").exists())
+        finally:
+            for proc in (holder, waiter):
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+
+    def test_capacity_never_signals_a_marker_pid_without_the_lock(self) -> None:
+        """A stale or planted .yield naming a process that does not have the lock open changes nothing."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            (fleet / "host.lock.yield").write_text(f"{bystander.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+            self.assertIsNone(bystander.poll(), "the bystander was not signalled")
+            self.assertFalse((fleet / "host.lock.preempted").exists())
+        finally:
+            for proc in (holder, bystander):
+                proc.kill()
+                proc.wait()
+            holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
     def test_capacity_stops_admitting_while_a_fleet_build_waits(self) -> None:
         fleet = self.fleet()
         try:
@@ -1873,6 +1961,29 @@ class GateTest(unittest.TestCase):
 
     def test_an_exclusive_holder_claims_the_host(self) -> None:
         self.hold(fcntl.LOCK_EX)
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_a_yielding_holder_leaves_the_listener_on(self) -> None:
+        self.hold(fcntl.LOCK_EX)
+        (self.tmp / "host.lock.yield").write_text(f"{os.getpid()}\n")
+        self.addCleanup(hook._gate_yield_verdict.clear)
+        self.assertIsNone(self.held(), "a job preempts it, so the gate keeps listening")
+        self.opener("fill-recipe.py")  # a child of this process with the lock open: the yielding build's own
+        hook._gate_yield_verdict.clear()
+        self.assertIsNone(self.held())
+        worker = self.opener("with-host-lock.py")
+        worker_pid = worker.pid
+        with mock.patch.object(hook, "yielding_family", return_value={os.getpid()}):
+            hook._gate_yield_verdict.clear()  # another fleet build on the lock: the marker yields nothing
+            self.assertEqual(self.held(), "a fleet build holds the host lock")
+            self.assertIn(worker_pid, hook.host_waiters(os.fspath(self.lock), self.tmp / "state"))
+        self.assertEqual(self.held(), "a fleet build holds the host lock", "kept for GATE_WAITER_EVERY_S")
+        hook._gate_yield_verdict.clear()
+        self.assertIsNone(self.held(), "the opener is this process's child, so part of the yielding build")
+        (self.tmp / "host.lock.yield").write_text("999999\n")  # no such process: a stale marker
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+        (self.tmp / "host.lock.yield").write_text("x" * 100)
         self.assertEqual(self.held(), "a fleet build holds the host lock")
 
     def test_a_reservation_claims_the_host(self) -> None:
@@ -2416,8 +2527,13 @@ class GateTest(unittest.TestCase):
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.child = mock.Mock(pid=4321)
         gate.source = (0, 0, 0)
+        # reload() blocks SIGTERM/SIGINT for the exec'd gate to unblock. With execv mocked that block would
+        # stay on this test process, and every later child would inherit it (a SIGTERM'd holder never dies).
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
         with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
             gate.reload()
+        self.assertIn(signal.SIGTERM, signal.pthread_sigmask(signal.SIG_SETMASK, mask), "blocked across the exec")
         args = execv.call_args[0][1]
         self.assertEqual(args[1:], [os.fspath(HOOK), "listen", "--adopt=4321"])
         gate.source = (0, 0, 0)
