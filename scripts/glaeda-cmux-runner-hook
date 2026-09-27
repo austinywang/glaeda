@@ -1119,8 +1119,9 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     # A consumer on a mini with fewer roots than the producer's (a product compiled at /private/tmp/cmux-ci-2
     # on a two-root mini, restored on a one-root mini): nothing compiles at root k here, so only consumers
     # alias it. A job holding every root this mini has (a consumer's admission on a one-root mini) still takes
-    # root k's token, so it and a job holding no root never share the alias. It cannot deadlock: root k's
-    # other takers hold none of this mini's roots, so none of them waits for this job.
+    # root k's token, so it and a job holding no root never share the alias. A job that takes root k first and
+    # then switches to one of this mini's roots can wait on this job while this job waits on it; neither hangs,
+    # both give up after their --wait (the restore script waits up to 1800 s). No workflow does that switch today.
     extra = k > roots and bool(held) and set(held) >= {f"root-{n}" for n in range(1, roots + 1)}
     if held and not extra and not (switch and all(holder_alive(root_holder_file(state_dir, old)) for old in held)):
         print(f"{PREFIX}: take-root: this job already holds {', '.join(held)}; one root per job"
