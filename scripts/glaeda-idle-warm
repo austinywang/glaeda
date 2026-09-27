@@ -68,7 +68,11 @@ KILL_SWITCH = HOME / ".config/glaeda/idle-warm.disabled"
 JOB_LOG = HOME / "Library/Logs/glaeda-cmux-jobs.jsonl"
 BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
-IDLE_S = 600  # no job started or ended for this long
+# No job started or ended for this long. 12 PR minis, 2026-09-25/27 (glaeda-cmux-jobs.jsonl, 1286 gaps between
+# busy spells, catch-up builds 135 to 630 s): 600 s left 334 gaps eligible and finished about 190 catch-ups;
+# 180 s leaves 657 and finishes about 330, with 35% of starts preempted by a job instead of 29%. A preempted
+# catch-up costs the job at most the 5 s yield and never counts as a failure (settle_attempt).
+IDLE_S = 180
 LOAD_PER_CORE = 0.25
 # The job admission floor (100 GiB, mini-fleet.json disk.min_free_gib) plus a cold compile (up to 36 GiB):
 # a catch-up never leaves the mini refusing jobs on disk.

@@ -773,7 +773,7 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
 
 `glaeda-idle-warm` (the 5-minute idle-warm LaunchAgent from glaeda-mini-setup) closes that gap:
 
-- **When.** No Runner.Worker or xcodebuild, no job started or ended for 10 minutes, 1-minute load under
+- **When.** No Runner.Worker or xcodebuild, no job started or ended for 3 minutes (`IDLE_S`), 1-minute load under
   0.25 per core, thermal pressure nominal, at least 136 GiB free (the 100 GiB admission floor plus a cold
   compile), no reservation, no fleet build holding or waiting for the host lock. Never on cmux-mac-mini (hostname cmuxs-Mac-mini-5, the production
   iOS soak box) or Lawrence's machines, never next to a trusted-only runner (a seeder), and only on

@@ -113,6 +113,19 @@ class GateTest(Base):
         os.utime(log, (50, 50))
         self.assertEqual(warm.last_job_at(log), 200)
 
+    def test_idle_after_three_quiet_minutes(self) -> None:
+        self.assertEqual(warm.IDLE_S, 180)
+        saved = warm.last_job_at
+        stub = types.SimpleNamespace(thermal_pressure_level=lambda: 1)
+        try:
+            warm.running = lambda: ""
+            warm.last_job_at = lambda: 1000.0
+            self.assertIn("a job ran 179 s ago", warm.idle_refusal(stub, 1179.0, self.state))
+            # Past IDLE_S a later gate (load, heat, disk) answers, never the job gate.
+            self.assertNotIn("a job ran", warm.idle_refusal(stub, 1181.0, self.state))
+        finally:
+            warm.last_job_at = saved
+
     def test_pick_root_warms_the_farthest_root_once_per_head(self) -> None:
         predicted = {"root-1": {"seconds": 140.0, "tier": "near", "app_swift_files": 2},
                      "root-2": {"seconds": 266.5, "tier": "far", "app_swift_files": 9},
