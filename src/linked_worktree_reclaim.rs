@@ -19,9 +19,12 @@
 //!   treats as garbage once it expires.
 //! - The objects of this worktree's own submodule repositories. A submodule counts as preserved
 //!   when it is clean, at the commit the superproject records, and every ref it holds is reachable
-//!   from its remote-tracking refs; those objects then come back from the remote, not from disk,
+//!   from its remote-tracking refs or from that commit when a superproject remote's default branch
+//!   records it (the published gitlink); those objects then come back from the remote, not disk,
 //!   and a remote that later drops them takes them with it. Any ref under `refs/remotes/` counts,
-//!   including one written by hand or fetched from a local path, and history the submodule reaches
+//!   including one written by hand or fetched from a local path, as does whatever branch
+//!   `refs/remotes/<name>/HEAD` names; a default branch that records a commit its submodule remote
+//!   never had is trusted too. History the submodule reaches
 //!   only through its reflog goes too, even when preserved superproject history records it. The
 //!   decision says so with
 //!   [`LinkedWorktreeReclaimAuthority::PreservedInRepositoryAndSubmoduleRemotes`].
@@ -150,7 +153,8 @@ pub struct LinkedWorktreeFacts {
     /// A submodule path holds a `.git` entry, or per-worktree submodule repositories exist.
     pub populated_submodules_present: bool,
     /// Every populated submodule is clean, checked out at the commit the superproject records,
-    /// and holds nothing its remote-tracking refs do not reach. True when none is populated.
+    /// and holds nothing its remote-tracking refs, or that commit when a superproject remote's
+    /// default branch records it, do not reach. True when none is populated.
     pub submodules_preserved_on_remotes: bool,
     /// Refs under this worktree's own `refs/worktree/`, `refs/bisect/`, or `refs/rewritten/`.
     pub per_worktree_refs_present: bool,
@@ -225,7 +229,8 @@ pub enum LinkedWorktreeReclaimAuthority {
     /// repository or is covered by the named compensation.
     PreservedInRepository,
     /// As [`Self::PreservedInRepository`], and the worktree's own submodule repositories hold
-    /// nothing their remote-tracking refs do not reach. Their objects go with the worktree, so
+    /// nothing their remote-tracking refs, or the gitlink a superproject remote's default branch
+    /// records, do not reach. Their objects go with the worktree, so
     /// recreating it (`git submodule update --init`) fetches them from those remotes again.
     PreservedInRepositoryAndSubmoduleRemotes,
 }
@@ -1409,9 +1414,10 @@ fn entry_present(path: &Path) -> Result<bool, LinkedWorktreeReclaimError> {
 //
 // `git worktree remove` deletes the worktree's `modules/` directory, and with it every commit,
 // branch, stash, and edit that exists only in those submodule repositories. A submodule counts as
-// preserved only when all of that is reachable from its remote-tracking refs, the one place the
-// superproject's recorded commit is fetched from again. Everything else -- an unusual layout, a
-// nested submodule, a filter, a single unreached ref -- keeps the worktree.
+// preserved only when all of that is reachable from its remote-tracking refs or is the exact commit
+// a superproject remote's default branch records for it: the remote is where `git submodule update`
+// fetches that commit from again. Everything else -- an unusual layout, a nested submodule, a
+// filter, a single unreached ref -- keeps the worktree.
 
 /// Most submodule repositories one worktree's `modules/` directory may hold. More fail closed.
 const MAX_SUBMODULE_REPOSITORIES: usize = 64;
@@ -1438,21 +1444,37 @@ fn observe_submodule_preservation(
         .collect::<Result<Vec<_>, LinkedWorktreeReclaimError>>()?;
     // Each repository must be the checkout of exactly one populated gitlink: a repository no
     // checkout uses keeps an index and a `core.worktree` nothing here inspects.
+    let published_bases = superproject_published_bases(observer, checkout, executor)?;
     let mut checked_out = Vec::with_capacity(populated_gitlinks.len());
     for relative in populated_gitlinks {
-        let Some(repository) =
-            submodule_checkout_preserved(observer, checkout, relative, &repositories, executor)?
+        let Some(preserved) = submodule_checkout_preserved(
+            observer,
+            checkout,
+            relative,
+            &repositories,
+            &published_bases,
+            executor,
+        )?
         else {
             return Ok(None);
         };
-        checked_out.push(repository);
+        checked_out.push(preserved);
     }
-    checked_out.sort();
-    if checked_out != repositories {
+    checked_out.sort_by(|left, right| left.repository.cmp(&right.repository));
+    if !checked_out
+        .iter()
+        .map(|preserved| &preserved.repository)
+        .eq(repositories.iter())
+    {
         return Ok(None);
     }
-    for repository in &repositories {
-        if !submodule_repository_preserved(observer, repository, executor)? {
+    for preserved in &checked_out {
+        if !submodule_repository_preserved(
+            observer,
+            &preserved.repository,
+            preserved.published_commit.as_deref(),
+            executor,
+        )? {
             return Ok(None);
         }
     }
@@ -1527,8 +1549,9 @@ fn submodule_checkout_preserved(
     checkout: &Path,
     relative: &Path,
     repositories: &[PathBuf],
+    published_bases: &[String],
     executor: &impl TimedCommandExecutor,
-) -> Result<Option<PathBuf>, LinkedWorktreeReclaimError> {
+) -> Result<Option<PreservedCheckout>, LinkedWorktreeReclaimError> {
     let path = checkout.join(relative);
     // A `.git` directory here is an embedded repository, which removal deletes outright.
     match std::fs::symlink_metadata(path.join(".git")) {
@@ -1647,13 +1670,97 @@ fn submodule_checkout_preserved(
     let at_recorded_commit = !recorded.is_empty()
         && staged_matches
         && submodule_head.stdout.strip_suffix('\n') == Some(recorded);
-    Ok(at_recorded_commit.then_some(git_dir))
+    if !at_recorded_commit {
+        return Ok(None);
+    }
+    let mut published = false;
+    for base in published_bases {
+        let at_base = observer
+            .git(
+                checkout,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{base}:{relative_text}"),
+                ],
+                executor,
+            )
+            .map_err(|error| git_failure(&error))?;
+        if at_base.status == Some(0) && at_base.stdout.strip_suffix('\n') == Some(recorded) {
+            published = true;
+            break;
+        }
+    }
+    Ok(Some(PreservedCheckout {
+        repository: git_dir,
+        published_commit: published.then(|| recorded.to_owned()),
+    }))
 }
 
-/// Every ref and HEAD of one submodule repository is reachable from its remote-tracking refs.
+/// A populated gitlink whose checkout passed [`submodule_checkout_preserved`].
+struct PreservedCheckout {
+    repository: PathBuf,
+    /// The checked-out commit, when a superproject remote's default branch records it at this path.
+    published_commit: Option<String>,
+}
+
+/// Superproject commits whose recorded gitlinks count as published: HEAD's merge base with each
+/// remote's default branch.
+///
+/// A submodule is fetched by exact commit (`git submodule update` asks the remote for the
+/// recorded object), so a clone often holds its checked-out commit without any remote-tracking
+/// ref reaching it. A default branch's history is then the evidence the remote has it: it is what
+/// review and every fresh checkout go through. Any other pushed branch is not, since Git pushes a
+/// superproject that records an unpushed submodule commit without complaint.
+fn superproject_published_bases(
+    observer: &ProjectCheckoutObserver,
+    checkout: &Path,
+    executor: &impl TimedCommandExecutor,
+) -> Result<Vec<String>, LinkedWorktreeReclaimError> {
+    let head = git(
+        observer,
+        checkout,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        executor,
+    )?;
+    let head = head
+        .stdout
+        .strip_suffix('\n')
+        .unwrap_or_default()
+        .to_owned();
+    let defaults = git(
+        observer,
+        checkout,
+        &["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"],
+        executor,
+    )?;
+    let mut bases = Vec::new();
+    for target in defaults
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("refs/remotes/"))
+    {
+        let base = observer
+            .git(checkout, &["merge-base", &head, target], executor)
+            .map_err(|error| git_failure(&error))?;
+        if base.status == Some(0)
+            && let Some(commit) = base.stdout.strip_suffix('\n')
+            && !commit.is_empty()
+            && !commit.contains('\n')
+        {
+            bases.push(commit.to_owned());
+        }
+    }
+    Ok(bases)
+}
+
+/// Every ref and HEAD of one submodule repository is reachable from its remote-tracking refs, or
+/// from `published_commit`, the commit a superproject remote's default branch records for it.
 fn submodule_repository_preserved(
     observer: &ProjectCheckoutObserver,
     repository: &Path,
+    published_commit: Option<&str>,
     executor: &impl TimedCommandExecutor,
 ) -> Result<bool, LinkedWorktreeReclaimError> {
     let Some(repository_text) = repository.to_str() else {
@@ -1675,13 +1782,18 @@ fn submodule_repository_preserved(
     if remotes.stdout.is_empty() {
         return Ok(false);
     }
-    // `--all` is every ref (stash included) plus HEAD; walking stops at the remote-tracking refs.
-    let unreached = git(
-        observer,
-        repository,
-        &[&git_dir, "rev-list", "-n1", "--all", "--not", "--remotes"],
-        executor,
-    )?;
+    // `--all` is every ref (stash included) plus HEAD; walking stops at the remote-tracking refs
+    // and the published commit.
+    let mut arguments = vec![
+        git_dir.as_str(),
+        "rev-list",
+        "-n1",
+        "--all",
+        "--not",
+        "--remotes",
+    ];
+    arguments.extend(published_commit);
+    let unreached = git(observer, repository, &arguments, executor)?;
     Ok(unreached.stdout.is_empty())
 }
 
