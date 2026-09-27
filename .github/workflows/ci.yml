@@ -149,6 +149,8 @@ jobs:
               Path("scripts/test-glaeda-seed-prefetch.py"),
               Path("scripts/glaeda-idle-warm"),
               Path("scripts/test-glaeda-idle-warm.py"),
+              Path("scripts/glaeda-mini-health"),
+              Path("scripts/test-glaeda-mini-health.py"),
               Path("scripts/glaeda-seed-serve"),
               Path("scripts/glaeda-seed-lan"),
               Path("scripts/test-glaeda-seed-lan.py"),
@@ -197,6 +199,7 @@ jobs:
           python3 scripts/test-glaeda-fleet-cas-prune.py
           python3 scripts/test-glaeda-seed-prefetch.py
           python3 scripts/test-glaeda-idle-warm.py
+          python3 scripts/test-glaeda-mini-health.py
           python3 scripts/test-glaeda-seed-lan.py
           python3 scripts/test-glaeda-lan-fetch.py
           python3 scripts/test-glaeda-gh.py

@@ -35,12 +35,14 @@ What --apply installs (templated for the current user):
                                                LAN_FETCH_ROOT_COPY, which needs sudo: an operator step
     ~/.local/bin/glaeda-idle-warm              from scripts/glaeda-idle-warm (builds main into a far kept root while an
                                                owned cmux mini is idle; a no-op anywhere else)
+    ~/.local/bin/glaeda-mini-health            from scripts/glaeda-mini-health (finds what stops a runner mini, heals what
+                                               the runner user can, reports the rest for ci-dash; a no-op off a runner)
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
-                                  idle-warm,update,gh-watch}.plist
+                                  idle-warm,mini-health,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -680,6 +682,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-warm.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-warm.err"),
         },
+        # Runner mini health (scripts/glaeda-mini-health): a locked console, display sleep, a wedged testmanagerd,
+        # Tailscale down, a stopped runner agent. Heals what this user can without disturbing a job and writes the
+        # report ci-dash's probe reads; it exits at once on a host without glaeda runners.
+        LABEL_PREFIX + "mini-health": {
+            "Label": LABEL_PREFIX + "mini-health",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-mini-health"), "--apply"],
+            "StartInterval": 120,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-mini-health.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-mini-health.err"),
+        },
         # The compiled-product LAN broker (scripts/glaeda-lan-fetch serve-local): CI steps descend from
         # non-Apple processes (Runner.Listener), so Local Network Privacy keeps them off the LAN; they ask this
         # agent over a private Unix socket instead. Apple's python3 is what lets its ssh reach the peers.
@@ -860,7 +876,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-procs", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-                 "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-update", "glaeda-gh"):
+                 "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
+                 "glaeda-update", "glaeda-gh"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -991,7 +1008,8 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-procs", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-update", "glaeda-gh"):
+                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
+                 "glaeda-update", "glaeda-gh"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     for act in actions:

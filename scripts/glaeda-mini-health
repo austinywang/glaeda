@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""glaeda-mini-health: find what stops a cmux runner mini from running jobs, fix what this user can, report the rest.
+
+    glaeda-mini-health            check only: print the report, change nothing
+    glaeda-mini-health --apply    check, heal, write the report (the 2-minute LaunchAgent from glaeda-mini-setup)
+
+Each run checks, as the runner user and without sudo:
+
+  console_locked / console_no_user   the console session is screen-locked or nobody is logged in, so GUI jobs are
+                                     refused here (glaeda#1286). Needs root and a reboot: reported only.
+  autologin_locks                    /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked is set, so
+                                     every auto-login starts locked (cmuxterm-hq#757). Root: reported only.
+  display_sleep                      pmset displaysleep is not 0; the screen lock follows the display sleep. Root.
+  testmanagerd_wedged                this user's testmanagerd stopped half way through tearing down a session: its
+                                     newest session line is "XCIDESession is responsible for cleaning up its socket"
+                                     with no "Closing session", "Tearing down" or "Created session" after it, and
+                                     every XCTest run here hangs. Healed while no test runs, with the runner hook's
+                                     recycle_testmanagerd (glaeda#1281), the same stop a gui job does at its start.
+  tailscale_down                     Tailscale is not Running (Stopped, stuck Starting, no answer). Healed after two
+                                     runs in a row: `tailscale up` when Stopped, else a stop and start of the Tailscale
+                                     VPN service (scutil --nc), as mini-ops tailscale-unstick.sh does by hand. A status
+                                     that does not answer (a loaded mini can time out with the tunnel up), a
+                                     standalone tailscaled (root daemon) or a logged-out node is reported only.
+  runner_stopped:<agent>             a runner LaunchAgent is loaded but not running (KeepAlive leaves it after a clean
+                                     exit). Healed after two runs in a row with `launchctl kickstart`; nothing runs
+                                     in it, so no job is disturbed. The listener gate's holds keep the agent running,
+                                     and a runner cmux_mini_fix.sh runner_hold stopped (HELD) is no finding.
+  runner_unloaded:<agent>            a runner LaunchAgent plist is not loaded: reported only (an operator may have
+                                     unloaded it; glaeda-cmux-runner-fleet --apply loads it).
+
+A heal is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
+but did not last (a runner that exits again), so nothing loops. Each finding reads
+{id, code, severity, since, evidence, auto_fix, note}: auto_fix is "pending" while a heal will be tried,
+"impossible" when this user cannot fix it or the tries ran out. A fixed finding leaves the report and its heal is
+kept under "healed" for a day (auto_fix "done"). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
+build-fleet/ci-dash turns each code into the operator command that fixes it); the state beside it keeps each
+finding's first sighting and the heal tries. It exits at once on a host with no glaeda runner. With KILL_SWITCH
+present it still reports but never heals. Prints one JSON line when it healed something or the findings changed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local/state/glaeda/mini-health"
+REPORT = STATE_DIR / "health.json"
+STATE = STATE_DIR / "state.json"
+KILL_SWITCH = HOME / ".config/glaeda/mini-health.disabled"
+AGENTS = HOME / "Library/LaunchAgents"
+HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh runner_hold's marks
+RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+)?")
+LOGINWINDOW = Path("/Library/Preferences/com.apple.loginwindow.plist")
+TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+TAILSCALE_STANDALONE = "/usr/local/bin/tailscale"
+TESTMANAGERD = "/usr/libexec/testmanagerd"
+SCHEMA = "glaeda-mini-health/v1"
+
+HEAL_EVERY_S = 600
+HEAL_TRIES = 3
+HEALED_KEEP_S = 86400
+HEALED_MAX = 20
+WEDGE_AGE_S = 90  # a teardown finishes in the same millisecond; a signature this old with nothing after is a wedge
+LOG_WINDOW_MIN = 720  # how far back the testmanagerd log is read (never before the daemon started)
+TAILSCALE_WAIT_S = 60
+# The newest of these lines decides: the signature alone means a session teardown that never finished.
+WEDGE_SIGNATURE = "XCIDESession is responsible for cleaning up its socket"
+SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created session")
+# A test that may be talking to testmanagerd (the hook's XCTEST_RUNNING, for hooks without it): the check waits.
+XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
+
+
+def sh(argv: list[str], timeout: float = 15) -> tuple[int, str]:
+    """(exit code, stdout); 127 when it could not run or timed out."""
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
+    return p.returncode, p.stdout
+
+
+def finding(fid: str, severity: str, evidence: str, auto_fix: str, note: str = "") -> dict[str, Any]:
+    return {"id": fid, "code": fid.split(":")[0], "severity": severity, "evidence": evidence[:300],
+            "auto_fix": auto_fix, "note": note[:300]}
+
+
+class Mini:
+    """What the checks read and do on this mini. Tests replace the methods that touch the system."""
+
+    def __init__(self, home: Path = HOME) -> None:
+        self.home = home
+        self.uid = os.getuid()
+        self._hook: Any = None
+
+    def runner_dirs(self) -> list[Path]:
+        return sorted(p for p in self.home.glob("actions-runner-glaeda*") if (p / "glaeda-hooks").is_dir())
+
+    def hook(self) -> Any:
+        """The runner hook module the jobs run (console state, testmanagerd recycler), or None."""
+        if self._hook is None:
+            dirs = self.runner_dirs()
+            path = dirs[0] / "glaeda-hooks" / "glaeda-cmux-runner-hook" if dirs else None
+            sys.dont_write_bytecode = True  # never a __pycache__ in the runner's glaeda-hooks
+            try:
+                loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_health", os.fspath(path))
+                module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                loader.exec_module(module)
+                self._hook = module
+            except Exception:  # noqa: BLE001  (an unreadable hook skips the checks that need it)
+                self._hook = False
+        return self._hook or None
+
+    # ---- reads
+
+    def console(self) -> tuple[str, str | None] | None:
+        hook = self.hook()
+        state = hook.console_state() if hook is not None and hasattr(hook, "console_state") else None
+        return (state.state, state.user) if state is not None else None
+
+    def loginwindow(self) -> dict[str, Any]:
+        try:
+            return plistlib.loads(LOGINWINDOW.read_bytes())
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return {}
+
+    def pmset(self) -> str:
+        return sh(["/usr/bin/pmset", "-g"])[1]
+
+    def processes(self) -> list[tuple[int, int, str, str]]:
+        """(pid, uid, stat, command) for every process."""
+        rows = []
+        for line in sh(["/bin/ps", "-Aww", "-o", "pid=,uid=,stat=,command="])[1].splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+                rows.append((int(parts[0]), int(parts[1]), parts[2], parts[3].strip()))
+        return rows
+
+    def elapsed_s(self, pid: int) -> int | None:
+        text = sh(["/bin/ps", "-o", "etime=", "-p", str(pid)])[1].strip()  # [[dd-]hh:]mm:ss
+        m = re.fullmatch(r"(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)", text)
+        if not m:
+            return None
+        d, h, mi, s = (int(x or 0) for x in m.groups())
+        return ((d * 24 + h) * 60 + mi) * 60 + s
+
+    def session_lines(self, pid: int, minutes: int) -> list[tuple[float, str]] | None:
+        """(time, message) of the daemon's session lines over the last `minutes`, oldest first; None when the
+        log could not be read (a timeout on a loaded mini)."""
+        wanted = " OR ".join(f'eventMessage BEGINSWITH "{s}"' for s in SESSION_LINES[1:])
+        predicate = f'processID == {pid} AND (eventMessage CONTAINS "{WEDGE_SIGNATURE}" OR {wanted})'
+        code, out = sh(["/usr/bin/log", "show", "--last", f"{max(1, minutes)}m", "--style", "ndjson",
+                        "--predicate", predicate], timeout=60)
+        if code != 0:
+            return None
+        rows = []
+        for line in out.splitlines():
+            try:
+                row = json.loads(line)
+                at = datetime.datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S.%f%z").timestamp()
+            except (ValueError, KeyError, TypeError):
+                continue
+            rows.append((at, str(row.get("eventMessage") or "")))
+        return sorted(rows, key=lambda r: r[0])
+
+    def tailscale(self) -> tuple[str, str] | None:
+        """(flavor app|standalone, BackendState or "no answer"), or None without Tailscale."""
+        # the standalone CLI, not the app's "Install CLI" link into Tailscale.app; a dead tailscaled then reads "no answer"
+        standalone = os.path.exists(TAILSCALE_STANDALONE) and "Tailscale.app" not in os.path.realpath(TAILSCALE_STANDALONE)
+        cli = TAILSCALE_STANDALONE if standalone else TAILSCALE_APP if os.path.exists(TAILSCALE_APP) else None
+        if cli is None:
+            return None
+        code, out = sh([cli, "status", "--json"], timeout=15)
+        try:
+            state = str(json.loads(out).get("BackendState") or "no answer")
+        except (ValueError, AttributeError):
+            state = "no answer"
+        return ("standalone" if standalone else "app"), state
+
+    def vpn_service(self) -> str | None:
+        m = re.search(r"([0-9A-F-]{36}).*io\.tailscale\.", sh(["/usr/sbin/scutil", "--nc", "list"])[1])
+        return m.group(1) if m else None
+
+    def runner_agents(self) -> list[tuple[str, bool, bool, str]]:
+        """(label, loaded, running, last exit) for each runner LaunchAgent plist."""
+        out = []
+        for plist in sorted(AGENTS.glob("com.teamleaderleo.glaeda.cmux-runner*.plist")):
+            label = plist.name[:-len(".plist")]
+            if not RUNNER_AGENT.fullmatch(label):
+                continue
+            code, text = sh(["/bin/launchctl", "print", f"gui/{self.uid}/{label}"])
+            state = re.search(r"^\s*state = (\S+)", text, re.M)
+            last = re.search(r"^\s*last exit code = (.+)$", text, re.M)
+            out.append((label, code == 0, bool(state and state.group(1) == "running"),
+                        last.group(1).strip() if last else "?"))
+        return out
+
+    # ---- heals
+
+    def recycle_testmanagerd(self) -> str | None:
+        hook = self.hook()
+        recycle = getattr(hook, "recycle_testmanagerd", None) if hook is not None else None
+        return recycle() if recycle else None
+
+    def tailscale_up(self) -> None:
+        sh([TAILSCALE_APP, "up"], timeout=30)
+
+    def restart_vpn(self, service: str) -> None:
+        sh(["/usr/sbin/scutil", "--nc", "stop", service])
+        time.sleep(3)
+        sh(["/usr/sbin/scutil", "--nc", "start", service])
+
+    def kickstart(self, label: str) -> None:
+        sh(["/bin/launchctl", "kickstart", f"gui/{self.uid}/{label}"])
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+# ---------------------------------------------------------------- checks
+
+
+def check_console(mini: Mini) -> list[dict[str, Any]]:
+    got = mini.console()
+    if got is None or got[0] == "unlocked":
+        return []
+    state, user = got
+    if state == "locked":
+        return [finding("console_locked", "error", f"the console session ({user}) is screen-locked "
+                        "(CGSSessionScreenIsLocked)", "impossible",
+                        "GUI jobs are refused here until it is unlocked; needs root and a reboot")]
+    return [finding("console_no_user", "error", "nobody is logged in at the console", "impossible",
+                    "GUI jobs are refused here; the mini should auto-login its runner user")]
+
+
+def check_power(mini: Mini) -> list[dict[str, Any]]:
+    out = []
+    if mini.loginwindow().get("autoLoginUserScreenLocked"):
+        out.append(finding("autologin_locks", "warn", "loginwindow autoLoginUserScreenLocked is set: every "
+                           "auto-login starts screen-locked", "impossible", "root: delete the key"))
+    m = re.search(r"^\s*displaysleep\s+(\d+)", mini.pmset(), re.M)
+    if m and m.group(1) != "0":
+        out.append(finding("display_sleep", "warn", f"display sleep is {m.group(1)} min; the screen lock "
+                           "follows it", "impossible", "root: pmset -a displaysleep 0"))
+    return out
+
+
+def check_testmanagerd(mini: Mini, now: float) -> list[dict[str, Any]] | None:
+    """None when it cannot judge (a test runs, or no hook): the last report's finding stands."""
+    hook = mini.hook()
+    busy = getattr(hook, "XCTEST_RUNNING", XCTEST_RUNNING) if hook is not None else XCTEST_RUNNING
+    rows = [r for r in mini.processes() if not r[2].startswith("Z") and "E" not in r[2]]  # gone or exiting
+    if any(busy.search(c) for _, _, _, c in rows):
+        return None
+    daemons = [pid for pid, uid, _, c in rows if uid == mini.uid and (c == TESTMANAGERD or c.startswith(TESTMANAGERD + " "))]
+    if not daemons:
+        return []
+    pid = daemons[0]
+    age = mini.elapsed_s(pid)
+    lines = mini.session_lines(pid, min(LOG_WINDOW_MIN, age // 60 + 1) if age else LOG_WINDOW_MIN)
+    if lines is None:
+        return None
+    if not lines or WEDGE_SIGNATURE not in lines[-1][1] or now - lines[-1][0] < WEDGE_AGE_S:
+        return []
+    at = datetime.datetime.fromtimestamp(lines[-1][0]).strftime("%H:%M:%S")
+    return [finding("testmanagerd_wedged", "error", f"testmanagerd pid {pid} stopped mid-teardown at {at} "
+                    f"(last line: {WEDGE_SIGNATURE}); every XCTest run here hangs", "pending",
+                    "stopped while no test runs; launchd starts a fresh one at the next test")]
+
+
+def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
+    got = mini.tailscale()
+    if got is None or got[1] == "Running":
+        return []
+    flavor, state = got
+    evidence = f"Tailscale BackendState {state}"
+    if flavor == "standalone":
+        return [finding("tailscale_down", "error", evidence + " (standalone tailscaled)", "impossible",
+                        "root: sudo launchctl kickstart -k system/com.tailscale.tailscaled")]
+    if state.startswith("Needs"):
+        return [finding("tailscale_down", "error", evidence, "impossible", "a person logs the node in")]
+    if state == "no answer":  # a loaded mini can time out while the tunnel is up: never restart it on a guess
+        return [finding("tailscale_down", "warn", evidence, "impossible",
+                        "tailscale status did not answer; mini-ops tailscale-unstick.sh looks closer")]
+    return [finding("tailscale_down", "error", evidence, "pending",
+                    "tailscale up when Stopped, else a stop and start of the Tailscale VPN service")]
+
+
+def check_runners(mini: Mini) -> list[dict[str, Any]]:
+    out = []
+    for label, loaded, running, last in mini.runner_agents():
+        agent = label.rsplit(".", 1)[1] if label[-1].isdigit() else "0"
+        if (HELD / ("actions-runner-glaeda" + ("" if agent == "0" else f"-{agent}"))).exists():
+            continue  # cmux_mini_fix.sh runner_hold stopped it on purpose (an ineligible node)
+        if not loaded:
+            out.append(finding(f"runner_unloaded:{agent}", "error", f"{label} is not loaded", "impossible",
+                               "glaeda-cmux-runner-fleet --apply loads it"))
+        elif not running:
+            out.append(finding(f"runner_stopped:{agent}", "error", f"{label} is loaded but not running "
+                               f"(last exit code {last})", "pending", "launchctl kickstart"))
+    return out
+
+
+# ---------------------------------------------------------------- heals
+
+
+def heal_testmanagerd(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    note = mini.recycle_testmanagerd()
+    if note is None:
+        return False, "this runner hook has no testmanagerd recycler yet (glaeda#1281)"
+    return ("stopped pid" in note or "killed pid" in note or "not running" in note), note
+
+
+def heal_tailscale(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    before = f["evidence"]
+    if "Stopped" in before:
+        mini.tailscale_up()
+        what = "tailscale up"
+    else:
+        service = mini.vpn_service()
+        if service is None:
+            return False, "no Tailscale VPN service to restart"
+        mini.restart_vpn(service)
+        what = f"scutil --nc stop/start {service}"
+    state = None
+    for _ in range(TAILSCALE_WAIT_S // 5):
+        got = mini.tailscale()
+        state = got[1] if got else None
+        if state == "Running":
+            return True, f"{what}: Running"
+        mini.sleep(5)
+    return False, f"{what}: still {state}"
+
+
+def agent_label(agent: str) -> str:
+    return "com.teamleaderleo.glaeda.cmux-runner" + ("" if agent == "0" else f".{agent}")
+
+
+def heal_runner(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    label = agent_label(f["id"].split(":", 1)[1])
+    mini.kickstart(label)
+    mini.sleep(5)
+    running = any(l == label and r for l, _, r, _ in mini.runner_agents())
+    return running, f"launchctl kickstart {label}: {'running' if running else 'still not running'}"
+
+
+# code -> (heal, runs in a row seen before healing)
+HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]] = {
+    "testmanagerd_wedged": (heal_testmanagerd, 1),
+    "tailscale_down": (heal_tailscale, 2),
+    "runner_stopped": (heal_runner, 2),
+}
+
+
+# ---------------------------------------------------------------- run
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        doc = json.loads(path.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path: Path, doc: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def iso(t: float) -> str:
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
+        report_path: Path = REPORT, heal_ok: bool = True) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    state = load_json(state_path) if apply else {}
+    seen: dict[str, Any] = state.get("seen") or {}
+    tries: dict[str, Any] = state.get("tries") or {}
+    healed = [h for h in state.get("healed") or [] if isinstance(h, dict) and now - (h.get("t") or 0) < HEALED_KEEP_S]
+    previous = {f["id"]: f for f in (load_json(report_path).get("findings") or []) if isinstance(f, dict)}
+
+    found = check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
+    tm = check_testmanagerd(mini, now)
+    carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
+    found += [previous["testmanagerd_wedged"]] if carried else tm or []
+
+    findings, heals = [], []
+    for f in found:
+        f = dict(f)
+        s = seen.get(f["id"]) or {"since": now, "runs": 0}
+        s["runs"] = s.get("runs", 0) + 1
+        seen[f["id"]] = s
+        f["since"] = iso(s["since"])
+        heal = HEALS.get(f["code"])
+        t = tries.get(f["id"]) or {"n": 0, "at": 0}
+        # a heal that worked and did not last (a runner that exits again) counts too, so nothing loops for a day
+        done = [h for h in healed if h.get("id") == f["id"]]
+        if done:
+            t = {**t, "at": max(t["at"], max(h["t"] for h in done))}
+        if heal and f["auto_fix"] == "pending" and not (carried and f["code"] == "testmanagerd_wedged"):
+            if t["n"] + len(done) >= HEAL_TRIES:
+                f["auto_fix"] = "impossible"
+                f["note"] = f"{HEAL_TRIES} heals did not fix it; last: {t.get('last', '?')}"[:300]
+            elif apply and heal_ok and s["runs"] >= heal[1] and now - t["at"] >= HEAL_EVERY_S:
+                ok, what = heal[0](mini, f)
+                t = {"n": t["n"] + 1, "at": now, "last": what[:200]}
+                tries[f["id"]] = t
+                heals.append({"id": f["id"], "ok": ok, "action": what[:200]})
+                if ok:
+                    healed.append({"id": f["id"], "code": f["code"], "t": now, "at": iso(now), "since": f["since"],
+                                   "evidence": f["evidence"], "action": what[:200], "auto_fix": "done"})
+                    seen.pop(f["id"], None)
+                    tries.pop(f["id"], None)
+                    continue
+                f["note"] = f"heal {t['n'] + len(done)} of {HEAL_TRIES} did not fix it: {what}"[:300]
+            elif not heal_ok:
+                f["note"] = f"healing is off ({KILL_SWITCH})"
+        findings.append(f)
+    ids = {f["id"] for f in findings}
+    seen = {k: v for k, v in seen.items() if k in ids}
+    tries = {k: v for k, v in tries.items() if k in ids}
+    report = {"schema": SCHEMA, "at": iso(now), "findings": findings, "healed": healed[-HEALED_MAX:]}
+    if apply:
+        write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:]})
+        write_json(report_path, report)
+    report["heals"] = heals
+    report["changed"] = sorted(ids) != sorted(previous)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--apply", action="store_true", help="heal and write the report (the LaunchAgent)")
+    args = p.parse_args(argv)
+    mini = Mini()
+    if not mini.runner_dirs():
+        if not args.apply:
+            print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host"}))
+        return 0
+    report = run(mini, args.apply, heal_ok=not KILL_SWITCH.exists())
+    if not args.apply:
+        print(json.dumps(report, indent=2))
+    elif report["heals"] or report["changed"]:
+        print(json.dumps({"at": report["at"], "findings": [f["id"] for f in report["findings"]],
+                          "heals": report["heals"]}, separators=(",", ":")), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -70,7 +70,7 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
 TOOLS = ("glaeda-disk", "glaeda-procs", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-         "glaeda-seed-prefetch", "glaeda-idle-warm", "glaeda-update", "glaeda-gh")
+         "glaeda-seed-prefetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
