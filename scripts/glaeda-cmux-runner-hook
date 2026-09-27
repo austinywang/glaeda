@@ -1101,9 +1101,9 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     it was (exit 1) and never without a root; two switchers after each other's root both time out, so
     callers keep --wait short. On success it points $GITHUB_ENV's CMUX_CI_CANONICAL_ROOT at ROOT. Prints
     the root's path."""
-    k = root_number(spec, roots)
+    k = root_number(spec)
     if k is None:
-        print(f"{PREFIX}: take-root: {spec!r} is not one of this mini's {roots} canonical root(s) "
+        print(f"{PREFIX}: take-root: {spec!r} is not a canonical root "
               "(/private/tmp/cmux-ci, /private/tmp/cmux-ci-N or N)", file=sys.stderr)
         return 2
     if not os.environ.get("RUNNER_NAME"):
@@ -1116,7 +1116,13 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if name in held:
         print(path)
         return 0
-    if held and not (switch and all(holder_alive(root_holder_file(state_dir, old)) for old in held)):
+    # A consumer on a mini with fewer roots than the producer's (a product compiled at /private/tmp/cmux-ci-2
+    # on a two-root mini, restored on a one-root mini): nothing compiles at root k here, so only consumers
+    # alias it. A job holding every root this mini has (a consumer's admission on a one-root mini) still takes
+    # root k's token, so it and a job holding no root never share the alias. It cannot deadlock: root k's
+    # other takers hold none of this mini's roots, so none of them waits for this job.
+    extra = k > roots and bool(held) and set(held) >= {f"root-{n}" for n in range(1, roots + 1)}
+    if held and not extra and not (switch and all(holder_alive(root_holder_file(state_dir, old)) for old in held)):
         print(f"{PREFIX}: take-root: this job already holds {', '.join(held)}; one root per job"
               + ("" if switch else " (--switch lets go of a root with its own holder first)"), file=sys.stderr)
         return 2
@@ -1148,7 +1154,7 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if not ok:
         print(f"{PREFIX}: take-root: {note}", file=sys.stderr)
         return 1
-    if held:  # a switch: ROOT is held, so the old roots can go, after the record stops naming them
+    if held and not extra:  # a switch: ROOT is held, so the old roots can go, after the record stops naming them
         with contextlib.suppress(OSError):
             roots_file(state_dir).write_text(name + "\n")
         for old in held:

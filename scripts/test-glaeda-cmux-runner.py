@@ -666,6 +666,35 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_one_root_consumer_restores_a_product_from_a_second_root(self) -> None:
+        # manaflow-ai/cmux 36295033926: a product compiled at /private/tmp/cmux-ci-2 on a two-root mini, restored
+        # on cmux7s (one root), whose consumer holds root-1 from admission; take-root refused it (exit 2)
+        self.fleet()
+        one = ("--canonical-roots", "1")
+        try:
+            consumer = self.job("app-host-unit-tests", "g0", 4, None, *one)
+            self.assertIn("root-1", consumer.stdout)
+            got = self.step(["take-root", "--root", "/private/tmp/cmux-ci-2", *one], "g0")
+            self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci-2"), got.stderr)
+            self.assertEqual((self.dir / "state" / "host-lock-holder-g0.roots").read_text().split(),
+                             ["root-1", "root-2"], "it keeps root-1 and records root-2 beside it")
+            self.assertEqual(self.step(["take-root", "--root", "1", *one], "g0").returncode, 0)
+            self.assertEqual(self.step(["take-root", "--root", "2", *one], "g0").returncode, 0, "a re-take is a no-op")
+            # a job holding no root waits for root-2's token, so two jobs never own its alias at once
+            waited = self.step(["take-root", "--root", "2", "--wait", "1", *one], "x0")
+            self.assertEqual(waited.returncode, 1, waited.stderr)
+            self.assertIn("still in use", waited.stderr)
+            self.finish("g0")
+            self.assertEqual(self.step(["take-root", "--root", "2", *one], "x0").returncode, 0, "released with g0")
+            late = self.job("app-host-unit-tests", "g1", 4, None, *one)
+            self.assertIn("root-1", late.stdout)
+            blocked = self.step(["take-root", "--root", "2", "--wait", "1", *one], "g1")
+            self.assertEqual(blocked.returncode, 1, "and a root-1 holder waits for x0 in turn")
+        finally:
+            for runner in ("g0", "x0", "g1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_two_roots_unknown_jobs_are_pinned_to_root_one(self) -> None:
         self.fleet()
         two = ("--canonical-roots", "2", "--compile-slots", "2")
@@ -842,9 +871,9 @@ class HookTest(unittest.TestCase):
         for bad in ("/tmp/elsewhere", "/private/tmp/cmux-ci-1", "0", "cmux-ci-2x", "02", "/private/tmp/cmux-ci-02"):
             with self.subTest(bad=bad):
                 self.assertEqual(self.take(bad, "x0").returncode, 2)
-        beyond = self.take("3", "x0", "--canonical-roots", "2")
-        self.assertEqual(beyond.returncode, 2, "a root this mini does not have")
-        self.assertIn("2 canonical root(s)", beyond.stderr)
+        for bad in ("100", "/private/tmp/cmux-ci-100"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.take(bad, "x0").returncode, 2)
         nameless = self.run_hook("take-root", None, None, "--root", "1", "--state-dir", os.fspath(self.dir / "state"))
         self.assertIn("RUNNER_NAME is not set", nameless.stderr)
         if os.environ.get("GITHUB_ACTIONS"):  # CI itself runs under a real Runner.Worker, so it is "inside a job"
