@@ -1858,6 +1858,160 @@ time.sleep(60)
             for runner in ("h0", "n0", "n1", "n2", "n3", "n4"):
                 self.finish(runner)
 
+    # ------------------------------------------------------------ ci-step admission (cmuxterm-hq#794)
+
+    def ci_step(self, phase: str, *extra: str, units: int = 3) -> tuple[int, dict]:
+        """Run admit, release or fits as the build worker does: one JSON line on stdout."""
+        result = self.run_hook(phase, None, None, "--capacity-units", str(units),
+                               "--capacity-dir", os.fspath(self.dir / "capacity"),
+                               "--state-dir", os.fspath(self.dir / "state"), *extra)
+        lines = result.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stdout + result.stderr)
+        return result.returncode, json.loads(lines[0])
+
+    def ci_worker(self) -> subprocess.Popen:
+        """A stand-in for the build worker whose pid a step's holder watches."""
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(worker.wait)
+        self.addCleanup(worker.kill)
+        return worker
+
+    def fits(self, units: int = 3) -> list[str]:
+        status, result = self.ci_step("fits", units=units)
+        self.assertEqual((status, result["schema"], result["unknown"]), (0, "glaeda-ci-step-fits/v1", False))
+        return result["fits"]
+
+    def test_ci_step_admission_shares_the_runners_ledger(self) -> None:
+        self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        try:
+            self.assertEqual(self.fits(), ["light", "isolated"])
+            status, first = self.ci_step("admit", "--class", "light", "--job-key", "r1-100-1", *watch)
+            self.assertEqual(status, 0, first)
+            self.assertEqual((first["schema"], first["admitted"], first["units"], first["units_total"],
+                              first["tokens"]), ("glaeda-ci-step-admission/v1", True, 1, 3, []))
+            self.assertIsInstance(first["holder_pid"], int)
+            self.assertTrue(self.shared_lock_blocks_exclusive(), "a dev build's exclusive host lock waits for steps")
+            self.assertEqual(self.fits(), ["light", "isolated"], "two of three units are free")
+            status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "r1-101-1", *watch)
+            self.assertEqual((status, second["units"]), (0, 2), second)
+            self.assertEqual(self.fits(), [], "every unit is held")
+            start = time.monotonic()
+            status, full = self.ci_step("admit", "--class", "light", "--job-key", "r1-102-1", *watch)
+            self.assertLess(time.monotonic() - start, 25, "a full mini refuses, it never waits")
+            self.assertEqual((status, full["admitted"]), (1, False))
+            self.assertIn("capacity: 0 of 3 units free", full["reason"])
+            runner = self.job("swift-package-tests", "r0", 3)
+            self.assertEqual(runner.returncode, 1, "a runner job sees the units the steps hold")
+            self.assertIn("refused: capacity: 0 of 3 units free", runner.stdout)
+            status, released = self.ci_step("release", "--job-key", "r1-100-1")
+            self.assertEqual((status, released["released"]), (0, "released the fleet host lock"))
+            self.assertEqual(self.fits(), ["light"], "one unit is free again: too few for an isolated step")
+        finally:
+            for key in ("r1-100-1", "r1-101-1", "r1-102-1"):
+                self.ci_step("release", "--job-key", key)
+        self.assertTrue(self.lock_free(), "every step holder let go")
+
+    def test_ci_step_holder_ends_with_the_worker(self) -> None:
+        self.fleet()
+        worker = self.ci_worker()
+        status, admitted = self.ci_step("admit", "--class", "light", "--job-key", "gone-1-1",
+                                        "--watch-pid", str(worker.pid))
+        self.assertEqual(status, 0, admitted)
+        self.assertFalse(self.lock_free())
+        worker.kill()
+        worker.wait()
+        deadline = time.monotonic() + 10
+        while not self.lock_free() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertTrue(self.lock_free(), "a crashed worker strands no capacity")
+        status, again = self.ci_step("admit", "--class", "light", "--job-key", "gone-1-1",
+                                     "--watch-pid", str(worker.pid))
+        self.assertEqual(status, 1)
+        self.assertIn("is not running", again["reason"])
+
+    def test_ci_step_refusals_are_typed_and_never_wait(self) -> None:
+        fleet = self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        try:
+            status, first = self.ci_step("admit", "--class", "isolated", "--job-key", "iso-1-1", *watch)
+            self.assertEqual((status, first["units"]), (0, 2), first)
+            self.assertEqual(self.fits(), ["light"], "one unit left: too few for an isolated step")
+            status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "iso-2-1", *watch)
+            self.assertEqual(status, 1)
+            self.assertIn("capacity: 1 of 3 units free", second["reason"])
+            status, again = self.ci_step("admit", "--class", "light", "--job-key", "iso-1-1", *watch)
+            self.assertEqual(status, 1, "a key holds one admission")
+            self.assertIn("already admitted", again["reason"])
+            status, prefixed = self.ci_step("admit", "--class", "light", "--job-key", "iso-1-1-gui", *watch)
+            self.assertEqual(status, 0, "a key that extends another is its own step")
+            self.ci_step("release", "--job-key", "iso-1-1-gui")
+            self.assertEqual(self.fits(), ["light"], "releasing one key leaves the other's holder")
+        finally:
+            self.ci_step("release", "--job-key", "iso-1-1")
+        for bad in (("--class", "compile", "--job-key", "k-1-1"), ("--class", "simulator", "--job-key", "k-1-1"),
+                    ("--class", "light", "--job-key", "../k"), ("--class", "light")):
+            with self.subTest(bad=bad):
+                result = self.run_hook("admit", None, None, "--capacity-units", "3", *bad, *watch)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            self.assertEqual(self.fits(), [], "nothing fits while a dev build holds the host")
+            status, refused = self.ci_step("admit", "--class", "light", "--job-key", "dev-1-1", *watch)
+            self.assertEqual(status, 1)
+            self.assertIn("capacity: a fleet build holds the host lock", refused["reason"])
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_ci_step_fits_nothing_while_a_fleet_build_waits(self) -> None:
+        fleet = self.fleet()
+        worker = self.ci_worker()
+        status, first = self.ci_step("admit", "--class", "light", "--job-key", "wait-1-1", "--watch-pid", str(worker.pid))
+        self.assertEqual(status, 0, first)
+        waiter = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "print('waiting',flush=True)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(waiter.stdout.readline().strip(), "waiting")
+            time.sleep(0.5)
+            self.assertEqual(self.fits(), [], "fits agrees with admit, which refuses while a fleet build waits")
+            status, refused = self.ci_step("admit", "--class", "light", "--job-key", "wait-2-1",
+                                           "--watch-pid", str(worker.pid))
+            self.assertEqual(status, 1)
+            self.assertIn("a fleet build is waiting for the host", refused["reason"])
+            self.ci_step("release", "--job-key", "wait-1-1")
+            self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once the step lets go")
+        finally:
+            waiter.kill()
+            waiter.wait()
+            waiter.stdout.close()
+            self.ci_step("release", "--job-key", "wait-1-1")
+
+    def test_ci_step_fits_is_unknown_while_an_admission_runs(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        fd = os.open(capacity / "admission.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            status, result = self.ci_step("fits")
+            self.assertEqual((status, result["fits"], result["unknown"]), (0, [], True))
+        finally:
+            os.close(fd)
+        self.assertEqual(self.fits(), ["light", "isolated"])
+
     def test_capacity_refuses_while_a_fleet_build_holds_the_host(self) -> None:
         fleet = self.fleet()
         holder = subprocess.Popen([sys.executable, "-c",

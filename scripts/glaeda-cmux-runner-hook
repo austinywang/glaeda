@@ -50,6 +50,14 @@ refuses. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0.
 
+    glaeda-cmux-runner-hook admit   --class C --job-key K --watch-pid PID --capacity-units N
+    glaeda-cmux-runner-hook release --job-key K
+    glaeda-cmux-runner-hook fits    --capacity-units N
+
+are the build worker's ci-step admission (cmuxterm-hq#794): admit takes class C's units and tokens now for the
+step K and leaves them with a holder that watches PID, or refuses without waiting (exit 1); release lets them go;
+fits names the step classes this mini could admit right now. Each prints one JSON line (step_admit, step_fits).
+
     glaeda-cmux-runner-hook listen --runner-dir DIR [--no-waiters]
 
 runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the fleet has the host (an exclusive
@@ -66,6 +74,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -1706,13 +1715,16 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
-                  warm_target: tuple[str, int | None] = ("", None)) -> tuple[bool, str]:
+                  warm_target: tuple[str, int | None] = ("", None), klass: str | None = None,
+                  one_holder: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
-    When held, taken_out (if given) receives the units and tokens taken, for the job log.
+    When held, taken_out (if given) receives the units and tokens taken, for the job log. klass, when given,
+    is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id. one_holder
+    refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
-    klass, pinned = job_class(job, repo, home_repo, workflow)
+    klass, pinned = (klass, False) if klass else job_class(job, repo, home_repo, workflow)
     units, tokens = CLASS_COST[klass]
     units = min(units, total)
     if roots > 1 and klass in ROOT_CONSUMERS:
@@ -1738,6 +1750,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if time.monotonic() >= deadline:
                     return False, "capacity: another admission on this mini is stuck"
                 time.sleep(0.1)
+        if one_holder and holder_alive(holder_file(state_dir)):
+            return False, f"{job or 'this job'} is already admitted"
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
@@ -1951,6 +1965,107 @@ def release_holder(pid_file: Path) -> str:
     while pid_alive(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
     return "released the fleet host lock" if not pid_alive(pid) else f"holder {pid} still exiting"
+
+
+# ---------------------------------------------------------------- ci-step admission (cmuxterm-hq#794)
+# The build worker (cmuxterm-hq build-fleet/cmd/worker) runs CI steps the controller hands it (ci-step jobs) and
+# admits each one through this same ledger, so a mini claims only work that fits and a capacity refusal never
+# reaches GitHub. `fits` tells the worker which step classes this mini could admit right now, for its heartbeat;
+# the controller leases a ci-step only to a worker whose heartbeat lists its class. `admit` then takes the class's
+# units and tokens for real, without waiting, and leaves them with a detached holder (hold) that watches the
+# worker's pid; `release` lets them go when the step ends. A step's holder is keyed by its job key, as a runner
+# job's is by RUNNER_NAME, so several steps hold at once beside the runners' jobs.
+# Steps take no canonical root, persistent-dd or gui token yet: those classes carry per-job setup that job-started
+# does (settle_root, testmanagerd, the console check) and move behind admit with the compile phase. No simulator
+# either: the worker is a system LaunchDaemon, outside the console user's CoreSimulator service.
+STEP_CLASSES = ("light", "isolated")
+STEP_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}")
+STEP_ADMISSION = "glaeda-ci-step-admission/v1"
+STEP_FITS = "glaeda-ci-step-fits/v1"
+STEP_FITS_WAIT_S = 1.0  # an admission holds admission.lock for milliseconds; past this the answer is unknown
+
+
+def step_runner_name(key: str) -> str:
+    """The RUNNER_NAME a ci-step's holder files are keyed by (holder_file), apart from every runner's. A digest of
+    the key, fixed length and hex, so release_host_lock's `<holder>-root-*` and `<holder>-gui` globs for one key
+    can never match another key's files, whatever the keys contain."""
+    return "ci-step-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+
+
+def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, host_lock: str, reservation: str,
+              state_dir: Path, now: float) -> list[str] | Unknown:
+    """The STEP_CLASSES this mini could admit right now, or UNKNOWN when an admission held admission.lock
+    throughout. The listener gate's probe (mini_full): the host is not the fleet's (host_held) and no fleet
+    build waits for it (host_waiters, which admission refuses for too, so a worker never leases a step it
+    would hand back), and under
+    admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
+    free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job)."""
+    if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
+        return []
+    try:
+        admission: int | None = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        admission = None  # no admission has run on this mini yet, so nothing is taken
+    try:
+        deadline = time.monotonic() + STEP_FITS_WAIT_S
+        while admission is not None:
+            try:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return UNKNOWN
+                time.sleep(0.05)
+        warm = idle_warm(capacity_dir)
+        yielding = warm[1] if warm else set()
+
+        def free(name: str) -> bool:
+            return name in yielding or probe(capacity_dir / name)
+
+        units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
+        fits = []
+        for klass in STEP_CLASSES:
+            need, tokens = CLASS_COST[klass]
+            if units < min(need, total):
+                continue
+            copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots)}
+            if all(any(free((f"root-{c + 1}" if token == "root" else token if c == 0 else f"{token}-{c}")
+                            + ".token") for c in range(copies.get(token, 1))) for token in tokens):
+                fits.append(klass)
+        return fits
+    finally:
+        if admission is not None:
+            os.close(admission)
+
+
+def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation: str, capacity_dir: Path,
+               total: int, state_dir: Path, compile_slots: int = 1, roots: int = 1) -> tuple[int, dict[str, Any]]:
+    """Admit one ci-step now or refuse it, never waiting for room. (exit status, typed result): 0 and the units and
+    tokens its holder keeps, or 1 and the reason. RUNNER_NAME must already be step_runner_name(key)."""
+    result: dict[str, Any] = {"schema": STEP_ADMISSION, "class": klass, "key": key, "admitted": False}
+
+    def refused(why: str) -> tuple[int, dict[str, Any]]:
+        result["reason"] = why[:400]
+        return 1, result
+
+    if total <= 0:
+        return refused("admit needs --capacity-units: this mini has no capacity ledger")
+    if watch_pid <= 1 or not pid_alive(watch_pid):
+        return refused(f"the watched pid {watch_pid} is not running")
+    why = reservation_refusal(reservation, time.time())
+    if why:
+        return refused(why)
+    taken: dict[str, Any] = {}
+    held, note = take_capacity(host_lock, capacity_dir, total, f"ci-step {key}", watch_pid, state_dir,
+                               compile_slots, roots, klass=klass, taken_out=taken, one_holder=True)
+    if not held:
+        return refused(note)
+    holder = holder_file(state_dir)
+    with contextlib.suppress(OSError, ValueError):
+        result["holder_pid"] = int(holder.read_text().strip())
+    result.update(admitted=True, units=taken.get("units"), units_total=taken.get("units_total"),
+                  tokens=taken.get("tokens", []), note=note[:400])
+    return 0, result
 
 
 # ---------------------------------------------------------------- listener gate
@@ -3095,9 +3210,13 @@ def disk_pressure(explicit: str | None) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
-    p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui"),
+    p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
+                                     "admit", "release", "fits"),
                    help="check: the eligibility gate only, read-only (no lock, no rustup change); "
-                        "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program)")
+                        "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program); "
+                        "admit, release, fits: the build worker's ci-step admission (one JSON line each)")
+    p.add_argument("--class", dest="step_class", choices=STEP_CLASSES, help="admit: the ci-step's class")
+    p.add_argument("--job-key", help="admit, release: the ci-step's key (runner name, run id and attempt)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
     p.add_argument("--root", help="take-root: the canonical root to hold, /private/tmp/cmux-ci[-N] or N")
     p.add_argument("--wait", type=float, default=0, help="take-root, take-gui: seconds to wait for the token")
@@ -3160,6 +3279,29 @@ def main(argv: list[str] | None = None) -> int:
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 
+    if args.phase in ("admit", "release"):
+        if not args.job_key or not STEP_KEY.fullmatch(args.job_key):
+            p.error(f"{args.phase} needs --job-key matching {STEP_KEY.pattern}")
+        os.environ["RUNNER_NAME"] = step_runner_name(args.job_key)  # the step's own holder files (holder_file)
+    if args.phase == "admit":
+        if not args.step_class:
+            p.error("admit needs --class")
+        status, result = step_admit(args.step_class, args.job_key, args.watch_pid, args.host_lock, args.reservation,
+                                    args.capacity_dir, args.capacity_units, args.state_dir, args.compile_slots,
+                                    args.canonical_roots)
+        print(json.dumps(result, sort_keys=True), flush=True)
+        return status
+    if args.phase == "release":
+        print(json.dumps({"schema": STEP_ADMISSION, "key": args.job_key,
+                          "released": release_host_lock(args.state_dir)}, sort_keys=True), flush=True)
+        return 0
+    if args.phase == "fits":
+        fits = step_fits(args.capacity_dir, args.capacity_units, args.compile_slots, args.canonical_roots,
+                         args.host_lock, args.reservation, args.state_dir, time.time())
+        unknown = isinstance(fits, Unknown)
+        print(json.dumps({"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown}, sort_keys=True),
+              flush=True)
+        return 0
     if args.phase == "listen":
         if args.runner_dir is None:
             p.error("listen needs --runner-dir")
