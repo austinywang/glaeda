@@ -626,14 +626,17 @@ securityd queues one SecurityAgent prompt per request and keeps it after the key
 SecurityAgent cancels only the prompt on screen; securityd starts a new one for the next queued prompt. On
 cmux14 and cmux8s (2026-09-27) prompts queued at the 09-26 reboot were still up the next morning, and the
 assistantd one came back each time the cmux e2e action closed SecurityAgent (cmux run 36317492985). So after
-the unlock the agent kills SecurityAgent, up to 5 times, until no queued prompt starts it again. It does so
-at every job start and every login. No keychain prompt is wanted on a PR mini. When the hook changes the
+the unlock the agent kills SecurityAgent until no queued prompt has started it again for 15 s (at most 30
+kills): the next queued prompt takes 6 to 9 s to appear (cmux-mac-mini, 2026-09-27), so stopping at the first
+quiet check a second later left it up. It does so at every job start and every login. No keychain prompt is wanted on a PR mini. When the hook changes the
 agent, it boots the old one out before loading the new one, since a loaded agent keeps running its old
 program.
 
 `cmux-ci` stays the user's default keychain. `swift test` runs in a runner's own session, where the login
 keychain is locked, and tests that add items without naming a keychain need an unlocked default. The
-default is per user, not per session.
+default is per user, not per session: macOS refuses `security list-keychains -d dynamic -s` and
+`default-keychain -d dynamic -s` ("The specified preferences domain is not valid"). UI and app-host tests use
+the desktop's session anyway: their xcodebuild goes through `launchctl asuser`, which joins it.
 
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job

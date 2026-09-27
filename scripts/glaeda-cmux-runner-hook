@@ -1073,11 +1073,17 @@ GUI_UNLOCK_LABEL = "com.teamleaderleo.glaeda.test-keychain-unlock"
 
 # Runs in the Aqua session: unlock, then cancel keychain prompts queued while it was locked. A prompt already
 # on screen stays there after the unlock, and killing SecurityAgent only cancels the one shown: securityd
-# starts a new SecurityAgent for the next queued prompt. Stop at the first kill that finds none (at most 5).
+# starts a new SecurityAgent for the next queued prompt, 6 to 9 s later (cmux-mac-mini, 2026-09-27), so stop
+# only once none has come back for 15 s (at most 30 kills). A single quiet check after 1 s left the next
+# queued prompt up. -u: only this user's SecurityAgent, never loginwindow's.
 # SIGKILL: a SecurityAgent showing a prompt ignores SIGTERM (cmux12s, 2026-09-27).
 GUI_UNLOCK_SCRIPT = ('/usr/bin/security unlock-keychain -p "" "$1" || exit 1\n'
-                     'n=0\n'
-                     'while [ "$n" -lt 5 ] && /usr/bin/pkill -KILL -x SecurityAgent; do n=$((n + 1)); sleep 1; done\n'
+                     'uid=$(/usr/bin/id -u) kills=0 quiet=0\n'
+                     'while [ "$quiet" -lt 15 ] && [ "$kills" -lt 30 ]; do\n'
+                     '  if /usr/bin/pkill -KILL -x -u "$uid" SecurityAgent; then kills=$((kills + 1)) quiet=0\n'
+                     '  else quiet=$((quiet + 1)); fi\n'
+                     '  sleep 1\n'
+                     'done\n'
                      'exit 0\n')
 
 
@@ -1089,7 +1095,7 @@ def unlock_test_keychain_in_gui(home: Path, uid: int | None = None) -> str:
     that session: RunAtLoad covers every login, and the kickstart here covers a keychain made since.
     Daemons ask for the default keychain within seconds of login, often before that agent runs, and securityd
     keeps such a prompt up after the unlock (cmux14 and cmux8s, 2026-09-27: queued at the 09-26 reboot, still up
-    the next morning). So the agent then kills SecurityAgent until no queued prompt restarts it. On a PR mini
+    the next morning). So the agent then kills SecurityAgent until no queued prompt has restarted it for 15 s. On a PR mini
     no keychain prompt is ever wanted. Best effort; without a GUI login there is nothing to fix."""
     uid = os.getuid() if uid is None else uid
     keychain = os.fspath(home / "Library/Keychains" / TEST_KEYCHAIN)

@@ -3797,37 +3797,30 @@ class RunnerTest(unittest.TestCase):
                 self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI unlock TimeoutExpired")
 
     def test_gui_unlock_script_cancels_every_queued_prompt(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            bin_dir = Path(tmp)
-            log = bin_dir / "log"
+        # Shell-function fakes: each kill finds SecurityAgent while a prompt is left.
+        def run(unlock_code: int, prompts: int) -> tuple[int, list[str]]:
+            script = hook.GUI_UNLOCK_SCRIPT
+            for tool in ("/usr/bin/security", "/usr/bin/pkill", "/usr/bin/id"):
+                script = script.replace(tool, "fake_" + tool.rsplit("/", 1)[1])
+            fakes = (f'left={prompts}\nfake_security() {{ echo "security $*"; return {unlock_code}; }}\n'
+                     'fake_pkill() { echo "pkill $*"; [ "$left" -gt 0 ] || return 1; left=$((left - 1)); }\n'
+                     'fake_id() { echo 501; }\nsleep() { :; }\n')
+            done = subprocess.run(["/bin/sh", "-c", fakes + script, "sh", "/k"], capture_output=True, text=True,
+                                  timeout=10)
+            return done.returncode, done.stdout.splitlines()
 
-            def stub(name: str, body: str) -> str:
-                path = bin_dir / name
-                path.write_text(f"#!/bin/sh\necho {name} \"$@\" >> {log}\n{body}\n")
-                path.chmod(0o755)
-                return os.fspath(path)
-
-            def run(unlock_code: int, prompts: int) -> tuple[int, list[str]]:
-                log.write_text("")
-                (bin_dir / "left").write_text(str(prompts))
-                # Each kill finds SecurityAgent while a prompt is left; the last one finds none.
-                pkill = stub("pkill", f'n=$(cat {bin_dir}/left); [ "$n" -gt 0 ] || exit 1; '
-                                      f'echo $((n - 1)) > {bin_dir}/left')
-                security = stub("security", f"exit {unlock_code}")
-                script = hook.GUI_UNLOCK_SCRIPT.replace("/usr/bin/pkill", pkill) \
-                    .replace("/usr/bin/security", security).replace("sleep 1", "sleep 0")
-                done = subprocess.run(["/bin/sh", "-c", script, "sh", "/k"], capture_output=True, text=True, timeout=10)
-                return done.returncode, log.read_text().splitlines()
-
-            code, lines = run(0, 2)
-            self.assertEqual(code, 0)
-            self.assertEqual(lines, ["security unlock-keychain -p  /k"] + ["pkill -KILL -x SecurityAgent"] * 3,
-                             "unlock first, then kill until no queued prompt restarts SecurityAgent")
-            code, lines = run(0, 9)
-            self.assertEqual(lines.count("pkill -KILL -x SecurityAgent"), 5, "bounded")
-            code, lines = run(1, 2)
-            self.assertEqual((code, lines), (1, ["security unlock-keychain -p  /k"]),
-                             "still locked: leave the prompts to the next run")
+        kill = "pkill -KILL -x -u 501 SecurityAgent"
+        code, lines = run(0, 0)
+        self.assertEqual((code, lines), (0, ["security unlock-keychain -p  /k"] + [kill] * 15),
+                         "unlock first; with no prompt, 15 quiet checks and done")
+        code, lines = run(0, 2)
+        self.assertEqual((code, lines[1:]), (0, [kill] * 17),
+                         "each queued prompt is killed, and the 15 s wait restarts after it")
+        code, lines = run(0, 99)
+        self.assertEqual((code, lines.count(kill)), (0, 30), "bounded")
+        code, lines = run(1, 2)
+        self.assertEqual((code, lines), (1, ["security unlock-keychain -p  /k"]),
+                         "still locked: leave the prompts to the next run")
 
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
