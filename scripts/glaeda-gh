@@ -59,7 +59,9 @@ cause decides at once.
 
 State lives in ~/.cache/glaeda/gh (GLAEDA_GH_DIR overrides): watch/, cache/, budget.json,
 daemon.json (a heartbeat and the last hour's request counts) and daemon.lock, which the daemon
-holds for its lifetime. The daemon re-executes itself when this file changes, so an update takes
+holds for its lifetime. A cycle that raises still writes the heartbeat, with the error's type and
+code site under "failing"; once cycles have failed for FAILING_AFTER seconds, clients exit 3 and
+name the error instead of waiting on a daemon that refreshes nothing. The daemon re-executes itself when this file changes, so an update takes
 effect without a restart.
 """
 
@@ -101,6 +103,7 @@ TOUCH_EVERY = 30  # clients refresh their interest this often
 DOWN_GRACE = 5.0  # clients look this long for the daemon before calling it down (it re-executes on update)
 HEARTBEAT_EVERY = 30  # the daemon rewrites daemon.json at least this often
 STALE_HEARTBEAT = 600  # a lock holder silent this long is hung (a tick of slow requests can take minutes)
+FAILING_AFTER = 120  # every tick raising for this long is a broken daemon, not a transient error
 FAILED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR", "STALE"}
 STEP_FAILED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}  # a cancelled step is not the cause
 PASSED = {"SUCCESS", "NEUTRAL", "SKIPPED"}
@@ -248,6 +251,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def error_site(error: BaseException) -> str:
+    """Where `error` was raised: file, line and function only, never values, so a recurring error
+    can be found without reproducing it."""
+    frames = traceback.extract_tb(error.__traceback__)
+    return f"{Path(frames[-1].filename).name}:{frames[-1].lineno} {frames[-1].name}" if frames else ""
 
 
 def describe(error: BaseException) -> str:
@@ -521,6 +531,8 @@ class Daemon:
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
         self.beat = float("-inf")
+        self.status: dict[str, Any] = {}  # the last good tick's daemon.json
+        self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
 
     # -- budget
 
@@ -655,7 +667,12 @@ class Daemon:
         self.now = time.time() if now is None else now
         self.errors = []
         entries = self.watches()
-        self.from_controller(entries)
+        try:
+            self.from_controller(entries)
+        except Exception as error:  # noqa: BLE001  the controller is an optional, free source: a fault
+            # there must not stop GitHub polling (it did: glaeda#1305). A WatchError is expected and
+            # says what failed; anything else is a bug, so it carries its code site.
+            self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
         prs, runs, comments = self.due("pr", entries), self.due("run", entries), self.due("comment", entries)
         for batch, fetch in ((prs, self.fetch_prs), (comments, self.fetch_comments)):
             for i in range(0, len(batch), GQL_BATCH):
@@ -683,10 +700,26 @@ class Daemon:
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "lastHour": hour, "heartbeat": HEARTBEAT_EVERY}
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
-        if prs or runs or comments or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
+        recovered, self.failing = self.failing is not None, None
+        if recovered or prs or runs or comments or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
             write_json(BASE / "daemon.json", status)
             self.beat = self.now
+        self.status = status
         return status
+
+    def tick_failed(self, error: str, site: str, now: float | None = None) -> None:
+        """A tick raised. The daemon is alive but refreshes nothing, so keep the heartbeat and say
+        why: without this, a tick that raised every time looked like a hung daemon to clients, and a
+        restart (which could not help) was their only advice."""
+        self.now = time.time() if now is None else now
+        first = self.failing is None
+        since = self.now if first else self.failing["since"]
+        count = 1 if first else self.failing["count"] + 1
+        self.failing = {"error": error, "site": site, "since": since, "count": count}
+        if first or self.now - self.beat >= HEARTBEAT_EVERY:
+            write_json(BASE / "daemon.json", {**self.status, "pid": os.getpid(), "at": self.now,
+                                              "heartbeat": HEARTBEAT_EVERY, "failing": self.failing})
+            self.beat = self.now
 
     def store(self, key: str, prior: dict | None, **fields: Any) -> None:
         entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
@@ -824,17 +857,18 @@ class Daemon:
                 self.errors.append(f"{e['key']} jobs: {jdoc}")
         self.store(e["key"], e["cache"], **fields)
 
-    def controller_down(self, error: WatchError) -> None:
+    def controller_down(self, error: Exception, site: str | None = None) -> None:
         """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the
         feed catches up on what happened in between when it answers again."""
+        what = describe(error) + (f" at {site}" if site else "")
         if isinstance(error, NoReceiver):
             wait, state = CONTROLLER_ABSENT, "absent"  # not an error: that controller has no receiver
         else:
             self.controller_failures += 1
             wait, state = min(CONTROLLER_ABSENT, CONTROLLER_RETRY * 2 ** (self.controller_failures - 1)), "down"
-            self.errors.append(describe(error))
+            self.errors.append(what)
         self.controller_down_until = self.now + wait
-        self.controller_status = {"state": state, "error": describe(error), "retryAt": self.now + wait,
+        self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
                                   "token": bool(self.controller.token)}
 
     def read_feed(self) -> list[dict]:
@@ -978,10 +1012,20 @@ def log(event: dict) -> None:
     print(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), **event}), flush=True)
 
 
+def clear_failing() -> None:
+    """Drop the previous process's "failing" record. A restart or a re-exec (which is how a fix
+    arrives) must not leave clients exiting 3 on it until the first good tick, which can take minutes."""
+    status = read_json(BASE / "daemon.json")
+    if isinstance(status, dict) and "failing" in status:
+        status.pop("failing")
+        write_json(BASE / "daemon.json", status)
+
+
 def serve() -> int:
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(BASE / "daemon.lock", "a+")
     fcntl.flock(lock, fcntl.LOCK_EX)  # a second daemon waits here instead of polling twice
+    clear_failing()
     me = Path(__file__).resolve()
     stamp = me.stat().st_mtime
     daemon = Daemon()
@@ -995,11 +1039,12 @@ def serve() -> int:
                 log({"event": "state", "modes": status["modes"], "errors": status["errors"]})
             last = summary
         except Exception as error:  # noqa: BLE001  keep serving; only the type name is logged
-            # plus where it was raised (code location only, never values), so a recurring error
-            # can be found without reproducing it
-            frames = traceback.extract_tb(error.__traceback__)
-            site = f"{Path(frames[-1].filename).name}:{frames[-1].lineno} {frames[-1].name}" if frames else ""
+            site = error_site(error)  # plus where it was raised
             log({"event": "error", "error": describe(error), "site": site})
+            try:
+                daemon.tick_failed(describe(error), site)
+            except Exception as report:  # noqa: BLE001  e.g. a full disk: keep serving
+                log({"event": "error", "error": describe(report), "site": "tick_failed"})
         time.sleep(TICK)
         try:
             if me.stat().st_mtime != stamp:
@@ -1066,6 +1111,29 @@ def daemon_stale() -> float | None:
         return None
     lag = time.time() - at
     return lag if lag > STALE_HEARTBEAT else None
+
+
+def daemon_failing() -> dict | None:
+    """The daemon's "failing" record, once every tick has raised for FAILING_AFTER seconds."""
+    status = read_json(BASE / "daemon.json")
+    broken = status.get("failing") if isinstance(status, dict) else None
+    if not isinstance(broken, dict):
+        return None
+    at, since = status.get("at"), broken.get("since")
+    if not isinstance(at, (int, float)) or not isinstance(since, (int, float)) or at - since < FAILING_AFTER:
+        return None
+    return broken
+
+
+def failing_message(broken: dict) -> str:
+    since = broken.get("since")
+    when = dt.datetime.fromtimestamp(since, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ") \
+        if isinstance(since, (int, float)) else "?"
+    where = f" at {broken['site']}" if broken.get("site") else ""
+    return (f"glaeda-gh: the daemon is running, but every cycle since {when} has failed with "
+            f"{broken.get('error') or '?'}{where} ({broken.get('count', '?')} times), so nothing is being "
+            "refreshed. Restarting it will not fix this: the installed glaeda-gh needs a fix (scripts/glaeda-gh "
+            "in teamleaderleo/glaeda). Tell the user; do not poll GitHub yourself in a loop meanwhile.")
 
 
 def stale_message(lag: float) -> str:
@@ -1316,6 +1384,10 @@ def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: fl
     if not daemon_running(grace=DOWN_GRACE):
         print(DOWN, file=sys.stderr)
         return EXIT_DOWN
+    broken = daemon_failing()
+    if broken is not None:
+        print(failing_message(broken), file=sys.stderr)
+        return EXIT_DOWN
     lag = daemon_stale()
     if lag is not None:
         print(stale_message(lag), file=sys.stderr)
@@ -1365,6 +1437,10 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     while True:
         if not daemon_running(grace=DOWN_GRACE):
             print(DOWN, file=sys.stderr)
+            return EXIT_DOWN
+        broken = daemon_failing()
+        if broken is not None:
+            print(failing_message(broken), file=sys.stderr)
             return EXIT_DOWN
         lag = daemon_stale()
         if lag is not None and not warned:
@@ -1473,6 +1549,10 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
         if not daemon_running(grace=DOWN_GRACE):
             print(DOWN, file=sys.stderr)
             return EXIT_DOWN
+        broken = daemon_failing()
+        if broken is not None:
+            print(failing_message(broken), file=sys.stderr)
+            return EXIT_DOWN
         lag = daemon_stale()
         if lag is not None and not warned:
             print(stale_message(lag), file=sys.stderr)
@@ -1531,10 +1611,11 @@ def cmd_budget(as_json: bool) -> int:
     budget = read_json(BASE / "budget.json") or {}
     status = read_json(BASE / "daemon.json") or {}
     lag = daemon_stale() if running else None
+    broken = daemon_failing() if running else None
     watching = len(list(watch_dir().glob("*.json"))) if watch_dir().is_dir() else 0
     if as_json:
-        print(json.dumps({"daemon": running, "stale": lag is not None, "budget": budget, "watching": watching,
-                          "last": status}, sort_keys=True))
+        print(json.dumps({"daemon": running, "stale": lag is not None, "failing": broken is not None,
+                          "budget": budget, "watching": watching, "last": status}, sort_keys=True))
     else:
         print(f"daemon: {'running' if running else 'NOT RUNNING'}, watching {watching}, "
               f"last heartbeat {age(status.get('at'))}")
@@ -1557,6 +1638,9 @@ def cmd_budget(as_json: bool) -> int:
             print("last errors: " + "; ".join(status["errors"][:3]))
     if not running:
         print(DOWN, file=sys.stderr)
+        return EXIT_DOWN
+    if broken is not None:
+        print(failing_message(broken), file=sys.stderr)
         return EXIT_DOWN
     if lag is not None:
         print(stale_message(lag), file=sys.stderr)

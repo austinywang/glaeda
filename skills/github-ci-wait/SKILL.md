@@ -107,6 +107,10 @@ If it prints `looks hung` (it holds its lock but has not written a heartbeat for
 restart it: `launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.gh-watch` or
 `systemctl --user restart glaeda-gh`.
 
+If it prints `every cycle since ... has failed with ERROR at SITE`, the daemon runs but a bug makes
+each cycle raise, so a restart will not help. Tell the user (the message names the code site), and
+meanwhile use single `gh` reads, never a polling loop.
+
 ## Do not
 
 - `gh run watch`, `gh pr checks --watch`, or `gh run view` / `gh pr view` / `gh api .../comments`

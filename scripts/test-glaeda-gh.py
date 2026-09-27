@@ -307,6 +307,33 @@ class ControllerTest(Base):
         self.assertEqual(self.daemon.controller_status["state"], "ok")
         self.assertEqual(self.daemon.controller_failures, 0)
 
+    def test_controller_fault_does_not_stop_the_tick(self) -> None:
+        """A bug in the optional controller path (glaeda#1305: an AttributeError on every
+        unreachable-controller read) aborted each tick, so GitHub was never polled either."""
+        def broken(since: int | None) -> dict:
+            raise AttributeError("'function' object has no attribute 'client'")
+        self.ctl.events = broken
+        self.gh.runs[28] = {"id": 28, "status": "in_progress"}
+        gg.register("run:o/r/28")
+        status = self.daemon.tick(NOW)
+        self.assertEqual(gg.read_cache("run:o/r/28")["data"]["status"], "in_progress")  # REST still served it
+        self.assertEqual(self.daemon.controller_status["state"], "down")
+        # a bug, not an expected WatchError: it names where it was raised, like a tick's error
+        self.assertRegex(self.daemon.controller_status["error"], r"^AttributeError at test-glaeda-gh\.py:\d+ broken$")
+        self.assertIn(self.daemon.controller_status["error"], status["errors"])
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["at"], NOW)  # and the heartbeat was written
+
+    def test_unreachable_real_controller_does_not_stop_the_tick(self) -> None:
+        import socket
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]  # closed once the with ends: connections are refused
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN,
+                                controller=gg.Controller(f"http://127.0.0.1:{port}", None))
+        self.daemon.tick(NOW)  # raised AttributeError here before glaeda#1305
+        self.assertEqual(self.daemon.controller_status["state"], "down")
+        self.assertNotIn(" at ", self.daemon.controller_status["error"])  # an expected WatchError: no site
+
     def test_job_lists_and_other_repos_stay_on_rest(self) -> None:
         self.ctl.runs[26] = ctl_run(26, "in_progress", repo="other/repo")
         self.gh.runs[26] = {"id": 26, "status": "in_progress"}
@@ -798,6 +825,54 @@ class DaemonTest(Base):
         self.daemon.tick(NOW + 100 + 3700)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["lastHour"]["rest304"], 0)  # an hour later
 
+    def test_failing_ticks_keep_the_heartbeat_and_say_why(self) -> None:
+        self.daemon.tick(NOW)
+        self.daemon.tick_failed("AttributeError", "glaeda-gh:337 get", now=NOW + 5)
+        doc = gg.read_json(gg.BASE / "daemon.json")
+        self.assertEqual(doc["at"], NOW + 5)  # the first failure is written at once
+        self.assertEqual(doc["failing"], {"error": "AttributeError", "site": "glaeda-gh:337 get",
+                                          "since": NOW + 5, "count": 1})
+        self.assertIn("lastHour", doc)  # the last good tick's fields are kept
+        self.daemon.tick_failed("AttributeError", "glaeda-gh:337 get", now=NOW + 10)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["at"], NOW + 5)  # not every tick
+        self.daemon.tick_failed("KeyError", "glaeda-gh:700 tick", now=NOW + 5 + gg.HEARTBEAT_EVERY)
+        doc = gg.read_json(gg.BASE / "daemon.json")
+        self.assertEqual(doc["at"], NOW + 5 + gg.HEARTBEAT_EVERY)  # but at the heartbeat's pace
+        self.assertEqual(doc["failing"], {"error": "KeyError", "site": "glaeda-gh:700 tick",
+                                          "since": NOW + 5, "count": 3})
+        self.daemon.tick(NOW + 40)  # recovered: written at once, without the record
+        doc = gg.read_json(gg.BASE / "daemon.json")
+        self.assertEqual(doc["at"], NOW + 40)
+        self.assertNotIn("failing", doc)
+        self.daemon.tick_failed("AttributeError", "glaeda-gh:337 get", now=NOW + 45)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["failing"]["since"], NOW + 45)  # a new episode
+
+    def test_restart_drops_the_previous_failing_record(self) -> None:
+        """A restart or re-exec is how a fix arrives: clients must not keep exiting 3 on the old
+        process's record until the new one's first good tick."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        gg.write_json(gg.BASE / "daemon.json", {
+            "at": now, "heartbeat": 30, "lastHour": {"rest": 3},
+            "failing": {"error": "AttributeError", "site": "glaeda-gh:337 get", "since": now - gg.FAILING_AFTER - 1,
+                        "count": 30}})
+        self.assertIsNotNone(gg.daemon_failing())
+
+        class Stop(Exception):
+            pass
+
+        def stop(*args, **kwargs):
+            raise Stop  # serve() has taken the lock and cleared the record by now
+
+        with mock.patch.object(gg, "Daemon", stop), self.assertRaises(Stop):
+            gg.serve()
+        doc = gg.read_json(gg.BASE / "daemon.json")
+        self.assertNotIn("failing", doc)
+        self.assertEqual((doc["at"], doc["lastHour"]), (now, {"rest": 3}))  # the rest is left alone
+        self.assertIsNone(gg.daemon_failing())
+        gg.clear_failing()  # nothing to clear: a no-op
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json"), doc)
+
 
 class ClientTest(Base):
     def setUp(self) -> None:
@@ -1059,6 +1134,27 @@ class ClientTest(Base):
         # an older daemon, idle, wrote daemon.json only when it last fetched something
         gg.write_json(gg.BASE / "daemon.json", {"at": time.time() - 3 * gg.STALE_HEARTBEAT})
         self.assertNotIn("looks hung", self.wait("run", "o/r/1", timeout=0.1)[1])
+
+    def test_failing_daemon_is_reported_not_waited_on(self) -> None:
+        now = time.time()
+        failing = {"error": "AttributeError", "site": "glaeda-gh:337 get", "count": 26000}
+        gg.write_json(gg.BASE / "daemon.json", {"at": now, "heartbeat": 30,
+                                                "failing": {**failing, "since": now - gg.FAILING_AFTER - 1}})
+        code, text = self.wait("run", "o/r/1", timeout=30)
+        self.assertEqual(code, 3)  # at once, not after the 30 s timeout
+        self.assertIn("every cycle since", text)
+        self.assertIn("AttributeError at glaeda-gh:337 get", text)
+        self.assertIn("Restarting it will not fix this", text)
+        self.assertNotIn("looks hung", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.cmd_status("run", "o/r/1", False, False, first_wait=0), 3)
+            self.assertEqual(gg.cmd_wait_comment("o/r#1", 30, False), 3)
+            self.assertEqual(gg.cmd_budget(True), 3)
+        self.assertTrue(json.loads(out.getvalue())["failing"])
+        # a moment of failure is not a broken daemon: the wait goes on
+        gg.write_json(gg.BASE / "daemon.json", {"at": now, "heartbeat": 30, "failing": {**failing, "since": now - 5}})
+        self.assertEqual(self.wait("run", "o/r/1", timeout=0.1)[0], 2)
 
     # -- a glaeda runner refusing a job at setup, then the rescue re-running it
 
