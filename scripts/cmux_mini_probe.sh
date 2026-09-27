@@ -129,6 +129,9 @@ if [ -d "$F" ]; then
     e fleet_recipe_released none
   fi
 fi
+# A running GitHub Actions worker means a job already owns this machine. Borrow placement checks
+# this again after writing its reservation so a job that started during candidate selection is caught.
+pgrep -f '[R]unner.Worker' >/dev/null 2>&1 && e runner_worker running || e runner_worker absent
 # Reservation marker written by glaeda-mini-fleet reserve. Shipped raw (bounded, base64 on one line)
 # so glaeda_reservation.py parses it on the operator side, as the runner hook does on the host.
 R="$F/reservation.json"
