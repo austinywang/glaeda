@@ -119,7 +119,7 @@ COMMENTS_LAST = 50  # comments per issue per read: more than this within one 15 
 COMMENT_BODY_MAX = 4000
 STEPS_BATCH = 50  # check runs per steps query
 EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN, EXIT_CONFLICT = 0, 1, 2, 3, 4
-CONTROLLER_DEFAULT = "http://100.71.114.64:18765"
+CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 2026-09-28 move
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
@@ -329,7 +329,7 @@ class Controller:
         path = os.environ.get("CMUX_CI_TOKEN_FILE") or os.fspath(CONTROLLER_TOKEN)
         try:
             token = Path(path).read_text().strip() or None
-        except OSError:
+        except (OSError, ValueError):  # ValueError: a token file that is not UTF-8
             token = None
         return cls(base, token)
 
@@ -511,7 +511,11 @@ class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env") -> None:
         self.transport = transport
-        self.controller = Controller.from_env() if controller == "env" else controller
+        # "env" (or any callable) is re-read every tick, so a daemon follows a controller move
+        # (cmux-fleet-client's client.json repointed) without a restart; an instance stays fixed.
+        self.controller_source: Callable[[], Any] | None = (
+            Controller.from_env if controller == "env" else controller if callable(controller) else None)
+        self.controller = self.controller_source() if self.controller_source else controller
         self.controller_down_until = 0.0
         self.controller_failures = 0
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
@@ -869,7 +873,7 @@ class Daemon:
             self.errors.append(what)
         self.controller_down_until = self.now + wait
         self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
-                                  "token": bool(self.controller.token)}
+                                  "token": bool(getattr(self.controller, "token", None))}
 
     def read_feed(self) -> list[dict]:
         """The feed pages after the cursor. The first call only learns the cursor; a reset (the
@@ -890,10 +894,31 @@ class Daemon:
                 break
         return pages
 
+    def follow_controller(self) -> None:
+        """Switch to the controller the source names now. Its feed starts over: a cursor is only
+        meaningful to the controller that issued it, and the old one, drained, serves stale reads."""
+        if self.controller_source is None:
+            return
+        if (self.controller_source is Controller.from_env and not os.environ.get("CMUX_CI_CONTROLLER")
+                and CONTROLLER_CONFIG.exists() and not isinstance(read_json(CONTROLLER_CONFIG), dict)):
+            return  # a config caught mid-write reads as garbage: keep the controller rather than the default
+        current = self.controller_source()
+        if getattr(current, "base", None) == getattr(self.controller, "base", None):
+            if current is not None and self.controller is not None:
+                self.controller.token = current.token  # a rotated token applies without a restart
+            return
+        log({"event": "controller", "from": getattr(self.controller, "base", None),
+             "to": getattr(current, "base", None)})
+        self.controller = current
+        self.controller_cursor, self.controller_seen = None, {}
+        self.controller_down_until, self.controller_failures = 0.0, 0
+        self.controller_status = {"state": "off" if current is None else "starting"}
+
     def from_controller(self, entries: list[dict]) -> None:
         """Follow the controller's change feed: free, one request a tick, plus one baseline read for
         each run newly watched. Job lists still come from REST."""
         self.controller_filled = set()
+        self.follow_controller()
         if self.controller is None or self.now < self.controller_down_until:
             return
         deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
