@@ -5,6 +5,12 @@
                                              exit 0: a verified file is at DEST; 3: no peer has it;
                                              anything else: an error. The caller falls back either way.
                                              A peer announcing more than N bytes is not asked.
+    glaeda-lan-fetch index                   print the fleet index (every peer's inventory-v1, polled by
+                                             the broker every INDEX_INTERVAL seconds into INDEX)
+    glaeda-lan-fetch state PEER K SLOT STAMP pull PEER's kept compile-admission state of canonical root K
+                                             (SLOT kept or pr-<n>; STAMP its stamp.json sha256, from the
+                                             index) into this mini's root K store; exit 0 when installed,
+                                             3 when the peer no longer has it
     glaeda-lan-fetch serve-local             the local broker (the lan-fetch LaunchAgent)
 
 cmux CI (scripts/ci/peer_product_source.py) calls the root-owned copy at
@@ -26,11 +32,26 @@ connected). A runner job descends from the listener gate (~/.local/bin/python3) 
 so a CI step cannot reach a peer itself. `product` therefore asks the broker over a Unix socket in a
 private directory; the broker is its own LaunchAgent whose program is /usr/bin/python3, so its ssh
 reaches the LAN. Without a broker, `product` fetches directly (that works from an SSH shell).
+
+Build mesh (cmuxterm-hq#661). The broker also keeps INDEX, the fleet index: every peer's inventory-v1
+(glaeda-seed-serve --role product), which lists the kept compile-admission states per canonical root with
+their stamps, the product digests and the seed keys it holds. glaeda-cmux-runner-hook reads it (never the
+network) to cost each peer's kept state against the job, the way it costs its own roots, and asks the
+broker (`state`) to pull a much nearer one into the root the job holds before the job's restore step.
+
+Kept state carries no digest GitHub recorded: it is trusted exactly as a PR mini trusts its own kept
+state, which any in-repo PR job on it may have written (forks never run on the minis). The mesh holds PR
+minis only (glaeda-seed-lan mesh refuses the trusted seeder, mini-6 and any trusted-ref runner), and the
+broker refuses to pull into a mini whose runner receipt names a trusted ref, so PR state never reaches the
+trusted seed chain. A pull lands in a staging directory beside the store, must extract completely with the
+stamp it asked for, and only then replaces the root's derived-data and stamp.json, the way cmux's `keep`
+does (stamp without fingerprint first, so an interrupted swap is cold, never mislabelled).
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
@@ -38,6 +59,7 @@ import pwd
 import re
 import secrets
 import select
+import shutil
 import signal
 import socket
 import stat
@@ -70,6 +92,22 @@ BROKER_THREADS = 8  # connections at a time; more are answered busy at once
 MAX_BROKER_REQUEST = 4096
 RELOAD_CHECK_SECONDS = 5.0  # how often an idle broker looks for an updated copy of itself
 EXIT_HIT, EXIT_ERROR, EXIT_MISS = 0, 1, 3
+
+# Build mesh: the fleet index and kept-state pulls.
+STATE_DIR = Path("/Users/Shared/cmux-build-fleet/ci")  # cmux CMUX_OWNED_STATE_ROOT (root 1; root k: cmux-ci-k)
+RECEIPT = HOME / ".local/state/glaeda/cmux-runner/receipt.json"
+INDEX = HOME / ".local/state/glaeda/lan-fetch/fleet-index.json"
+INDEX_SCHEMA = "glaeda-fleet-index/v1"
+INVENTORY_SCHEMA = "glaeda-lan-inventory/v1"
+INDEX_INTERVAL = 60.0
+INVENTORY_TIMEOUT = 12.0
+MAX_INVENTORY_BYTES = 512 * 1024
+MAX_ROOTS = 8
+SLOT_RE = re.compile(r"kept|pr-[1-9][0-9]{0,8}")
+STATE_DEADLINE = 480.0
+STAGING_PREFIX = ".lan-state-"
+ZSTD_CANDIDATES = ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd")
+TAR = "/usr/bin/tar"
 
 
 def load_config(path: Path | None = None) -> dict | None:
@@ -281,23 +319,245 @@ def fetch(sha: str, dest: Path, config: dict | None, max_bytes: int = MAX_OBJECT
     return EXIT_ERROR, {**record, "error": "; ".join(errors)[:400]}
 
 
+# ------------------------------------------------------------------ build mesh: index and kept state
+
+
+def zstd_tool() -> str | None:
+    return next((c for c in ZSTD_CANDIDATES if os.access(c, os.X_OK)), None)
+
+
+def trusted_host(receipt: Path | None = None) -> bool:
+    """Whether this mini's runner receipt names a trusted ref (a seed writer): it never takes PR state."""
+    try:
+        member = json.loads((receipt or RECEIPT).read_text()).get("member") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    ref = member.get("trustedRef") if isinstance(member, dict) else None
+    return isinstance(ref, str) and ref.startswith("refs/")
+
+
+def root_store(k: int, state_dir: Path | None = None) -> Path:
+    base = state_dir or STATE_DIR
+    return base if k == 1 else base / f"cmux-ci-{k}"
+
+
+def clean_inventory(raw: object) -> dict | None:
+    """A peer's inventory-v1 answer, reduced to well-formed fields (the peer is not trusted)."""
+    if not isinstance(raw, dict) or raw.get("schema") != INVENTORY_SCHEMA:
+        return None
+    roots = []
+    for entry in raw.get("roots") or []:
+        if not isinstance(entry, dict):
+            continue
+        k, slot, stamp = entry.get("root"), entry.get("slot"), entry.get("stamp_sha256")
+        if (not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= MAX_ROOTS or not isinstance(slot, str)
+                or not SLOT_RE.fullmatch(slot) or not isinstance(stamp, str) or not SHA_RE.fullmatch(stamp)):
+            continue
+        roots.append(entry)
+    products = [d for d in raw.get("products") or [] if isinstance(d, str) and SHA_RE.fullmatch(d)]
+    seeds = [key for key in raw.get("seeds") or [] if isinstance(key, str) and len(key) < 200]
+    return {"at": raw.get("at"), "host": str(raw.get("host") or "")[:64], "roots": roots[:64],
+            "products": products[:512], "seeds": seeds[:256]}
+
+
+def inventory_of(config: dict, peer: dict, timeout: float = INVENTORY_TIMEOUT) -> dict | None:
+    try:
+        out = subprocess.run(ssh_command(config, peer, "inventory-v1"), stdin=subprocess.DEVNULL,
+                             capture_output=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    marker = HEADER + b"inventory "
+    at = out.find(marker)
+    if at < 0:
+        return None
+    line_end = out.find(b"\n", at)
+    size = out[at + len(marker):line_end]
+    if line_end < 0 or not size.isdigit() or int(size) > MAX_INVENTORY_BYTES:
+        return None
+    body = out[line_end + 1:line_end + 1 + int(size)]
+    try:
+        return clean_inventory(json.loads(body))
+    except ValueError:
+        return None
+
+
+def refresh_index(config: dict | None, path: Path | None = None) -> dict:
+    """Poll every peer's inventory in parallel and write the fleet index atomically; the index."""
+    path = path or INDEX
+    index = {"schema": INDEX_SCHEMA, "at": int(time.time()), "self": os.uname().nodename.split(".")[0],
+             "peers": {}}
+    if config is not None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(config["peers"])) as pool:
+            answers = list(pool.map(lambda peer: inventory_of(config, peer), config["peers"]))
+        for peer, answer in zip(config["peers"], answers):
+            index["peers"][peer["name"]] = {"ok": answer is not None, "polled_at": index["at"],
+                                           "inventory": answer}
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+    tmp.write_text(json.dumps(index, sort_keys=True))
+    tmp.replace(path)
+    return index
+
+
+def read_index(path: Path | None = None) -> dict | None:
+    try:
+        index = json.loads((path or INDEX).read_text())
+    except (OSError, ValueError):
+        return None
+    return index if isinstance(index, dict) and index.get("schema") == INDEX_SCHEMA else None
+
+
+def install_state(staging: Path, store: Path, stamp_raw: bytes) -> None:
+    """Swap STAGING's derived-data into STORE as cmux `keep` does: an unfingerprinted stamp first, so an
+    interrupted swap reads as cold, then the tree, then the full stamp. Other store entries stay."""
+    stamp = json.loads(stamp_raw)
+    store.mkdir(parents=True, exist_ok=True)
+    cold = {key: value for key, value in stamp.items()
+            if key not in ("fingerprint", "merged_onto", "pr", "pr_app_swift_files", "pr_app_swift_total",
+                           "pr_package_interface", "pr_hot_files")}
+    (store / "stamp.json").write_text(json.dumps(cold, sort_keys=True))
+    derived = store / "derived-data"
+    if derived.exists() or derived.is_symlink():
+        aside = store / f".derived-data.discard-{os.getpid()}"  # cmux sweep_discarded's name
+        derived.rename(aside)
+        shutil.rmtree(aside, ignore_errors=True)
+    (staging / "derived-data").rename(derived)
+    tmp = store / f".stamp.json.lan-{os.getpid()}"
+    tmp.write_bytes(stamp_raw)
+    tmp.replace(store / "stamp.json")
+
+
+def fetch_state(peer_name: str, k: int, slot: str, want: str, config: dict | None, state_dir: Path | None = None,
+                deadline: float | None = None, cancel: threading.Event | None = None,
+                receipt: Path | None = None) -> tuple[int, dict]:
+    """(exit code, record): pull PEER's kept state of root K (SLOT, stamp sha256 WANT) into root K's store."""
+    started = time.monotonic()
+    deadline = deadline if deadline is not None else started + STATE_DEADLINE
+    cancel = cancel or threading.Event()
+    record: dict = {"tool": "glaeda-lan-fetch", "verb": "state", "peer": peer_name, "root": k, "slot": slot,
+                    "stamp_sha256": want}
+    if not (isinstance(k, int) and 1 <= k <= MAX_ROOTS and SLOT_RE.fullmatch(slot) and SHA_RE.fullmatch(want)):
+        return EXIT_ERROR, {**record, "error": "bad request"}
+    if trusted_host(receipt):
+        return EXIT_ERROR, {**record, "error": "this mini runs a trusted ref; it never takes PR state"}
+    if config is None:
+        return EXIT_MISS, {**record, "reason": "no mesh config"}
+    peer = next((p for p in config["peers"] if p["name"] == peer_name), None)
+    if peer is None:
+        return EXIT_ERROR, {**record, "error": "not a mesh peer"}
+    base = state_dir or STATE_DIR
+    store = root_store(k, base)
+    if not base.is_dir() or (k > 1 and store.is_symlink()):
+        return EXIT_ERROR, {**record, "error": "no state directory"}
+    staging = base / f"{STAGING_PREFIX}{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(4)}"
+    os.mkdir(staging, 0o700)
+    zstd = zstd_tool()
+    proc = subprocess.Popen(ssh_command(config, peer, f"state-v1 {k} {slot} {want} {'zstd' if zstd else 'tar'}"),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    procs = [proc]
+    done, stopped = threading.Event(), []
+
+    def watch() -> None:
+        while not done.wait(0.2):
+            why = "cancelled" if cancel.is_set() else "timed out" if time.monotonic() >= deadline else ""
+            if why:
+                stopped.append(why)
+                for each in procs:
+                    with contextlib.suppress(OSError):
+                        os.killpg(each.pid, signal.SIGKILL)
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        words = header_of(proc.stdout).decode(errors="replace").split()
+        if words == ["miss"]:
+            return EXIT_MISS, {**record, "reason": "the peer no longer holds it"}
+        if len(words) != 5 or words[:4] != ["hit-state", str(k), slot, want] or words[4] not in ("zstd", "tar"):
+            return EXIT_ERROR, {**record, "error": stopped[0] if stopped else
+                                "peer answered " + (" ".join(words)[:60] or "nothing")}
+        record["codec"] = words[4]
+        tar = subprocess.Popen([TAR, "-xf", "-", "-C", os.fspath(staging)], stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        procs.append(tar)
+        sink = tar.stdin
+        unzstd = None
+        if words[4] == "zstd":
+            if not zstd:
+                return EXIT_ERROR, {**record, "error": "peer sent zstd, no zstd here"}
+            unzstd = subprocess.Popen([zstd, "-d", "-q", "-c"], stdin=subprocess.PIPE, stdout=tar.stdin,
+                                      stderr=subprocess.DEVNULL, start_new_session=True)
+            procs.append(unzstd)
+            tar.stdin.close()
+            sink = unzstd.stdin
+        received = 0
+        try:
+            while True:
+                chunk = proc.stdout.read1(1 << 20)
+                if not chunk:
+                    break
+                sink.write(chunk)
+                received += len(chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                sink.close()
+        codes = [each.wait() for each in procs[::-1]]
+        record["received_bytes"] = received
+        record["transfer_seconds"] = round(time.monotonic() - started, 3)
+        if stopped:
+            return EXIT_ERROR, {**record, "error": stopped[0]}
+        if any(codes):
+            return EXIT_ERROR, {**record, "error": f"stream failed (exit codes {codes})"}
+        stamp_path = staging / "stamp.json"
+        if (stamp_path.is_symlink() or not stamp_path.is_file() or (staging / "derived-data").is_symlink()
+                or not (staging / "derived-data").is_dir()):
+            return EXIT_ERROR, {**record, "error": "incomplete state"}
+        stamp_raw = stamp_path.read_bytes()
+        if hashlib.sha256(stamp_raw).hexdigest() != want:
+            return EXIT_ERROR, {**record, "error": "stamp mismatch"}
+        install_state(staging, store, stamp_raw)
+        return EXIT_HIT, {**record, "seconds": round(time.monotonic() - started, 3)}
+    except OSError as error:
+        return EXIT_ERROR, {**record, "error": f"{type(error).__name__}: {error}"[:200]}
+    finally:
+        done.set()
+        watcher.join()
+        for each in procs:
+            with contextlib.suppress(OSError):
+                os.killpg(each.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                each.wait(timeout=5)
+        proc.stdout.close()
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def index_loop(stop: threading.Event, path: Path | None = None, interval: float = INDEX_INTERVAL) -> None:
+    while not stop.is_set():
+        with contextlib.suppress(Exception):
+            refresh_index(load_config(), path)
+        stop.wait(interval)
+
+
 # ------------------------------------------------------------------ the broker
 
 
 def broker_request(sha: str, dest: Path, sock_path: Path | None = None,
-                   max_bytes: int = MAX_OBJECT_BYTES) -> tuple[int, dict] | None:
+                   max_bytes: int = MAX_OBJECT_BYTES, request: dict | None = None) -> tuple[int, dict] | None:
     """Ask the local broker; None when there is none to ask."""
     sock_path = sock_path or SOCKET
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        conn.settimeout(REQUEST_DEADLINE + 20)
+        conn.settimeout((STATE_DEADLINE if request else REQUEST_DEADLINE) + 20)
         conn.connect(os.fspath(sock_path))
     except OSError:
         conn.close()
         return None
     try:
-        conn.sendall((json.dumps({"verb": "product", "sha256": sha, "dest": os.fspath(dest),
-                                  "max_bytes": max_bytes}) + "\n").encode())
+        conn.sendall((json.dumps(request or {"verb": "product", "sha256": sha, "dest": os.fspath(dest),
+                                             "max_bytes": max_bytes}) + "\n").encode())
         data = b""
         while not data.endswith(b"\n") and len(data) < 65536:
             chunk = conn.recv(4096)
@@ -322,12 +582,20 @@ def read_request(conn: socket.socket) -> dict:
             break
         data += chunk
     request = json.loads(data)
+    if isinstance(request, dict) and request.get("verb") == "state":
+        peer, k, slot, want = request.get("peer"), request.get("root"), request.get("slot"), request.get("stamp_sha256")
+        if (not isinstance(peer, str) or not NAME_RE.fullmatch(peer) or not isinstance(k, int) or isinstance(k, bool)
+                or not isinstance(slot, str) or not isinstance(want, str)):
+            raise ValueError("bad request")
+        return {"verb": "state", "peer": peer, "root": k, "slot": slot, "stamp_sha256": want}
+    if isinstance(request, dict) and request.get("verb") == "refresh-index":
+        return {"verb": "refresh-index"}
     if not isinstance(request, dict) or request.get("verb") != "product":
         raise ValueError("unknown request")
     sha, dest, max_bytes = request.get("sha256"), request.get("dest"), request.get("max_bytes", MAX_OBJECT_BYTES)
     if not isinstance(sha, str) or not isinstance(dest, str) or not isinstance(max_bytes, int):
         raise ValueError("bad request")
-    return {"sha": sha, "dest": dest, "max_bytes": max_bytes}
+    return {"verb": "product", "sha": sha, "dest": dest, "max_bytes": max_bytes}
 
 
 def client_gone(conn: socket.socket) -> bool:
@@ -351,10 +619,19 @@ def handle(conn: socket.socket, slots: threading.BoundedSemaphore) -> None:
             else:
                 try:
                     cancel, result = threading.Event(), []
-                    deadline = time.monotonic() + REQUEST_DEADLINE
-                    worker = threading.Thread(target=lambda: result.append(fetch(
-                        request["sha"], Path(request["dest"]), load_config(), request["max_bytes"], deadline, cancel)),
-                        daemon=True)
+                    if request["verb"] == "state":
+                        deadline = time.monotonic() + STATE_DEADLINE
+                        work = lambda: fetch_state(request["peer"], request["root"], request["slot"],  # noqa: E731
+                                                   request["stamp_sha256"], load_config(), deadline=deadline,
+                                                   cancel=cancel)
+                    elif request["verb"] == "refresh-index":
+                        work = lambda: (EXIT_HIT, {"tool": "glaeda-lan-fetch", "verb": "refresh-index",  # noqa: E731
+                                                   "peers": len(refresh_index(load_config())["peers"])})
+                    else:
+                        deadline = time.monotonic() + REQUEST_DEADLINE
+                        work = lambda: fetch(request["sha"], Path(request["dest"]), load_config(),  # noqa: E731
+                                             request["max_bytes"], deadline, cancel)
+                    worker = threading.Thread(target=lambda: result.append(work()), daemon=True)
                     worker.start()
                     while worker.is_alive():
                         worker.join(0.2)
@@ -372,7 +649,7 @@ def handle(conn: socket.socket, slots: threading.BoundedSemaphore) -> None:
 
 
 def serve_local(sock_path: Path | None = None, ready: threading.Event | None = None,
-                reexec=os.execv, me: Path | None = None) -> int:
+                index_path: Path | None = None, reexec=os.execv, me: Path | None = None) -> int:
     """The broker: one Unix socket in a 0700 directory; BROKER_THREADS connections and BROKER_CONCURRENCY
     fetches at a time, and a connection past those answers busy at once."""
     sock_path = sock_path or SOCKET
@@ -405,6 +682,8 @@ def serve_local(sock_path: Path | None = None, ready: threading.Event | None = N
                 active[0] -= 1
             handlers.release()
 
+    stop = threading.Event()
+    threading.Thread(target=index_loop, args=(stop, index_path), daemon=True).start()
     if ready is not None:
         ready.set()
     try:
@@ -438,6 +717,7 @@ def serve_local(sock_path: Path | None = None, ready: threading.Event | None = N
                 active[0] += 1
             pool.submit(run, conn)
     finally:
+        stop.set()
         server.close()
         pool.shutdown(wait=False)
 
@@ -445,6 +725,19 @@ def serve_local(sock_path: Path | None = None, ready: threading.Event | None = N
 def main(argv: list[str]) -> int:
     if argv == ["serve-local"]:
         return serve_local()
+    if argv == ["index"]:
+        index = read_index()
+        print(json.dumps(index, indent=1, sort_keys=True) if index else "{}")
+        return 0 if index else EXIT_MISS
+    if len(argv) == 5 and argv[0] == "state" and argv[2].isdecimal():
+        request = {"verb": "state", "peer": argv[1], "root": int(argv[2]), "slot": argv[3],
+                   "stamp_sha256": argv[4].lower()}
+        answered = broker_request("", Path("/"), request=request)
+        if answered is None:
+            answered = fetch_state(argv[1], int(argv[2]), argv[3], argv[4].lower(), load_config())
+        code, record = answered
+        print(json.dumps(record, sort_keys=True), flush=True)
+        return code
     max_bytes = MAX_OBJECT_BYTES
     if len(argv) == 5 and argv[3] == "--max-bytes" and argv[4].isdecimal():
         max_bytes, argv = int(argv[4]), argv[:3]

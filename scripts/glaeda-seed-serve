@@ -25,6 +25,18 @@ node_product_cache.py: PRODUCTS/objects/<key[:2]>/<key>/{metadata.json,object.ta
 
     product-has-v1 SHA256    glaeda-seed-serve 1 has SHA256 SIZE, or miss (exit 3)
     product-v1 SHA256        glaeda-seed-serve 1 hit-product SHA256 SIZE, then exactly SIZE raw bytes
+    inventory-v1             glaeda-seed-serve 1 inventory SIZE, then SIZE bytes of JSON (INVENTORY_SCHEMA):
+                             this mini's kept compile-admission states per canonical root (the stamp of
+                             STATE/derived-data and STATE/cmux-ci-<k>/derived-data, and of each parked
+                             pull-request build under <store>/pr-builds/pr-<n>), its product digests and
+                             its seed keys. glaeda-lan-fetch's broker polls it into the fleet index.
+    state-v1 K SLOT STAMP CODEC
+                             glaeda-seed-serve 1 hit-state K SLOT STAMP CODEC, then `tar -cf - stamp.json
+                             derived-data` of root K's kept state (SLOT kept, or pr-<n> for a parked build)
+                             whose stamp.json has sha256 STAMP (through zstd -1 -T0 for CODEC zstd); miss
+                             (exit 3) when it is gone or changed. The tar is of an APFS clone taken while the
+                             stamp and the derived-data directory stayed the same, so a job's `keep` racing
+                             it never yields a torn state. Logs and Index.noindex are left out (cmux UNREAD).
 
 SHA256 is the archive's content digest (metadata object_digest), 64 lowercase hex. Only an entry whose
 directories are real (walked from / with O_DIRECTORY|O_NOFOLLOW and openat, so none is a symlink),
@@ -65,10 +77,14 @@ The options below are fixed by the authorized_keys command, never by the client.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
 import signal
 import stat
 import subprocess
@@ -111,6 +127,26 @@ ROLES = ("seed", "product", "archive")
 ARCHIVE = "/Volumes/glaeda-seed-archive/seeds"
 ARCHIVE_SUFFIX = ".tar.zst"
 MAX_LIST = 512
+# Kept compile-admission state (cmux owned_build_state.py): root 1's store is STATE, root k's STATE/cmux-ci-k;
+# a parked pull-request build (cmux PR slots) sits at <store>/pr-builds/pr-<n>.
+STAMP = "stamp.json"
+DERIVED = "derived-data"
+PR_BUILDS = "pr-builds"
+MAX_ROOTS = 8
+MAX_PR_SLOTS = 8
+SLOT_RE = re.compile(r"kept|pr-[1-9][0-9]{0,8}")
+STAMP_MAX_BYTES = 64 * 1024
+STAMP_FIELDS = ("fingerprint", "merged_onto", "pr", "pr_app_swift_files", "pr_app_swift_total",
+                "pr_package_interface", "pr_hot_files")
+UNREAD = ("Logs", "Index.noindex")  # cmux owned_build_state.UNREAD: never read by a build
+INVENTORY_SCHEMA = "glaeda-lan-inventory/v1"
+MAX_INVENTORY_BYTES = 512 * 1024
+MAX_INVENTORY_PRODUCTS = 512
+MAX_INVENTORY_SEEDS = 256
+# A kept state is 8-12 GB: ~35 s through zstd at LAN speed, ~100 s as plain tar, plus the clone.
+STATE_SERVE_TIMEOUT = 420
+SNAPSHOT_PREFIX = ".lan-serve-"
+CP = "/bin/cp"
 IP_RE = re.compile(r"[0-9A-Fa-f.:]{1,64}")
 
 
@@ -132,6 +168,12 @@ def parse_request(text: str, role: str = "seed") -> tuple[str, str, list[str]]:
     if role == "product":
         if len(words) == 2 and words[0] in ("product-v1", "product-has-v1") and SHA_RE.fullmatch(words[1]):
             return words[0].removesuffix("-v1"), "", [words[1]]
+        if words == ["inventory-v1"]:
+            return "inventory", "", []
+        if (len(words) == 5 and words[0] == "state-v1" and words[1].isdecimal() and words[1].isascii()
+                and 1 <= int(words[1]) <= MAX_ROOTS and str(int(words[1])) == words[1]
+                and SLOT_RE.fullmatch(words[2]) and SHA_RE.fullmatch(words[3]) and words[4] in CODECS):
+            return "state", words[4], [words[1], words[2], words[3]]
         raise Refused("unknown request")
     if len(words) < 3 or words[0] != "seed-v1":
         raise Refused("unknown request")
@@ -262,9 +304,15 @@ def try_lock(path: Path) -> int | None:
         return None
 
 
-def admit(run_dir: Path, client: str) -> list[int] | None:
-    """The fds of this client's lock and a queue place, or None (answer busy at once)."""
-    mine = try_lock(run_dir / f"client-{client.replace(':', '_')}.lock")
+def admit(run_dir: Path, client: str, lane: str = "") -> list[int] | None:
+    """The fds of this client's lock and a queue place, or None (answer busy at once).
+
+    LANE gives a client's bookkeeping traffic its own per-client guard. The guard exists to stop one
+    client flooding this peer with transfers; a fetching client's own index poll is not that flood, and
+    sharing the lane with it makes the fetch read as a miss on a peer that has the object. The queue
+    places are still shared, so total concurrency stays bounded.
+    """
+    mine = try_lock(run_dir / f"client-{client.replace(':', '_')}{lane}.lock")
     if mine is None:
         return None
     for place in range(QUEUE):
@@ -452,17 +500,17 @@ def say(line: str) -> None:
     os.write(1, (f"{HEADER} {line}\n").encode())
 
 
-def stream(seeds: Path, key: str, codec: str) -> int:
+def stream(seeds: Path, key: str, codec: str, names: list[str] | None = None, timeout: float = SERVE_TIMEOUT) -> int:
     """Write KEY's tar (through zstd for CODEC zstd) to stdout; the exit status of the pipeline."""
     lower = [TASKPOLICY, "-d", "utility"] if os.access(TASKPOLICY, os.X_OK) else []
-    tar = subprocess.Popen([*lower, TAR, "-cf", "-", "-C", os.fspath(seeds), key], stdin=subprocess.DEVNULL,
+    tar = subprocess.Popen([*lower, TAR, "-cf", "-", "-C", os.fspath(seeds), *(names or [key])], stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE if codec == "zstd" else 1, stderr=subprocess.DEVNULL)
     procs = [tar]
     if codec == "zstd":
         procs.append(subprocess.Popen([zstd_tool() or "zstd", "-1", "-T0", "-q", "-c"], stdin=tar.stdout,
                                       stdout=1, stderr=subprocess.DEVNULL))
         tar.stdout.close()
-    deadline = time.monotonic() + SERVE_TIMEOUT
+    deadline = time.monotonic() + timeout
     status = 0
     for proc in procs:
         try:
@@ -496,6 +544,10 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
         return 0
     if verb in ("product", "product-has"):
         return serve_product(verb, keys[0], products, run_dir, client, slot_wait, record)
+    if verb == "inventory":
+        return serve_inventory(state, products, run_dir, client, record)
+    if verb == "state":
+        return serve_state(state, int(keys[0]), keys[1], keys[2], codec, run_dir, client, slot_wait, record)
     if verb == "list":
         # Admitted like a product lookup: a scan of the seed caches is work a flood of clients must not multiply.
         admitted = admit(run_dir, client)
@@ -603,6 +655,279 @@ def serve_product(verb: str, sha: str, products: Path, run_dir: Path, client: st
     finally:
         for held in admitted:
             os.close(held)
+
+
+# ------------------------------------------------------------------ kept state (inventory-v1, state-v1)
+
+
+def root_store(state: Path, k: int) -> Path:
+    return state if k == 1 else state / f"cmux-ci-{k}"
+
+
+def slot_dir(store: Path, slot: str) -> Path:
+    return store if slot == "kept" else store / PR_BUILDS / slot
+
+
+def read_kept(directory: Path) -> tuple[bytes, int, float] | None:
+    """(stamp bytes, derived-data inode, stamp mtime) of a kept state in DIRECTORY, or None.
+
+    DIRECTORY is walked from / without following a symlink; stamp.json must be a regular file of at most
+    STAMP_MAX_BYTES holding a JSON object, and derived-data a real directory. Any job on this mini can
+    write these, so a failure only means "no state here".
+    """
+    fd = open_dir_path(directory)
+    if fd is None:
+        return None
+    try:
+        derived = os.stat(DERIVED, dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISDIR(derived.st_mode):
+            return None
+        stamp_fd = os.open(STAMP, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        try:
+            info = os.fstat(stamp_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > STAMP_MAX_BYTES:
+                return None
+            raw = os.read(stamp_fd, STAMP_MAX_BYTES + 1)
+        finally:
+            os.close(stamp_fd)
+        if len(raw) > STAMP_MAX_BYTES or not isinstance(json.loads(raw), dict):
+            return None
+        return raw, derived.st_ino, info.st_mtime
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def pr_slots(store: Path) -> list[str]:
+    try:
+        names = sorted(os.listdir(store / PR_BUILDS)) if stat.S_ISDIR(os.lstat(store / PR_BUILDS).st_mode) else []
+    except OSError:
+        return []
+    return [name for name in names if SLOT_RE.fullmatch(name) and name != "kept"][:MAX_PR_SLOTS]
+
+
+def tree_bytes(directory: Path, budget: float) -> int | None:
+    """Bytes of the files under DIRECTORY (symlinks not followed, UNREAD left out); None past BUDGET s."""
+    deadline, total, stack = time.monotonic() + budget, 0, [os.fspath(directory)]
+    while stack:
+        if time.monotonic() > deadline:
+            return None
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        if not (entry.name in UNREAD and os.path.dirname(entry.path) == os.fspath(directory)):
+                            stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+        except OSError:
+            continue
+    return total
+
+
+def kept_states(state: Path, run_dir: Path, size_budget: float = 4.0) -> list[dict]:
+    """Every kept state on this mini (roots 1..MAX_ROOTS, kept and parked slots), newest first."""
+    cache_path = run_dir / "inventory-bytes.json"
+    try:
+        cache = json.loads(cache_path.read_text())
+        cache = cache if isinstance(cache, dict) else {}
+    except (OSError, ValueError):
+        cache = {}
+    fresh, found = {}, []
+    deadline = time.monotonic() + size_budget
+    for k in range(1, MAX_ROOTS + 1):
+        store = root_store(state, k)
+        if k > 1 and not store.is_dir():
+            continue
+        for slot in ["kept", *pr_slots(store)]:
+            got = read_kept(slot_dir(store, slot))
+            if got is None:
+                continue
+            raw, inode, mtime = got
+            stamp = json.loads(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            cache_key = f"{k}/{slot}/{digest}/{inode}"
+            size = cache.get(cache_key)
+            if not isinstance(size, int):
+                size = tree_bytes(slot_dir(store, slot) / DERIVED, max(0.0, deadline - time.monotonic()))
+            if isinstance(size, int):
+                fresh[cache_key] = size
+            entry = {"root": k, "slot": slot, "stamp_sha256": digest, "kept_at": int(mtime), "bytes": size}
+            entry.update({field: stamp[field] for field in STAMP_FIELDS if field in stamp})
+            found.append(entry)
+    with contextlib.suppress(OSError):
+        tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}")
+        tmp.write_text(json.dumps(fresh))
+        tmp.replace(cache_path)
+    return sorted(found, key=lambda entry: -entry["kept_at"])
+
+
+def product_digests(products: Path) -> list[str]:
+    """Content digests of this mini's cached products (metadata only), at most MAX_INVENTORY_PRODUCTS."""
+    digests: list[str] = []
+    root = open_dir_path(products)
+    if root is None:
+        return digests
+    try:
+        objects = open_child_dir(root, "objects")
+        if objects is None:
+            return digests
+        try:
+            for shard_name in sorted(os.listdir(objects)):
+                shard = open_child_dir(objects, shard_name) if re.fullmatch(r"[a-f0-9]{2}", shard_name) else None
+                if shard is None:
+                    continue
+                try:
+                    for name in sorted(os.listdir(shard)):
+                        entry = open_child_dir(shard, name) if SHA_RE.fullmatch(name) else None
+                        if entry is None:
+                            continue
+                        try:
+                            metadata = read_metadata(entry) or {}
+                        finally:
+                            os.close(entry)
+                        digest = metadata.get("object_digest")
+                        if (isinstance(digest, str) and SHA_RE.fullmatch(digest)
+                                and metadata.get("schema_generation") == PRODUCT_SCHEMA):
+                            digests.append(digest)
+                            if len(digests) >= MAX_INVENTORY_PRODUCTS:
+                                return digests
+                finally:
+                    os.close(shard)
+        finally:
+            os.close(objects)
+    except OSError:
+        pass
+    finally:
+        os.close(root)
+    return digests
+
+
+def seed_keys(state: Path) -> list[str]:
+    keys: list[str] = []
+    for seeds in seed_dirs(state):
+        try:
+            names = sorted(os.listdir(seeds))
+        except OSError:
+            continue
+        keys += [name for name in names if KEY_RE.fullmatch(name) and kept(seeds, name)]
+    return sorted(set(keys))[:MAX_INVENTORY_SEEDS]
+
+
+def inventory(state: Path, products: Path, run_dir: Path) -> dict:
+    return {"schema": INVENTORY_SCHEMA, "host": os.uname().nodename.split(".")[0], "at": int(time.time()),
+            "roots": kept_states(state, run_dir), "products": product_digests(products), "seeds": seed_keys(state)}
+
+
+def serve_inventory(state: Path, products: Path, run_dir: Path, client: str, record: dict) -> int:
+    # The broker polls this every INDEX_INTERVAL seconds from the same host that fetches products, so it
+    # takes its own lane: an inventory poll must never make a concurrent product lookup answer busy.
+    admitted = admit(run_dir, client, "-inventory")
+    if admitted is None:
+        say("busy")
+        log(run_dir, {**record, "outcome": "busy", "verb": "inventory"})
+        return 4
+    try:
+        with contextlib.suppress(OSError):
+            os.nice(10)
+        body = json.dumps(inventory(state, products, run_dir), sort_keys=True).encode()
+        if len(body) > MAX_INVENTORY_BYTES:
+            say("refused inventory-too-large")
+            return 5
+        say(f"inventory {len(body)}")
+        view = memoryview(body)
+        while view:
+            view = view[os.write(1, view):]
+        log(run_dir, {**record, "outcome": "inventory", "bytes": len(body)})
+        return 0
+    finally:
+        for held in admitted:
+            os.close(held)
+
+
+def sweep_snapshots(state: Path) -> None:
+    """Remove snapshots a killed serve left behind (their pid is gone)."""
+    try:
+        names = [name for name in os.listdir(state) if name.startswith(SNAPSHOT_PREFIX)]
+    except OSError:
+        return
+    for name in names:
+        pid = name[len(SNAPSHOT_PREFIX):].split("-")[0]
+        alive = False
+        if pid.isdecimal():
+            try:
+                os.kill(int(pid), 0)
+                alive = True
+            except PermissionError:
+                alive = True
+            except OSError:
+                alive = False
+        if not alive:
+            shutil.rmtree(state / name, ignore_errors=True)
+
+
+def clone_args() -> list[str]:
+    """cp's recursive copy-on-write flags: APFS clone on the minis, reflink-when-possible elsewhere (CI)."""
+    if sys.platform == "darwin":
+        return [CP, "-cR"]
+    return [CP, "--reflink=auto", "-R"]
+
+
+def snapshot(state: Path, directory: Path, want: str) -> Path | None:
+    """A copy-on-write clone of DIRECTORY's kept state whose stamp has sha256 WANT, taken while it stayed put."""
+    before = read_kept(directory)
+    if before is None or hashlib.sha256(before[0]).hexdigest() != want:
+        return None
+    snap = state / f"{SNAPSHOT_PREFIX}{os.getpid()}-{secrets.token_hex(4)}"
+    os.mkdir(snap, 0o700)
+    lower = [TASKPOLICY, "-d", "utility"] if os.access(TASKPOLICY, os.X_OK) else []
+    cloned = subprocess.run([*lower, *clone_args(), os.fspath(directory / DERIVED), os.fspath(snap / DERIVED)],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=300).returncode == 0
+    after = read_kept(directory)
+    if not cloned or after is None or after[:2] != before[:2]:
+        shutil.rmtree(snap, ignore_errors=True)
+        return None
+    for name in UNREAD:
+        shutil.rmtree(snap / DERIVED / name, ignore_errors=True)
+    (snap / STAMP).write_bytes(before[0])
+    return snap
+
+
+def serve_state(state: Path, k: int, slot: str, want: str, codec: str, run_dir: Path, client: str,
+                slot_wait: float, record: dict) -> int:
+    record = {**record, "verb": "state", "root": k, "slot": slot}
+    admitted = admit(run_dir, client)
+    held = take_slot(run_dir, slot_wait) if admitted is not None else None
+    if held is None:
+        for fd in admitted or []:
+            os.close(fd)
+        say("busy")
+        log(run_dir, {**record, "outcome": "busy"})
+        return 4
+    snap = None
+    started = time.monotonic()
+    try:
+        with contextlib.suppress(OSError):
+            os.nice(10)
+        sweep_snapshots(state)
+        snap = snapshot(state, slot_dir(root_store(state, k), slot), want)
+        if snap is None:
+            say("miss")
+            log(run_dir, {**record, "outcome": "miss"})
+            return 3
+        if codec == "zstd" and zstd_tool() is None:
+            codec = "tar"
+        say(f"hit-state {k} {slot} {want} {codec}")
+        status = stream(snap, "", codec, names=[STAMP, DERIVED], timeout=STATE_SERVE_TIMEOUT)
+        log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "codec": codec, "status": status,
+                      "seconds": round(time.monotonic() - started, 1)})
+        return 0 if status == 0 else 5
+    finally:
+        if snap is not None:
+            shutil.rmtree(snap, ignore_errors=True)
+        for fd in [held, *admitted]:
+            os.close(fd)
 
 
 def main(argv: list[str]) -> int:

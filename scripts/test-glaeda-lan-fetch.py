@@ -55,8 +55,10 @@ if mode == "silent" and request.startswith("product-v1"):
         open(os.environ["FAKE_PIDFILE"], "w").write(str(os.getpid()))
     time.sleep(60)
 os.environ["SSH_ORIGINAL_COMMAND"] = request
+states = json.loads(os.environ.get("FAKE_STATES", "{}"))
 os.execv(sys.executable, [sys.executable, os.environ["FAKE_SERVE"], "--role", "product", "--products", peers[address],
-                          "--run-dir", peers[address] + ".run", "--receipt", "/nonexistent"])
+                          "--run-dir", peers[address] + ".run", "--receipt", "/nonexistent",
+                          "--state", states.get(address, "/nonexistent")])
 """
 
 
@@ -160,6 +162,24 @@ class ProductServeTest(unittest.TestCase):
         finally:
             os.close(fd)
         self.assertEqual(self.ask(f"product-has-v1 {sha}")[0], 0)
+
+    def test_an_inventory_poll_does_not_hold_the_same_clients_product_lane(self):
+        # The broker polls every peer's inventory every INDEX_INTERVAL seconds from the same host that
+        # fetches products through it. Sharing the per-client guard made a concurrent product lookup
+        # answer busy, and a busy peer is indistinguishable from a miss to the fetcher, so the fetch
+        # reported "no peer has it" about a peer that had it.
+        sha, _ = put_product(self.products, b"x" * 100)
+        run = Path(self.tmp.name) / "run"
+        run.mkdir()
+        import fcntl
+        for holder, asked in (("client-172.20.21.196-inventory.lock", f"product-has-v1 {sha}"),
+                              ("client-172.20.21.196.lock", "inventory-v1")):
+            fd = os.open(run / holder, os.O_RDONLY | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                self.assertEqual(self.ask(asked)[0], 0, f"{holder} must not block {asked}")
+            finally:
+                os.close(fd)
 
     def test_hard_links_other_owners_big_metadata_and_symlinked_paths_are_refused(self):
         data = b"x" * 1000
@@ -481,6 +501,152 @@ sys.exit(m.main(sys.argv[1:]))
     def test_the_helper_runs_apples_python_isolated(self):
         first = (ROOT / "scripts/glaeda-lan-fetch").read_text().splitlines()[0]
         self.assertEqual(first, "#!/usr/bin/python3 -I")
+
+
+def put_state(state: Path, k: int, stamp: dict, files: dict[str, bytes], slot: str = "kept") -> str:
+    """A cmux kept compile-admission state for root K; returns its stamp's sha256."""
+    store = state if k == 1 else state / f"cmux-ci-{k}"
+    if slot != "kept":
+        store = store / "pr-builds" / slot
+    derived = store / "derived-data"
+    for name, data in files.items():
+        (derived / name).parent.mkdir(parents=True, exist_ok=True)
+        (derived / name).write_bytes(data)
+    derived.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(stamp, sort_keys=True).encode()
+    (store / "stamp.json").write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+STAMP = {"fingerprint": "a" * 32 + "-owned-rec1", "merged_onto": "b" * 40, "pr": 13504,
+         "pr_app_swift_files": ["Sources/A.swift"], "pr_app_swift_total": 1, "pr_package_interface": False}
+
+
+class MeshStateTest(unittest.TestCase):
+    """inventory-v1, state-v1 and the fetch_state pull (build mesh)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.tmp.name))
+        self.peer_state = base / "peer-ci"
+        self.peer_products = base / "peer-products"
+        (self.peer_products / "objects").mkdir(parents=True)
+        self.local = base / "local-ci"
+        self.local.mkdir()
+        conf = base / "lan-mesh"
+        conf.mkdir()
+        (conf / "id_ed25519").write_text("k")
+        (conf / "known_hosts").write_text("x")
+        (conf / "config.json").write_text(json.dumps({"schema": 1, "user": "cmux", "peers": [
+            {"name": "cmux9s-mac-mini", "address": "172.20.21.192"}]}))
+        self.config = lf.load_config(conf / "config.json")
+        fake = base / "fake-ssh"
+        fake.write_text(f"#!{sys.executable}\n" + FAKE_SSH)
+        fake.chmod(0o755)
+        self.saved = (lf.SSH, dict(os.environ))
+        lf.SSH = os.fspath(fake)
+        os.environ.update({"FAKE_PEERS": json.dumps({"172.20.21.192": os.fspath(self.peer_products)}),
+                           "FAKE_STATES": json.dumps({"172.20.21.192": os.fspath(self.peer_state)}),
+                           "FAKE_SERVE": os.fspath(SERVE), "FAKE_SSH_LOG": os.fspath(base / "ssh.log")})
+        self.receipt = base / "receipt.json"
+
+    def tearDown(self) -> None:
+        lf.SSH, env = self.saved
+        os.environ.clear()
+        os.environ.update(env)
+        self.tmp.cleanup()
+
+    def pull(self, k: int, slot: str, want: str) -> tuple[int, dict]:
+        return lf.fetch_state("cmux9s-mac-mini", k, slot, want, self.config, state_dir=self.local,
+                              receipt=self.receipt)
+
+    def test_inventory_lists_kept_and_parked_states_products_and_seeds(self):
+        one = put_state(self.peer_state, 1, STAMP, {"Build/a.o": b"x" * 100, "Logs/big.log": b"y" * 5000})
+        two = put_state(self.peer_state, 2, {**STAMP, "pr": 14772}, {"b.o": b"z" * 10}, slot="pr-14772")
+        sha, _ = put_product(self.peer_products, b"product")
+        key = "admission-derived-data-v1-macOS-ARM64-" + "a" * 32 + "-j14-" + "b" * 40
+        (self.peer_state / "seeds" / key).mkdir(parents=True)
+        (self.peer_state / "seeds" / key / serve.MANIFEST).write_text("{}")
+        (self.peer_state / "cmux-ci-2" / "stamp.json").write_text("not json")  # a broken stamp is skipped
+        index = lf.refresh_index(self.config, self.local / "index.json")
+        inv = index["peers"]["cmux9s-mac-mini"]["inventory"]
+        self.assertTrue(index["peers"]["cmux9s-mac-mini"]["ok"])
+        roots = {(r["root"], r["slot"]): r for r in inv["roots"]}
+        self.assertEqual(set(roots), {(1, "kept"), (2, "pr-14772")})
+        self.assertEqual(roots[(1, "kept")]["stamp_sha256"], one)
+        self.assertEqual(roots[(1, "kept")]["bytes"], 100)  # Logs left out
+        self.assertEqual((roots[(1, "kept")]["pr"], roots[(2, "pr-14772")]["stamp_sha256"]), (13504, two))
+        self.assertEqual((inv["products"], inv["seeds"]), ([sha], [key]))
+        self.assertEqual(lf.read_index(self.local / "index.json")["peers"].keys(), {"cmux9s-mac-mini"})
+
+    def test_a_pull_installs_the_peers_state_into_the_same_root(self):
+        want = put_state(self.peer_state, 2, STAMP, {"Build/x.o": os.urandom(200000), "Index.noindex/i": b"i"})
+        old = put_state(self.local, 2, {**STAMP, "pr": 1}, {"old.o": b"old"})
+        (self.local / "cmux-ci-2" / "seeds").mkdir()  # other store entries stay
+        code, record = self.pull(2, "kept", want)
+        self.assertEqual(code, 0, record)
+        store = self.local / "cmux-ci-2"
+        self.assertEqual(hashlib.sha256((store / "stamp.json").read_bytes()).hexdigest(), want)
+        self.assertEqual((store / "derived-data/Build/x.o").read_bytes(),
+                         (self.peer_state / "cmux-ci-2/derived-data/Build/x.o").read_bytes())
+        self.assertFalse((store / "derived-data/old.o").exists())
+        self.assertFalse((store / "derived-data/Index.noindex").exists())
+        self.assertTrue((store / "seeds").is_dir())
+        self.assertNotEqual(old, want)
+        leftovers = [p.name for p in self.local.iterdir() if p.name.startswith(".")]
+        leftovers += [p.name for p in self.peer_state.iterdir() if p.name.startswith(".lan-serve")]
+        self.assertEqual(leftovers, [])
+
+    def test_a_changed_or_missing_state_is_a_miss_and_nothing_changes(self):
+        put_state(self.peer_state, 1, STAMP, {"a.o": b"a"})
+        kept = put_state(self.local, 1, {**STAMP, "pr": 7}, {"mine.o": b"m"})
+        code, record = self.pull(1, "kept", "9" * 64)
+        self.assertEqual(code, 3, record)
+        self.assertEqual(self.pull(3, "kept", "9" * 64)[0], 3)
+        self.assertEqual(hashlib.sha256((self.local / "stamp.json").read_bytes()).hexdigest(), kept)
+        self.assertTrue((self.local / "derived-data/mine.o").exists())
+
+    def test_a_trusted_mini_never_takes_pr_state(self):
+        want = put_state(self.peer_state, 1, STAMP, {"a.o": b"a"})
+        self.receipt.write_text(json.dumps({"member": {"trustedRef": "refs/heads/main"}}))
+        code, record = self.pull(1, "kept", want)
+        self.assertEqual(code, 1)
+        self.assertIn("trusted", record["error"])
+        self.assertFalse((self.local / "derived-data").exists())
+
+    def test_bad_requests_are_refused(self):
+        for k, slot, want in ((0, "kept", "a" * 64), (9, "kept", "a" * 64), (1, "../x", "a" * 64), (1, "kept", "x")):
+            with self.subTest(k=k, slot=slot):
+                self.assertEqual(self.pull(k, slot, want)[0], 1)
+        self.assertEqual(lf.fetch_state("stranger", 1, "kept", "a" * 64, self.config, state_dir=self.local,
+                                        receipt=self.receipt)[0], 1)
+        for request in ("state-v1 1 kept " + "a" * 64, "state-v1 01 kept " + "a" * 64 + " tar",
+                        "state-v1 1 ../kept " + "a" * 64 + " tar", "inventory-v1 x"):
+            with self.subTest(request=request[:30]):
+                env = {**os.environ, "SSH_ORIGINAL_COMMAND": request, "SSH_CLIENT": "172.20.21.196 1 22"}
+                proc = subprocess.run([sys.executable, os.fspath(SERVE), "--role", "product", "--state",
+                                       os.fspath(self.peer_state), "--run-dir", os.fspath(self.local / ".run"),
+                                       "--products", os.fspath(self.peer_products)], env=env, capture_output=True)
+                self.assertEqual(proc.returncode, 2)
+        # The seed role never answers the mesh verbs.
+        env = {**os.environ, "SSH_ORIGINAL_COMMAND": "inventory-v1", "SSH_CLIENT": "172.20.21.196 1 22"}
+        proc = subprocess.run([sys.executable, os.fspath(SERVE), "--state", os.fspath(self.peer_state),
+                               "--run-dir", os.fspath(self.local / ".run2"), "--receipt", "/nonexistent"],
+                              env=env, capture_output=True)
+        self.assertEqual(proc.returncode, 2)
+
+    def test_a_keep_racing_the_snapshot_is_a_miss(self):
+        want = put_state(self.peer_state, 1, STAMP, {"a.o": b"a"})
+        real = serve.read_kept
+        calls = []
+
+        def racing(directory):
+            calls.append(directory)
+            got = real(directory)
+            return got if len(calls) == 1 else (got[0], got[1] + 1, got[2])  # the inode moved: a keep ran
+        with unittest.mock.patch.object(serve, "read_kept", racing):
+            self.assertIsNone(serve.snapshot(self.peer_state, self.peer_state, want))
+        self.assertEqual([p for p in self.peer_state.iterdir() if p.name.startswith(".lan-serve")], [])
 
 
 if __name__ == "__main__":

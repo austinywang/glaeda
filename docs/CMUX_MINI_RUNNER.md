@@ -977,6 +977,38 @@ sighting, evidence, `auto_fix` pending or impossible, and the heals of the last 
 reads; ci-dash's Health section names the operator command for the rest. `glaeda-mini-health` alone prints
 the report without healing; `touch ~/.config/glaeda/mini-health.disabled` keeps it reporting but stops heals.
 
+## 2m. Build mesh: the fleet index and kept state between PR minis
+
+Compiled products (2j) are one object per build. The bigger saving is kept compile-admission state: a
+pull request re-pushed onto a different mini starts cold there (PR 13504 cold-started on three minis on
+2026-09-25) while another mini holds its previous build. The same mesh key and forced command carry two
+more verbs, so no new server, port or GitHub call is involved:
+
+- **`inventory-v1`** answers `glaeda-seed-serve 1 inventory SIZE` and SIZE bytes of JSON
+  (`glaeda-lan-inventory/v1`): per canonical root, the stamp of the kept state (`derived-data` +
+  `stamp.json` in `/Users/Shared/cmux-build-fleet/ci`, `ci/cmux-ci-<k>`, and each parked pull-request build
+  `<store>/pr-builds/pr-<n>`) with its sha256, `kept_at` and size (Logs and Index.noindex left out, sizes
+  cached per stamp), the cached product digests and the kept seed keys.
+- **`state-v1 K SLOT STAMP CODEC`** streams `tar` (zstd -1 -T0 when both ends have zstd) of that kept state.
+  The server first takes an APFS clone (`cp -cR`) and serves it only if the stamp bytes and the
+  `derived-data` inode were the same before and after, so a job's `keep` racing it yields `miss`, never a
+  torn tree. The clone is removed afterwards, and clones a killed serve left are swept by pid.
+- **Fleet index.** The `lan-fetch` broker polls every peer's inventory every 60 s into
+  `~/.local/state/glaeda/lan-fetch/fleet-index.json` (`glaeda-fleet-index/v1`); `glaeda-lan-fetch index`
+  prints it. Readers (glaeda-cmux-runner-hook) never touch the network.
+- **Pull.** `glaeda-lan-fetch state PEER K SLOT STAMP` (through the broker, Local Network Privacy) extracts
+  into `ci/.lan-state-*`, requires the stamp it asked for, then swaps `derived-data` and `stamp.json` into
+  root K's store the way cmux `keep` does. A state is only usable in the same canonical root (its
+  fingerprint covers the root path), so a pull always goes root K to root K.
+- **Trust.** Kept state has no recorded digest: a PR mini trusts it exactly as it trusts its own kept state,
+  which any in-repo PR job there may have written (forks never run on the minis). The mesh is PR minis only,
+  and the broker refuses to pull into a mini whose runner receipt names a trusted ref, so PR state never
+  reaches the trusted seed chain (cmux15), and mini-6 is never in the mesh.
+
+Link speed (2026-09-26, every mini): the M4 Pro minis have the built-in 1 GbE port (Broadcom 57762,
+"Maximum Link Speed: 1 Gb/s", negotiated 1000baseT), not the 10 GbE option, and the Thunderbolt bridge is
+inactive. So a kept state (8-12 GB on disk) moves in about 35-50 s through zstd, or ~90 s as plain tar.
+
 ## 3. Verify
 
 ```bash
