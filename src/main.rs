@@ -114,7 +114,7 @@ use sha2::{Digest as _, Sha256};
 #[command(
     name = "glaeda",
     version,
-    about = "Tend a small fleet of self-hosted GitHub Actions runners"
+    about = "Run trustworthy compute across local and fleet execution capacity"
 )]
 struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
