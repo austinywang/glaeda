@@ -145,6 +145,8 @@ class Family:
     max_idle_hours: float | None = None  # a hot-tier item goes once idle this long, whatever the idle window
     # candidates are the sealed caches discover_caches finds below root, not root's children
     discover: bool = False
+    # candidates are the build outputs inside the checkouts under root (checkout_builds), not root's children
+    checkout_builds: bool = False
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -523,6 +525,82 @@ def seed_verdict(path: Path) -> str:
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
+CHECKOUT_BUILD_IDLE_HOURS = 24.0
+
+
+def _checkout_git(checkout: Path, *args: str) -> list[str]:
+    """NUL-separated output of a read-only git command in checkout, or [] on any failure. The caller's
+    GIT_* variables would override -C (a hook's GIT_DIR names one repository for every checkout)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    try:
+        r = subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, timeout=60, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [os.fsdecode(f) for f in r.stdout.split(b"\0") if f] if r.returncode == 0 else []
+
+
+def project_checkouts(projects: Path) -> list[Path]:
+    """Every checkout under projects, by real path: each repository directly below it and its linked
+    worktrees there. Worktrees outside projects (a Claude session's scratchpad) belong to their own family."""
+    real = os.path.realpath(projects)
+    repos = [c for c in _children(projects) if (c / ".git").exists() and not c.is_symlink()]
+    found = {os.path.realpath(c) for c in repos}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for fields in pool.map(lambda c: _checkout_git(c, "worktree", "list", "--porcelain", "-z"), repos):
+            for f in fields:
+                if f.startswith("worktree "):
+                    w = os.path.realpath(f[len("worktree "):])
+                    if w.startswith(real + "/") and os.path.isdir(w):
+                        found.add(w)
+    return [Path(w) for w in sorted(found)]
+
+
+def _checkout_build_dirs(checkout: Path) -> list[Path]:
+    found = []
+    tracked = _checkout_git(checkout, "ls-files", "-z", "--", "Package.swift", ":(glob)**/Package.swift")
+    for rel in sorted({os.path.dirname(r) for r in tracked}):
+        build = checkout / rel / ".build"
+        if not build.is_symlink() and _head(os.fspath(build / "CACHEDIR.TAG"), 64).startswith(CACHEDIR_TAG):
+            found.append(build)
+    found += [g for g in _children(checkout / ".glaeda/apple-build/cache") if g.is_dir() and not g.is_symlink()]
+    return found
+
+
+def checkout_builds(projects: Path) -> list[Path]:
+    """The build output inside the checkouts under projects that its tool recreates: SwiftPM's .build
+    (tagged with a CACHEDIR.TAG) beside each tracked Package.swift, and each glaeda-apple cache generation
+    (.glaeda/apple-build/cache/<key>; the receipts beside it stay). The index names the packages, so
+    nothing walks the checkouts; the git calls run in parallel (hundreds of checkouts on a laptop)."""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return [b for bs in pool.map(_checkout_build_dirs, project_checkouts(projects)) for b in bs]
+
+
+def checkout_build_family(projects: Path) -> Family:
+    return Family("checkout-build", projects, True,
+                  "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
+                  checkout_builds=True, build_output=True, min_idle_hours=CHECKOUT_BUILD_IDLE_HOURS,
+                  owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15)
+
+
+def apple_build_verdict(path: Path) -> str:
+    """Why a glaeda-apple cache generation stays whatever its age, or "": a run is in flight or holds the
+    build lock. Xcode writes deeper than the idle check looks, so the lock is what shows a build."""
+    state = path.parent.parent
+    if (state / "inflight.json").exists():
+        return "a glaeda-apple run is in flight"
+    try:
+        fd = os.open(state / "build.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return ""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return ""
+    except OSError:
+        return "a glaeda-apple run holds its build lock"
+    finally:
+        os.close(fd)
 
 
 def worktree_roots(projects: Path) -> list[Path]:
@@ -654,6 +732,10 @@ def default_families() -> list[Family]:
     for root in wt_roots:
         fams.append(Family("worktrees", root, False,
                            "run glaeda-worktree-reclaim-all (report only)"))
+    # SwiftPM and glaeda-apple build output inside the checkouts: every other family here keeps a checkout
+    # whole, so under pressure nothing was left to evict while agent sessions compiled packages in hundreds
+    # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). A day idle, since the session may come back.
+    fams.append(checkout_build_family(projects))
     # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
     # Sizes here are also counted inside their checkout under projects or worktrees.
     fams.append(Family("cargo-target", projects, False,
@@ -1180,6 +1262,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return seed_verdict(path)
     if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
         return rustup_verdict(path)
+    if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
+        return apple_build_verdict(path)
     return ""
 
 
@@ -1879,6 +1963,11 @@ def candidates(fam: Family) -> list[Path]:
         if key not in _DISCOVERED:  # one walk per run: main() and survey both ask
             _DISCOVERED[key] = discover_caches(fam.root)
         level = list(_DISCOVERED[key])
+    elif fam.checkout_builds:
+        key = "checkout-builds:" + os.fspath(fam.root)
+        if key not in _DISCOVERED:
+            _DISCOVERED[key] = checkout_builds(fam.root)
+        level = list(_DISCOVERED[key])
     elif fam.match:
         level = _search(fam)
     else:
@@ -1909,13 +1998,14 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
     reclaimable candidate is re-measured. A discovering family's root is the whole home directory, so
     only its current candidates are dropped, not every size below it (that re-measured the report-only
     checkouts too and ran past the hooks' timeout on the minis)."""
-    drop = {os.fspath(p) for f in fams if f.reclaimable and f.discover for p in candidates(f)}
+    drop = {os.fspath(p) for f in fams if f.reclaimable and (f.discover or f.checkout_builds)
+            for p in candidates(f)}
 
     def candidate_of_selected(k: str) -> bool:
         if k in drop:
             return True
         for f in fams:
-            if not f.reclaimable or f.discover:
+            if not f.reclaimable or f.discover or f.checkout_builds:
                 continue
             root = str(f.root) + "/"
             if k.startswith(root) and k[len(root):].split("/")[0] not in f.skip:

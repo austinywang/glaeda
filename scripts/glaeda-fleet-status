@@ -84,8 +84,8 @@ RETIRED_WARN_BYTES = 5 * GIB
 # fleet-cas-prune runs hourly; three missed runs is a stopped LaunchAgent, not a busy host.
 PRUNE_SILENT_SECONDS = 3 * 3600
 PRUNE_LABEL = "com.teamleaderleo.glaeda.fleet-cas-prune"
-# glaeda-disk families whose bytes are also counted in another family (cargo-target sits inside checkouts).
-DOUBLE_COUNTED = frozenset({"cargo-target"})
+# glaeda-disk families whose bytes are also counted in another family (both sit inside checkouts).
+DOUBLE_COUNTED = frozenset({"cargo-target", "checkout-build"})
 GC_SUSPECT = re.compile(r"kept entries naming no stored object: (\d+)")
 
 # Only these reach child processes; the document never carries any of them.
