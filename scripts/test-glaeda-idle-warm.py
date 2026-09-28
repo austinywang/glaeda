@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import types
 import unittest
@@ -390,7 +391,7 @@ FAKE_FUZZ = """#!/usr/bin/env python3
 import json, os, subprocess, sys, time
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALLS"], "a") as calls:
-    calls.write(" ".join(args) + "\\n")
+    calls.write(" ".join(args) + " nice=%d\\n" % os.nice(0))
 out = args[args.index("--out") + 1]
 app = subprocess.Popen(["/bin/sleep", "300"])
 open(os.path.join(out, "app.pid"), "w").write(str(app.pid))
@@ -399,133 +400,80 @@ app.kill()
 json.dump({"seed": 1, "sessions": 1, "steps": 42, "findings": []}, open(os.path.join(out, "summary.json"), "w"))
 """
 
+# Loads the lane in a child process (so a SIGTERM or SIGKILL of its process group does not reach the test) with
+# the same stubs FuzzTest.fuzz_setup puts in, and runs it.
+FUZZ_DRIVER = """
+import importlib.machinery, importlib.util, json, os, sys
+from pathlib import Path
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+warm = load("w", sys.argv[1])
+hook = load("h", sys.argv[2])
+state = Path(sys.argv[3])
+warm.FLEET_DIR = state.parent
+warm.HOME = Path(sys.argv[4])
+warm.FUZZ_KILL_SWITCH = warm.HOME / "idle-fuzz.disabled"
+hook.root_stamp = lambda k, s: {"merged_onto": sys.argv[5]} if k == 2 else None
+hook.console_state = lambda: None
+hook.reservation_refusal = lambda path, now: None
+warm.host_denied = lambda names=None: ""
+warm.fuzz_setup = lambda: (hook, 2)
+warm.console_refusal = lambda h: ""
+warm.gui_process = lambda ours="": ""  # other agents' Xcode tests on this Mac are not this test's
+warm.free_bytes = lambda p: 500 * 1024 ** 3
+print(json.dumps(warm.fuzz(True, state)), flush=True)
+"""
+
 
 class FuzzTest(Base):
-    def fuzz_setup(self, sleep: str = "0") -> tuple[types.SimpleNamespace, dict]:
-        """A mini with nothing to warm: root 2 keeps a main build, the engine is main's checkout."""
-        (self.state / "seed-source.json").write_text("{}")
+    def fuzz_setup(self, sleep: str = "0") -> types.SimpleNamespace:
+        """A mini whose root 2 keeps a main build of HEAD, with main's checkout (a git repo) for the fuzzer."""
         (self.dir / "fleet" / "host.lock").touch()
         engine = self.state / ".catch-up" / "cmux"
         (engine / "scripts").mkdir(parents=True)
         (engine / "dogfood" / "fuzz").mkdir(parents=True)
         (engine / "scripts" / "fuzz").write_text(FAKE_FUZZ)
+        (engine / "dogfood" / "fuzz" / "README.md").write_text("engine\n")
+        git = ["git", "-C", os.fspath(engine), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "main"], check=True)
+        self.head = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True,
+                                   text=True).stdout.strip()
         store = self.state / "cmux-ci-2"
         app = store / "derived-data" / "Build" / "Products" / "Debug" / "cmux DEV.app" / "Contents"
         app.mkdir(parents=True)
         (app / "Info.plist").write_text("main build")
-        (store / "stamp.json").write_text(json.dumps({"merged_onto": HEAD}))
-        (self.dir / ".config" / "glaeda").mkdir(parents=True)
+        (store / "stamp.json").write_text(json.dumps({"merged_onto": self.head}))
         os.environ.update(FAKE_CALLS=os.fspath(self.dir / "calls"), FAKE_SLEEP=sleep)
-        scope = {"units": 4, "roots": 2, "compile_slots": 2, "xcode": "/Applications/Xcode_26.6.app"}
-        stamps = {1: {"merged_onto": "b" * 40, "pr": 15000}, 2: {"merged_onto": HEAD}}
-        stub = types.SimpleNamespace(**{name: getattr(hook, name) for name in
-                                        ("lock_file", "CLASS_COST", "WARM_HOLDER", "probe")},
-                                     warm_root_costs=lambda order, base, number, state: (order, {}),
-                                     root_stamp=lambda k, state: stamps.get(k))
+        stamps = {1: {"merged_onto": "b" * 40, "pr": 15000}, 2: {"merged_onto": self.head}}
+        stub = types.SimpleNamespace(probe=hook.probe, FUZZ_HOLDER=hook.FUZZ_HOLDER,
+                                     root_stamp=lambda k, state: stamps.get(k),
+                                     reservation_refusal=lambda path, now: None)
+        self.saved.update({name: getattr(warm, name) for name in ("fuzz_setup", "gui_process", "FUZZ_KILL_SWITCH")})
+        warm.FUZZ_KILL_SWITCH = self.dir / "idle-fuzz.disabled"
         warm.host_denied = lambda names=None: ""
-        warm.runner_setup = lambda dirs: (stub, scope)
-        warm.idle_refusal = lambda hook_module, now, state: ""
-        warm.main_head = lambda state: HEAD
-        warm.running = lambda: ""
+        warm.fuzz_setup = lambda: (stub, 2)
         warm.console_refusal = lambda hook_module: ""
+        warm.gui_process = lambda ours="": ""
         warm.free_bytes = lambda path: 500 * 1024 ** 3
-        return stub, scope
+        return stub
 
-    def test_off_unless_enabled(self) -> None:
-        if sys.platform != "darwin":
-            return
-        self.fuzz_setup()
-        memory = self.state / ".catch-up" / "state.json"
-        memory.parent.mkdir(parents=True, exist_ok=True)
-        memory.write_text(json.dumps({"roots": {"1": {"head": HEAD}, "2": {"head": HEAD}}}))
-        result = warm.run(True, self.state)
-        self.assertEqual(result["state"], "skip", result)
-        self.assertFalse((self.dir / "calls").exists(), "no fuzz run without the enable file")
+    def driver(self) -> subprocess.Popen:
+        # Named glaeda-idle-warm, as the LaunchAgent runs it: the hook signals only a holder that is that program.
+        program = self.dir / "bin" / "glaeda-idle-warm"
+        program.parent.mkdir(exist_ok=True)
+        program.write_text(FUZZ_DRIVER)
+        return subprocess.Popen(
+            [sys.executable, os.fspath(program), os.fspath(ROOT / "scripts" / "glaeda-idle-warm"),
+             os.fspath(ROOT / "scripts" / "glaeda-cmux-runner-hook"), os.fspath(self.state), os.fspath(self.dir),
+             self.head, "--fuzz"], stdout=subprocess.PIPE, text=True, env={**os.environ})
 
-    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
-    def test_nothing_to_warm_fuzzes_a_staged_copy_of_the_main_build_and_releases(self) -> None:
-        self.fuzz_setup()
-        (self.dir / ".config" / "glaeda" / "idle-fuzz.enabled").touch()
-        memory = self.state / ".catch-up" / "state.json"
-        memory.parent.mkdir(parents=True, exist_ok=True)
-        memory.write_text(json.dumps({"roots": {"1": {"head": HEAD}, "2": {"head": HEAD}}}))
-        result = warm.run(True, self.state)
-        self.assertEqual(result["state"], "fuzzed", result)
-        self.assertEqual(result["held"], ["unit-0"], "one unit, never a root or the gui token")
-        self.assertEqual((result["build"], result["steps"], result["findings"]), (HEAD, 42, 0))
-        staged = self.dir / "fleet" / "fuzz" / "builds" / HEAD / "cmux DEV.app" / "Contents" / "Info.plist"
-        self.assertEqual(staged.read_text(), "main build")
-        call = (self.dir / "calls").read_text()
-        self.assertIn(f"run --app {staged.parents[1]} --minutes {warm.FUZZ_MINUTES}", call)
-        self.assertIn(f"--label main --sha {HEAD}", call)
-        self.assertFalse((self.capacity / "idle-warm.json").exists())
-        fd = hook.lock_file(self.capacity / "unit-0", fcntl.LOCK_EX)
-        self.assertIsNotNone(fd, "released")
-        os.close(fd)
-        (self.dir / "calls").unlink()
-        again = warm.run(True, self.state, fuzz_now=True)  # staged already: the same copy again
-        self.assertEqual((again["state"], again["build"]), ("fuzzed", HEAD), again)
-
-    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
-    def test_never_beside_a_gui_job_and_needs_an_engine_and_a_main_build(self) -> None:
-        stub, scope = self.fuzz_setup()
-        self.capacity.mkdir(parents=True)
-        gui = hook.lock_file(self.capacity / "gui.token", fcntl.LOCK_EX)
-        self.assertIn("gui token", warm.fuzz(stub, scope, self.state, HEAD, "x")["reason"])
-        os.close(gui)
-        (self.state / ".catch-up" / "cmux" / "scripts" / "fuzz").unlink()
-        self.assertIn("no scripts/fuzz", warm.fuzz(stub, scope, self.state, HEAD, "x")["reason"])
-        (self.state / ".catch-up" / "cmux" / "scripts" / "fuzz").write_text(FAKE_FUZZ)
-        unit = hook.lock_file(self.capacity / "unit-3", fcntl.LOCK_EX)  # any admitted job holds a unit
-        self.assertEqual(warm.fuzz(stub, scope, self.state, HEAD, "x")["reason"], "a job holds unit-3")
-        os.close(unit)
-        self.assertFalse((self.capacity / "idle-warm.json").exists())
-        stub.root_stamp = lambda k, state: {"merged_onto": HEAD, "pr": 15000}  # pull request builds only
-        self.assertIn("no main build", warm.fuzz(stub, scope, self.state, HEAD, "x")["reason"])
-        # a copy a kill cut short is never taken for a build
-        partial = self.dir / "fleet" / "fuzz" / "builds" / f".{HEAD}.123" / "cmux DEV.app"
-        partial.mkdir(parents=True)
-        self.assertEqual(warm.staged_builds(), [])
-        self.assertIn("no main build", warm.fuzz(stub, scope, self.state, HEAD, "x")["reason"])
-        warm.free_bytes = lambda path: 10 * 1024 ** 3
-        stub.root_stamp = lambda k, state: {"merged_onto": HEAD}
-        self.assertIn("GiB free", warm.fuzz(stub, scope, self.state, HEAD, "x")["reason"])
-        self.assertFalse((self.dir / "calls").exists())
-
-    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
-    def test_a_jobs_sigterm_ends_the_fuzzer_and_its_app_at_once(self) -> None:
-        """What a job's admission (yield_idle_warm) does to a fuzz run: the app goes with the process group."""
-        self.fuzz_setup(sleep="120")
-        (self.dir / ".config" / "glaeda" / "idle-fuzz.enabled").touch()
-        driver = self.dir / "glaeda-idle-warm-driver.py"
-        driver.write_text(textwrap.dedent(f"""
-            import importlib.machinery, importlib.util, json, os, sys, types
-            from pathlib import Path
-            def load(name, path):
-                loader = importlib.machinery.SourceFileLoader(name, path)
-                spec = importlib.util.spec_from_loader(name, loader)
-                module = importlib.util.module_from_spec(spec)
-                loader.exec_module(module)
-                return module
-            warm = load("w", {os.fspath(ROOT / 'scripts' / 'glaeda-idle-warm')!r})
-            hook = load("h", {os.fspath(ROOT / 'scripts' / 'glaeda-cmux-runner-hook')!r})
-            state = Path({os.fspath(self.state)!r})
-            warm.FLEET_DIR = state.parent
-            warm.HOME = Path({os.fspath(self.dir)!r})
-            hook.root_stamp = lambda k, s: {{"merged_onto": "{HEAD}"}} if k == 2 else None
-            warm.host_denied = lambda names=None: ""
-            warm.runner_setup = lambda dirs: (hook, {{"units": 4, "roots": 2, "compile_slots": 1, "xcode": "/x.app"}})
-            warm.idle_refusal = lambda *a: ""
-            warm.main_head = lambda s: "{HEAD}"
-            warm.running = lambda: ""
-            warm.console_refusal = lambda h: ""
-            warm.gui_refusal = lambda h, c: ""  # other agents' Xcode tests on this Mac are not this test's
-            warm.free_bytes = lambda p: 500 * 1024 ** 3
-            print(warm.run(True, state, fuzz_now=True), flush=True)
-        """))
-        proc = subprocess.Popen([sys.executable, os.fspath(driver)], stdout=subprocess.PIPE, text=True,
-                                env={**os.environ})
-        self.addCleanup(proc.kill)
+    def started_app(self, proc: subprocess.Popen) -> int:
         runs = self.dir / "fleet" / "fuzz" / "runs"
         deadline = time.monotonic() + 30
         pid_files: list[Path] = []
@@ -535,16 +483,133 @@ class FuzzTest(Base):
         if not pid_files:
             proc.kill()
             self.fail(f"the fuzzer started no app: {proc.communicate(timeout=10)[0]}")
-        app_pid = int(pid_files[0].read_text())
-        holder = json.loads((self.capacity / "idle-warm.json").read_text())
-        self.assertEqual((holder["pid"], holder["held"]), (proc.pid, ["unit-0"]))
-        self.assertIsNone(hook.lock_file(self.capacity / "unit-0", fcntl.LOCK_EX))
+        return int(pid_files[0].read_text())
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_fuzzes_a_staged_copy_of_the_main_build_beside_a_compile_at_low_priority(self) -> None:
+        self.fuzz_setup()
+        # A compile admitted on this mini: every unit and a root taken. The fuzzer needs none of them.
+        self.capacity.mkdir(parents=True)
+        held = [hook.lock_file(self.capacity / name, fcntl.LOCK_EX) for name in
+                ("unit-0", "unit-1", "unit-2", "unit-3", "root-1.token", "persistent-dd.token")]
+        self.addCleanup(lambda: [os.close(fd) for fd in held if fd is not None])
+        plan = warm.fuzz(False, self.state)
+        self.assertEqual(plan["state"], "plan", plan)
+        self.assertFalse((self.dir / "calls").exists(), "a plan fuzzes nothing")
+        proc = self.driver()
+        out, _ = proc.communicate(timeout=60)
+        result = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(result["state"], "fuzzed", result)
+        self.assertEqual((result["build"], result["steps"], result["findings"]), (self.head, 42, 0))
+        staged = self.dir / "fleet" / "fuzz" / "builds" / self.head / "cmux DEV.app" / "Contents" / "Info.plist"
+        self.assertEqual(staged.read_text(), "main build")
+        engine = self.dir / "fleet" / "fuzz" / "engines" / self.head
+        self.assertEqual((engine / "dogfood" / "fuzz" / "README.md").read_text(), "engine\n", "exported from git")
+        call = (self.dir / "calls").read_text()
+        self.assertIn(f"run --app {staged.parents[1]} --minutes {warm.FUZZ_MINUTES}", call)
+        self.assertIn(f"--label main --sha {self.head}", call)
+        self.assertGreaterEqual(int(call.rsplit("nice=", 1)[1]), warm.FUZZ_NICE)
+        self.assertFalse((self.capacity / "idle-warm.json").exists(), "never a catch-up holder")
+        # The same staged build and engine next time, even with the checkout gone.
+        (self.dir / "calls").unlink()
+        subprocess.run(["rm", "-rf", os.fspath(self.state / ".catch-up")], check=True)
+        again = json.loads(self.driver().communicate(timeout=60)[0].strip().splitlines()[-1])
+        self.assertEqual((again["state"], again["build"]), ("fuzzed", self.head), again)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_never_beside_a_gui_job_a_reservation_or_without_a_main_build(self) -> None:
+        stub = self.fuzz_setup()
+        self.capacity.mkdir(parents=True)
+        gui = hook.lock_file(self.capacity / "gui.token", fcntl.LOCK_EX)
+        self.assertEqual(warm.fuzz(True, self.state)["reason"], "a job holds the gui token")
+        os.close(gui)
+        stub.reservation_refusal = lambda path, now: "host reserved by leo for PR 1 dogfood until later"
+        self.assertIn("dogfood", warm.fuzz(True, self.state)["reason"])
+        stub.reservation_refusal = lambda path, now: None
+        warm.gui_process = lambda ours="": "a job is asking for the gui token"
+        self.assertEqual(warm.fuzz(True, self.state)["reason"], "a job is asking for the gui token")
+        warm.gui_process = lambda ours="": ""
+        (self.dir / "idle-fuzz.disabled").touch()
+        self.assertIn("idle-fuzz.disabled", warm.fuzz(True, self.state)["reason"])
+        (self.dir / "idle-fuzz.disabled").unlink()
+        stub.root_stamp = lambda k, state: {"merged_onto": self.head, "pr": 15000}  # pull request builds only
+        self.assertIn("no main build", warm.fuzz(True, self.state)["reason"])
+        # a copy a kill cut short is never taken for a build
+        partial = self.dir / "fleet" / "fuzz" / "builds" / f".{self.head}.123" / "cmux DEV.app"
+        partial.mkdir(parents=True)
+        self.assertEqual(warm.staged_builds(), [])
+        self.assertIn("no main build", warm.fuzz(True, self.state)["reason"])
+        warm.free_bytes = lambda path: 10 * 1024 ** 3
+        stub.root_stamp = lambda k, state: {"merged_onto": self.head}
+        self.assertIn("GiB free", warm.fuzz(True, self.state)["reason"])
+        self.assertFalse((self.dir / "calls").exists())
+        warm.free_bytes = lambda path: 500 * 1024 ** 3
+        warm.fuzz_setup = lambda: "no glaeda runner on this mini"
+        self.assertEqual(warm.fuzz(True, self.state)["reason"], "no glaeda runner on this mini")
+
+    def test_gui_process_sees_tests_take_gui_and_other_dev_apps(self) -> None:
+        ours = "/Users/Shared/cmux-build-fleet/fuzz/builds/"
+        cases = {
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/xctest -XCTest All": "an Xcode test is running",
+            "/usr/bin/python3 /Users/cmux/r/glaeda-hooks/glaeda-cmux-runner-hook take-gui --wait 60":
+                "a job is asking for the gui token",
+            "/bin/sh /Users/cmux/.local/bin/glaeda-canonical-root take-gui": "a job is asking for the gui token",
+            "/tmp/dogfood/cmux DEV pr-1.app/Contents/MacOS/cmux DEV": "another cmux DEV app is running",
+            f"{ours}abc/cmux DEV.app/Contents/MacOS/cmux DEV": "",
+            "/usr/bin/python3 glaeda-cmux-runner-hook take-root --root 1": "",
+        }
+        real = subprocess.run
+
+        def fake(comm: str, command: str):
+            return lambda argv, **k: types.SimpleNamespace(returncode=0, stdout=(comm if argv[-1] == "comm=" else command) + "\n")
+        try:
+            for command, want in cases.items():
+                subprocess.run = fake(command.split(" -")[0].split(" --")[0], command)
+                self.assertEqual(warm.gui_process(ours), want, command)
+            # A compile names the app and a test runner in its arguments; only running ones count.
+            for command in ("/usr/bin/codesign --force --sign - /dd/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV",
+                            "/usr/bin/codesign --force /dd/Build/Products/Debug/cmuxUITests-Runner.app/"):
+                subprocess.run = fake("/usr/bin/codesign", command)
+                self.assertEqual(warm.gui_process(ours), "", command)
+        finally:
+            subprocess.run = real
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_taking_the_gui_token_stops_the_fuzzer_and_its_app_at_once(self) -> None:
+        """What a gui job's admission or take-gui does (yield_idle_fuzz): the app goes with the process group."""
+        self.fuzz_setup(sleep="120")
+        proc = self.driver()
+        self.addCleanup(proc.kill)
+        app_pid = self.started_app(proc)
+        holder = json.loads((self.capacity / hook.FUZZ_HOLDER).read_text())
+        self.assertEqual(holder["pid"], proc.pid)
+        self.assertEqual(hook.yield_idle_warm(self.capacity), "", "a compile's admission leaves the fuzzer alone")
+        self.assertTrue(hook.pid_alive(app_pid))
+        # launchd reaps the lane on a mini; here the test is its parent, so reap it as it dies (a zombie is alive
+        # to kill(pid, 0), and the hook would wait on it).
+        reaper = threading.Thread(target=proc.wait, daemon=True)
+        reaper.start()
         started = time.monotonic()
-        proc.send_signal(signal.SIGTERM)  # yield_idle_warm's first signal
-        self.assertEqual(proc.wait(timeout=10), -signal.SIGKILL)
+        self.assertIn("stopped the idle fuzzer", hook.yield_idle_fuzz(self.capacity))
         self.assertLess(time.monotonic() - started, 5)
+        reaper.join(timeout=10)
+        self.assertEqual(proc.returncode, -signal.SIGKILL)
         self.assertFalse(hook.pid_alive(app_pid), "the app went with the fuzzer's process group")
-        self.assertIsNotNone(hook.lock_file(self.capacity / "unit-0", fcntl.LOCK_EX))
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_an_older_hook_still_loses_the_fuzzer_when_a_job_takes_the_gui_token(self) -> None:
+        """A runner whose hook predates FUZZ_HOLDER never signals the fuzzer: the lane sees the token and stops."""
+        self.fuzz_setup(sleep="120")
+        proc = self.driver()
+        self.addCleanup(proc.kill)
+        app_pid = self.started_app(proc)
+        gui = hook.lock_file(self.capacity / "gui.token", fcntl.LOCK_EX)
+        self.addCleanup(os.close, gui)
+        out, _ = proc.communicate(timeout=30)
+        result = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual((result["state"], result["reason"]), ("stopped", "a job holds the gui token"), result)
+        self.assertLess(result["wall_seconds"], 30)
+        self.assertFalse(hook.pid_alive(app_pid), "the app is gone")
 
 
 class TrimTest(Base):

@@ -45,7 +45,7 @@ What --apply installs (templated for the current user):
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
-                                  idle-warm,mini-health,local-guard,update,gh-watch}.plist
+                                  idle-warm,idle-fuzz,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -690,6 +690,17 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "Nice": 5,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-warm.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-warm.err"),
+        },
+        # The UI fuzzer lane (glaeda-idle-warm --fuzz): on a mini with glaeda runners, fuzzes main's kept build at
+        # nice 10 beside compiles, and stops the moment a job wants the gui token (the hook stops it, and it watches
+        # for one itself); it exits at once anywhere else, and never runs while the host is reserved.
+        LABEL_PREFIX + "idle-fuzz": {
+            "Label": LABEL_PREFIX + "idle-fuzz",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-warm"), "--apply", "--fuzz"],
+            "StartInterval": 60,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-fuzz.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-fuzz.err"),
         },
         # Runner mini health (scripts/glaeda-mini-health): a locked console, display sleep, a wedged testmanagerd,
         # Tailscale down, a stopped runner agent. Heals what this user can without disturbing a job and writes the

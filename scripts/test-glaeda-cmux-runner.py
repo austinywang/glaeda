@@ -1510,6 +1510,55 @@ time.sleep(60)
             time.sleep(0.1)
         self.assertTrue(not state or state.startswith("Z"), f"the build still runs: {state!r}")
 
+    def idle_fuzzer(self, capacity: Path) -> tuple[subprocess.Popen, int]:
+        """A stand-in for the idle fuzzer lane: glaeda-idle-warm naming itself in FUZZ_HOLDER, with an app in its
+        process group; (the lane, the app's pid)."""
+        leader = make_executable(self.dir / "fuzz" / "glaeda-idle-warm", f"""import json, os, pathlib, signal, subprocess, time
+os.setpgid(0, 0)
+app = subprocess.Popen(["/bin/sleep", "60"])  # joins our process group
+pathlib.Path({os.fspath(capacity)!r}, "idle-fuzz.json").write_text(json.dumps({{"pid": os.getpid(), "held": [], "fuzz": True}}))
+signal.signal(signal.SIGTERM, lambda *_: os.killpg(0, signal.SIGKILL))
+print(app.pid, flush=True)
+time.sleep(60)
+""")
+        proc = subprocess.Popen([sys.executable, os.fspath(leader), "--apply", "--fuzz"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.kill)
+        app = int(proc.stdout.readline())
+        self.addCleanup(lambda: subprocess.run(["/bin/kill", "-9", str(app)], capture_output=True))
+        threading.Thread(target=proc.wait, daemon=True).start()  # launchd reaps the lane on a mini
+        return proc, app
+
+    def test_capacity_only_a_gui_job_stops_the_idle_fuzzer(self) -> None:
+        """The fuzzer runs beside compiles; a job that takes the gui token (at admission or take-gui) stops it and its
+        app before it holds the token."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        (self.dir / "fuzz").mkdir()
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        try:
+            lane, app = self.idle_fuzzer(capacity)
+            self.assertIsNone(hook.idle_warm(capacity), "the fuzz lane is never taken for a catch-up")
+            compile_job = self.job("macos-compile-admission", "f0", 8, None, *two)
+            self.assertEqual(compile_job.returncode, 0, compile_job.stdout + compile_job.stderr)
+            self.assertNotIn("idle fuzzer", compile_job.stdout)
+            self.assertTrue(hook.pid_alive(app), "a compile leaves the fuzzer running")
+            gui = self.job("tests-build-and-lag", "f1", 8, None, *two)
+            self.assertEqual(gui.returncode, 0, gui.stdout + gui.stderr)
+            self.assertIn(f"stopped the idle fuzzer (pid {lane.pid})", gui.stdout)
+            self.assertIn("+gui", gui.stdout)
+            self.assertFalse(hook.pid_alive(app), "its app went with it")
+            self.finish("f1")
+            # take-gui: a job that asks for the token from its step
+            lane, app = self.idle_fuzzer(capacity)
+            taken = self.take_gui("f0", "--wait", "5")
+            self.assertEqual(taken.returncode, 0, taken.stderr)
+            self.assertIn(f"stopped the idle fuzzer (pid {lane.pid})", taken.stderr)
+            self.assertFalse(hook.pid_alive(app))
+        finally:
+            for runner in ("f0", "f1"):
+                self.finish(runner)
+
     def test_capacity_a_stale_idle_catch_up_file_signals_nothing(self) -> None:
         self.fleet()
         capacity = self.dir / "capacity"

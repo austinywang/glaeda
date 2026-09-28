@@ -1503,6 +1503,9 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path, recycle: str | 
     if locked:  # the console session cannot run the tests: leave them to a job on another mini
         print(f"{PREFIX}: take-gui: {locked}", file=sys.stderr)
         return TAKE_GUI_GAVE_WAY
+    stopped = yield_idle_fuzz(capacity_dir)  # the console session is this job's from here on
+    if stopped:
+        print(f"{PREFIX}: take-gui: {stopped[2:]}", file=sys.stderr)
     deadline = time.monotonic() + max(0.0, wait_s)
     while True:
         fd = lock_file(capacity_dir / "gui.token", fcntl.LOCK_EX)
@@ -1559,6 +1562,11 @@ def pid_alive(pid: int) -> bool:
 WARM_HOLDER = "idle-warm.json"
 WARM_PROGRAM = "glaeda-idle-warm"
 WARM_YIELD_S = 5.0
+# The idle UI fuzzer (glaeda-idle-warm --fuzz) runs beside compiles at low priority and holds no capacity unit
+# or token, so a compile's admission leaves it alone. It drives the console session, so every job that takes the
+# gui token (at admission or with take-gui) stops it first, the way admission stops a catch-up: it names its pid
+# in FUZZ_HOLDER, and yield_idle_fuzz sends SIGTERM and waits for it and its app to go.
+FUZZ_HOLDER = "idle-fuzz.json"
 
 
 def is_idle_warm(command: str) -> bool:
@@ -1566,9 +1574,9 @@ def is_idle_warm(command: str) -> bool:
     return any(os.path.basename(word) == WARM_PROGRAM for word in command.split()[:2])
 
 
-def warm_holder(capacity_dir: Path) -> tuple[int, set[str]] | None:
-    """The idle catch-up holder file's pid and lock names, or None when there is none that parses."""
-    raw = read_bounded(capacity_dir / WARM_HOLDER)
+def warm_holder(capacity_dir: Path, name: str = WARM_HOLDER) -> tuple[int, set[str]] | None:
+    """The idle catch-up (or fuzzer, NAME) holder file's pid and lock names, or None when there is none that parses."""
+    raw = read_bounded(capacity_dir / name)
     holder = json.loads(raw.decode("utf-8")) if raw is not None else None
     pid = holder.get("pid") if isinstance(holder, dict) else None
     held = holder.get("held") if isinstance(holder, dict) else None
@@ -1577,18 +1585,23 @@ def warm_holder(capacity_dir: Path) -> tuple[int, set[str]] | None:
     return pid, {str(name) for name in held if isinstance(name, str)}
 
 
-def idle_warm(capacity_dir: Path) -> tuple[int, set[str]] | None:
+def idle_warm(capacity_dir: Path, name: str = WARM_HOLDER) -> tuple[int, set[str]] | None:
     """The running idle catch-up's pid and the lock names it holds (unit-N, root-K, persistent-dd...), or None.
+    With NAME FUZZ_HOLDER, the running idle fuzzer's pid (it holds no locks).
 
     The file is written by a process of this user, so it is read bounded and trusted only as far as its pid is
     alive and is glaeda-idle-warm: a stale file whose pid was reused never gets another process signalled."""
     try:
-        holder = warm_holder(capacity_dir)
+        holder = warm_holder(capacity_dir, name)
         if holder is None or holder[0] == os.getpid() or not pid_alive(holder[0]):
             return None
         command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(holder[0])], capture_output=True,
                                  text=True, timeout=5).stdout
-        return holder if is_idle_warm(command) else None
+        # The two lanes are one program: the fuzz lane runs with --fuzz, the catch-up without. A stale holder whose
+        # pid now belongs to the other lane is not this holder.
+        if not is_idle_warm(command) or ("--fuzz" in command.split()) != (name == FUZZ_HOLDER):
+            return None
+        return holder
     except Exception:  # noqa: BLE001 - a holder file must never refuse or fail a job
         return None
 
@@ -1601,10 +1614,16 @@ def kill_warm_group(pid: int) -> None:
         os.killpg(pid, signal.SIGKILL)
 
 
-def yield_idle_warm(capacity_dir: Path) -> str:
+def yield_idle_fuzz(capacity_dir: Path) -> str:
+    """Stop a running idle fuzzer (and its app) before this job takes the gui token; a note, or ''."""
+    return yield_idle_warm(capacity_dir, FUZZ_HOLDER)
+
+
+def yield_idle_warm(capacity_dir: Path, name: str = WARM_HOLDER) -> str:
     """Stop a running idle catch-up so this job gets its locks; a note for the admission line, or ''."""
+    what = "idle fuzzer" if name == FUZZ_HOLDER else "idle catch-up"
     try:
-        warm = idle_warm(capacity_dir)
+        warm = idle_warm(capacity_dir, name)
         if warm is None:
             return ""
         pid = warm[0]
@@ -1616,9 +1635,9 @@ def yield_idle_warm(capacity_dir: Path) -> str:
                 time.sleep(0.02)
             if not pid_alive(pid):
                 kill_warm_group(pid)
-                return f"; stopped the idle catch-up (pid {pid})"
+                return f"; stopped the {what} (pid {pid})"
             deadline = time.monotonic() + 2.0
-        return f"; the idle catch-up (pid {pid}) did not stop"
+        return f"; the {what} (pid {pid}) did not stop"
     except Exception:  # noqa: BLE001 - yielding must never refuse or fail a job
         return ""
 
@@ -1873,6 +1892,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if one_holder and holder_alive(holder_file(state_dir)):
             return False, f"{job or 'this job'} is already admitted"
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
+        if "gui" in tokens:  # this job will drive the console session: the idle fuzzer's app must be gone first
+            yielded += yield_idle_fuzz(capacity_dir)
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)

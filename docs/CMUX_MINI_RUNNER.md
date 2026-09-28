@@ -943,17 +943,28 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
 
 Check one mini: `glaeda-idle-warm` (plan) says whether it would warm now and which root, or why not.
 
-**Idle UI fuzzing.** With `~/.config/glaeda/idle-fuzz.enabled`, an idle spell with nothing left to warm runs
-cmux's UI fuzzer (`scripts/fuzz` from the kept main checkout) instead of skipping. It clones the newest main
-build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no root token: the copy counts only if the root's
-stamp is unchanged after it), fuzzes it for up to 10 minutes and minimizes up to two failures, 26 minutes at most;
-runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`. Same gates and yield as a catch-up, plus: every capacity
-unit free (no admitted job at all, since a gui-step job takes the gui token only later with take-gui), this user
-owns an unlocked console, no Xcode test runs, and 90 GiB free. It holds one unit through
-`capacity/idle-warm.json`, never the gui token or a root (either would stop a gui runner's listener). A job's
-SIGTERM ends the fuzzer and its app together: the app is the fuzzer's child, in the catch-up's process group.
-`glaeda-idle-warm --apply --fuzz` runs it now. cmuxterm-hq's `build-fleet/fuzz/collect.py` files the findings
-as cmux issues.
+**Idle UI fuzzing (a preemptible lane).** The idle-fuzz LaunchAgent (`glaeda-idle-warm --apply --fuzz`, every
+minute, from glaeda-mini-setup, so it ships with glaeda OTA) runs cmux's UI fuzzer on every mini with glaeda
+runners, except NEVER_HOSTS (cmux-mac-mini, Lawrence's machines) and a mini with
+`~/.config/glaeda/idle-fuzz.disabled`. It is not part of the catch-up: it runs at nice 10 beside compiles and
+catch-ups, and holds no capacity unit, root or token, so no admission waits for it or refuses because of it.
+
+- **Starts** when this user owns an unlocked console, no job holds the gui token or asks for it (a take-gui
+  step), no Xcode test and no other cmux DEV app runs, the host has no reservation (someone dogfooding there),
+  and 90 GiB are free. It clones the newest main build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no
+  root token: the copy counts only if the root's stamp is unchanged after it) and exports the fuzzer at that
+  commit (`git archive` of `scripts/fuzz` and `dogfood/fuzz` from the catch-up checkout or the seed mirror) into
+  `fuzz/engines/<sha>`, since a catch-up may check out a newer main meanwhile. It fuzzes for up to 10 minutes
+  and minimizes up to two failures, 26 minutes at most; runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`.
+- **Stops** the moment a job wants the console. It names its pid in `capacity/idle-fuzz.json` (the hook's
+  FUZZ_HOLDER); a job whose admission takes the gui token, or a step running take-gui, stops it first with SIGTERM,
+  which kills its process group, the app included (the app is the fuzzer's child), within the hook's 5 s yield.
+  The lane also watches for itself every 0.25 s (gui token, reservation) and every second (process list: an
+  Xcode test, a take-gui, another cmux DEV app), so a runner whose hook predates FUZZ_HOLDER loses it too.
+  A compile's admission leaves it alone.
+
+`glaeda-idle-warm --fuzz` prints whether it would run now, or why not; `--apply --fuzz` runs it. cmuxterm-hq's
+`build-fleet/fuzz/collect.py` files the findings as cmux issues.
 
 ## 2l. Mini health: heal what the runner user can, report the rest
 
