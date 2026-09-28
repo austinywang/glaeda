@@ -943,6 +943,18 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
 
 Check one mini: `glaeda-idle-warm` (plan) says whether it would warm now and which root, or why not.
 
+**Idle UI fuzzing.** With `~/.config/glaeda/idle-fuzz.enabled`, an idle spell with nothing left to warm runs
+cmux's UI fuzzer (`scripts/fuzz` from the kept main checkout) instead of skipping. It clones the newest main
+build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no root token: the copy counts only if the root's
+stamp is unchanged after it), fuzzes it for up to 10 minutes and minimizes up to two failures, 26 minutes at most;
+runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`. Same gates and yield as a catch-up, plus: every capacity
+unit free (no admitted job at all, since a gui-step job takes the gui token only later with take-gui), this user
+owns an unlocked console, no Xcode test runs, and 90 GiB free. It holds one unit through
+`capacity/idle-warm.json`, never the gui token or a root (either would stop a gui runner's listener). A job's
+SIGTERM ends the fuzzer and its app together: the app is the fuzzer's child, in the catch-up's process group.
+`glaeda-idle-warm --apply --fuzz` runs it now. cmuxterm-hq's `build-fleet/fuzz/collect.py` files the findings
+as cmux issues.
+
 ## 2l. Mini health: heal what the runner user can, report the rest
 
 `glaeda-mini-health` (the 2-minute mini-health LaunchAgent from glaeda-mini-setup, a no-op without glaeda

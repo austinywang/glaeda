@@ -3,6 +3,7 @@
 
     glaeda-idle-warm              plan: would this mini warm now, which root, and why not
     glaeda-idle-warm --apply      warm (the 1-minute LaunchAgent from glaeda-mini-setup)
+    glaeda-idle-warm --apply --fuzz   run the idle UI fuzzer now instead of warming (same gates and yield)
 
 cmux compile admission on an owned mini starts from the root's kept build (cmux owned_build_state.py) or a
 kept seed. What it compiles depends on how far that start is from the job's tree (cmux warm_distance.py):
@@ -33,6 +34,9 @@ letting admission.lock go. Every job's admission stops it (SIGTERM) and waits fo
 kills the build's process group at once and exits, which releases them. cmux's scripts/ci/owned_catch_up.sh,
 from a checkout of main's head kept under ci/.catch-up, does the build: the same check, prefer, adopt, record,
 compile and keep steps a main dispatch's compile admission runs, and every step is safe to kill.
+
+With ~/.config/glaeda/idle-fuzz.enabled, an idle spell with nothing left to warm runs cmux's UI fuzzer instead
+(see fuzz() below): the same yield to every job, one capacity unit, no gui token.
 
 The build is trusted main code run as the build user on a PR mini. Pull requests admitted to that root already
 share its kept state, so it adds no new trust boundary. One run at a time (flock on ci/.catch-up/lock). Prints
@@ -98,6 +102,7 @@ GIT = shutil.which("git", path=PATH) or "/usr/bin/git"
 _child: subprocess.Popen | None = None
 _holder: Path | None = None
 _grouped = False  # we lead the process group the build runs in
+_fuzzing = False  # a fuzz run (and its app) is under way
 
 
 def record(**fields: Any) -> dict[str, Any]:
@@ -505,6 +510,8 @@ def stop(signum: int, _frame: Any) -> None:
     if _grouped:
         kill_build(passes=1)  # within the hook's WARM_YIELD_S; the killpg below takes the rest
         forget_inode_override()
+        if _fuzzing:
+            dismiss_crash_dialogs()
         os.killpg(os.getpid(), signal.SIGKILL)
     os._exit(128 + signum)
 
@@ -593,6 +600,308 @@ def trim_logs(logs: Path) -> None:
             stale.unlink()
 
 
+# ---------------------------------------------------------------- fuzz (idle gap fill)
+
+# The idle UI fuzzer: cmux's scripts/fuzz (dogfood/fuzz) drives a copy of the newest main build this mini kept
+# through random but valid action sequences (splits, tabs, workspaces, drags, palette, settings, windows) and
+# records every crash, hang, error log or broken layout invariant with a minimized repro and frames under
+# FUZZ_DIR/runs, for the collector to file as cmux issues. Opt-in per mini (FUZZ_ENABLE). It runs only when
+# nothing is left to warm, the catch-up's gates hold, no job holds the gui token and no Xcode test runs, and this
+# user owns an unlocked console. It holds one capacity unit (plus, while it copies a build, that root's token)
+# through WARM_HOLDER, so a job's admission stops it the way it stops a catch-up: SIGTERM, then the process group,
+# which the app is in (the fuzzer starts it as its own child). It takes no gui token: holding it would stop a gui
+# runner's listener, and the fuzzer must never keep a job away.
+# A run holds the catch-up lock, so a main push waits for it: at most FUZZ_TIMEOUT_S (26 minutes).
+FUZZ_MINUTES = 10
+FUZZ_MINIMIZE_MINUTES = 5  # per finding
+FUZZ_MAX_FINDINGS = 2
+FUZZ_TIMEOUT_S = (FUZZ_MINUTES + FUZZ_MAX_FINDINGS * FUZZ_MINIMIZE_MINUTES + 6) * 60
+FUZZ_KEEP_BUILDS = 2
+FUZZ_KEEP_QUIET_RUNS = 10  # runs without a finding
+FUZZ_KEEP_FINDING_RUNS = 30  # runs with one, until the collector files them; the oldest go first past this
+# Runs and staged builds add bytes (a catch-up rebuilds in place), so the fuzzer stays well above the runner's
+# 50 GiB admission floor: it must never be why a job is refused for disk.
+FUZZ_MIN_FREE_BYTES = 90 * 1024 ** 3
+FUZZ_APP = "cmux DEV.app"
+XCODE_TEST = re.compile(r"(^|/)(xctest|XCTRunner)(\s|$)|-Runner\.app/")
+
+
+def fuzz_enable_file() -> Path:
+    return HOME / ".config/glaeda/idle-fuzz.enabled"
+
+
+def fuzz_dir() -> Path:
+    return FLEET_DIR / "fuzz"
+
+
+def console_refusal(hook: Any) -> str:
+    """Why this user cannot drive the console now: another user (or nobody) owns it, or it is screen-locked.
+    The hook's own reading (its listener gate's), so both agree on what an usable console is."""
+    try:
+        if os.stat("/dev/console").st_uid != os.getuid():
+            return "another user owns the console"
+    except OSError:
+        return "cannot read the console owner"
+    try:
+        state = hook.console_state()
+    except Exception:  # noqa: BLE001 - an older hook
+        state = None
+    if state is None:
+        return "cannot read the console session"
+    return "" if state.state == "unlocked" else f"the console session is {state.state}"
+
+
+def gui_refusal(hook: Any, capacity: Path) -> str:
+    """A GUI job on this mini: the gui token held, or an Xcode test process running."""
+    if not hook.probe(capacity / "gui.token"):
+        return "a job holds the gui token"
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return "cannot list processes"
+    for command in out.stdout.splitlines():
+        if XCODE_TEST.search(command):
+            return "an Xcode test is running"
+    return ""
+
+
+def fuzz_engine(state: Path) -> Path | None:
+    """The cmux checkout whose scripts/fuzz runs: main's, kept for the catch-up, or GLAEDA_IDLE_FUZZ_ENGINE."""
+    override = os.environ.get("GLAEDA_IDLE_FUZZ_ENGINE")
+    checkout = Path(override) if override else state / ".catch-up" / "cmux"
+    return checkout if (checkout / "scripts" / "fuzz").is_file() and (checkout / "dogfood" / "fuzz").is_dir() else None
+
+
+def main_roots(hook: Any, roots: int, state: Path) -> list[tuple[int, str, float]]:
+    """(root, main commit, when kept) for each root whose kept build is a main build, newest first."""
+    found = []
+    for root in range(1, roots + 1):
+        try:
+            stamp = hook.root_stamp(root, os.fspath(state))
+        except Exception:  # noqa: BLE001 - an older hook or an unreadable stamp
+            continue
+        sha = stamp.get("merged_onto") if isinstance(stamp, dict) and not stamp.get("pr") else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        store = state if root == 1 else state / f"cmux-ci-{root}"
+        if not (store / "derived-data" / "Build" / "Products" / "Debug" / FUZZ_APP).is_dir():
+            continue
+        try:
+            found.append((root, sha, (store / "stamp.json").stat().st_mtime))
+        except OSError:
+            continue
+    return sorted(found, key=lambda item: -item[2])
+
+
+def staged_builds() -> list[Path]:
+    """Complete staged main builds (FUZZ_DIR/builds/<sha>/ with its app and build.json), newest first. A copy a
+    kill cut short is a dot directory without build.json, and never counts."""
+    builds = []
+    for path in (fuzz_dir() / "builds").glob("*"):
+        if path.name.startswith(".") or not (path / FUZZ_APP).is_dir() or not (path / "build.json").is_file():
+            continue
+        with contextlib.suppress(OSError):
+            builds.append((path.stat().st_mtime, path))
+    return [path for _, path in sorted(builds, key=lambda item: -item[0])]
+
+
+def stage_build(state: Path, root: int, sha: str) -> Path | str:
+    """Copy root ROOT's kept main app (an APFS clone: seconds, no space) to FUZZ_DIR/builds/SHA, or why not.
+
+    Without the root's token, which would stop a gui runner's listener while it is held: the kept build changes
+    only when a job's `keep` rewrites stamp.json, so a stamp read the same before and after the copy means the
+    copy is of one build. The copy is the fuzzer's own; a running app must not sit under a job's adopt."""
+    store = state if root == 1 else state / f"cmux-ci-{root}"
+    source = store / "derived-data" / "Build" / "Products" / "Debug" / FUZZ_APP
+    builds = fuzz_dir() / "builds"
+    builds.mkdir(parents=True, exist_ok=True)
+    for stale in builds.glob(".*"):  # copies a kill cut short
+        shutil.rmtree(stale, ignore_errors=True)
+    before = (store / "stamp.json").read_bytes()
+    final = builds / sha
+    incoming = builds / f".{sha}.{os.getpid()}"
+    incoming.mkdir()
+    subprocess.run(["/bin/cp", "-Rc", os.fspath(source), os.fspath(incoming / FUZZ_APP)], check=True,
+                   capture_output=True, timeout=600)
+    if (store / "stamp.json").read_bytes() != before:
+        shutil.rmtree(incoming, ignore_errors=True)
+        return f"root-{root}'s kept build changed while it was copied"
+    (incoming / "build.json").write_text(json.dumps({"sha": sha, "root": root, "at": int(time.time())}) + "\n")
+    shutil.rmtree(final, ignore_errors=True)
+    incoming.rename(final)
+    for stale in staged_builds()[FUZZ_KEEP_BUILDS:]:
+        shutil.rmtree(stale, ignore_errors=True)
+    return final
+
+
+def take_fuzz(hook: Any, capacity: Path, setup: dict[str, Any]) -> tuple[list[int], list[str]] | str:
+    """One capacity unit with the host lock shared, under admission.lock, and WARM_HOLDER written before
+    admission.lock is released; or why not. Only when every unit is free: any admitted job holds one, and a
+    gui-step job (app-host tests, test-e2e's test job) takes the gui token only later, from its step, with
+    take-gui, which does not stop a yielding holder. So the fuzzer starts only on a mini with no job at all,
+    and every job after it is admitted through take_capacity, which stops it first."""
+    global _holder
+    capacity.mkdir(parents=True, exist_ok=True)
+    admission = os.open(capacity / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    fds: list[int] = []
+    try:
+        try:
+            fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "an admission is running"
+        host = os.open(FLEET_DIR / "host.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+        fds.append(host)
+        try:
+            fcntl.flock(host, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return "a fleet build holds the host lock"
+        held = []
+        for slot in range(setup["units"]):
+            fd = hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX)
+            if fd is None:
+                return f"a job holds unit-{slot}"
+            if held:
+                os.close(fd)  # only probing: every unit must be free, one is enough to hold
+            else:
+                fds.append(fd)
+                held.append(f"unit-{slot}")
+        if not held:
+            return "no capacity unit is free"
+        holder = capacity / hook.WARM_HOLDER
+        incoming = capacity / f".{hook.WARM_HOLDER}.{os.getpid()}"
+        incoming.write_text(json.dumps({"pid": os.getpid(), "held": held, "fuzz": True}) + "\n")
+        incoming.rename(holder)
+        _holder = holder
+        taken, fds = fds, []
+        return taken, held
+    except OSError as error:
+        return f"cannot take the ledger ({type(error).__name__})"
+    finally:
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        os.close(admission)
+
+
+def trim_fuzz_runs(runs: Path) -> None:
+    """Keep the newest FUZZ_KEEP_QUIET_RUNS finished runs without a finding and FUZZ_KEEP_FINDING_RUNS with one."""
+    quiet, found = [], []
+    now = time.time()
+    for run_dir in runs.glob("*"):
+        try:
+            stamp = run_dir.stat().st_mtime
+        except OSError:
+            continue
+        try:
+            summary = json.loads((run_dir / "summary.json").read_text())
+        except (OSError, ValueError):
+            # A job's preemption kills the fuzzer before it writes its summary: past the longest run, it is done.
+            if now - stamp < FUZZ_TIMEOUT_S:
+                continue
+            summary = {"findings": [os.fspath(p.parent) for p in run_dir.glob("session-*/finding.json")]}
+        findings = summary.get("findings") if isinstance(summary, dict) else None
+        (found if isinstance(findings, list) and findings else quiet).append((stamp, run_dir))
+    for kept, group in ((FUZZ_KEEP_QUIET_RUNS, quiet), (FUZZ_KEEP_FINDING_RUNS, found)):
+        for _, stale in sorted(group, key=lambda item: -item[0])[kept:]:
+            shutil.rmtree(stale, ignore_errors=True)
+
+
+def free_bytes(path: Path) -> int | None:
+    try:
+        stat = os.statvfs(path)
+    except OSError:
+        return None
+    return stat.f_bavail * stat.f_frsize
+
+
+def fuzz(hook: Any, scope: dict[str, Any], state: Path, head: str, why_not_warm: str) -> dict[str, Any]:
+    """Fuzz the newest main build this mini kept, as a preemptible idle gap fill; one JSON record."""
+    global _child, _grouped, _fuzzing
+    base = record(head=head, warm=why_not_warm, mode="fuzz")
+    capacity = FLEET_DIR / "capacity"
+    why = console_refusal(hook) or gui_refusal(hook, capacity)
+    if why:
+        return {**base, "state": "skip", "reason": why}
+    free = free_bytes(FLEET_DIR)
+    if free is None or free < FUZZ_MIN_FREE_BYTES:
+        return {**base, "state": "skip", "reason": f"{(free or 0) // 1024 ** 3} GiB free, the fuzzer needs "
+                                                   f"{FUZZ_MIN_FREE_BYTES // 1024 ** 3}"}
+    engine = fuzz_engine(state)
+    if engine is None:
+        return {**base, "state": "skip", "reason": "no scripts/fuzz in the cmux checkout"}
+    roots = main_roots(hook, scope["roots"], state)
+    staged = {path.name: path for path in staged_builds()}
+    newest = roots[0] if roots else None
+    if newest is None and not staged:
+        return {**base, "state": "skip", "reason": "no main build kept or staged on this mini"}
+    _grouped = own_group()
+    if not _grouped:
+        return {**base, "state": "skip", "reason": "cannot lead a process group for the fuzzer"}
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, stop)
+    taken = take_fuzz(hook, capacity, scope)
+    if isinstance(taken, str):
+        return {**base, "state": "skip", "reason": taken}
+    fds, held = taken
+    _fuzzing = True
+    try:
+        if newest is not None and newest[1] not in staged:
+            build = stage_build(state, newest[0], newest[1])
+            if isinstance(build, str):
+                return {**base, "state": "skip", "reason": build}
+        else:
+            build = staged[newest[1]] if newest else next(iter(staged.values()))
+        why = running() or gui_refusal(hook, capacity)  # a job that started while the locks were taken
+        if why:
+            return {**base, "state": "skip", "reason": why}
+        runs = fuzz_dir() / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        seed = int.from_bytes(os.urandom(4), "big") >> 1
+        out = runs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{build.name[:12]}-{seed}"
+        out.mkdir()
+        env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
+        env["PATH"] = PATH
+        started = time.monotonic()
+        with open(out / "fuzz.log", "ab") as log:
+            _child = subprocess.Popen(
+                [sys.executable, os.fspath(engine / "scripts" / "fuzz"), "run", "--app", os.fspath(build / FUZZ_APP),
+                 "--minutes", str(FUZZ_MINUTES), "--minimize-minutes", str(FUZZ_MINIMIZE_MINUTES),
+                 "--max-findings", str(FUZZ_MAX_FINDINGS), "--seed", str(seed), "--out", os.fspath(out),
+                 "--label", "main", "--sha", build.name],
+                cwd=engine, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            code = _child.wait(timeout=FUZZ_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            code = None
+        finally:
+            _child = None
+        kill_build()  # the app and anything else the fuzzer left in our group
+        dismiss_crash_dialogs()
+        try:
+            summary = json.loads((out / "summary.json").read_text())
+        except (OSError, ValueError):
+            summary = None
+        summary = summary if isinstance(summary, dict) else {}
+        findings = summary.get("findings")
+        trim_fuzz_runs(runs)
+        return {**base, "state": "fuzzed", "held": held, "build": build.name, "run": out.name,
+                "exit": code, "steps": summary.get("steps"),
+                "findings": len(findings) if isinstance(findings, list) else 0,
+                "wall_seconds": round(time.monotonic() - started, 1)}
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return {**base, "state": "error", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
+    finally:
+        _fuzzing = False
+        release(fds)
+
+
+def dismiss_crash_dialogs() -> None:
+    """A crash the fuzzer caused leaves macOS's crash dialog (not in our process group) on the console, over the
+    next GUI job: close it."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["/usr/bin/pkill", "-9", "-x", "Problem Reporter"], capture_output=True, timeout=2)
+
+
 # ---------------------------------------------------------------- run
 
 
@@ -633,7 +942,7 @@ def save_memory(path: Path, memory: dict[str, Any]) -> None:
     incoming.rename(path)
 
 
-def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
+def run(apply: bool, state: Path, now: float | None = None, fuzz_now: bool = False) -> dict[str, Any]:
     global _grouped
     now = time.time() if now is None else now
     if platform.system() != "Darwin":
@@ -671,8 +980,10 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
         head = main_head(state)
         if not head:
             return record(state="skip", reason="no main head in the seed prefetch mirror")
-        picked = pick_root(hook, scope["roots"], head, state, memory)
+        picked = "asked to fuzz" if fuzz_now else pick_root(hook, scope["roots"], head, state, memory)
         if isinstance(picked, str):
+            if apply and (fuzz_now or fuzz_enable_file().exists()):  # nothing to warm: fill the idle gap with the fuzzer
+                return fuzz(hook, scope, state, head, picked)
             return record(state="skip", reason=picked, head=head)
         root, predicted = picked
         base = record(head=head, root=root, predicted=predicted)
@@ -728,9 +1039,11 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--fuzz", action="store_true",
+                        help="with --apply: skip warming and run the idle fuzzer now, under the same gates")
     args = parser.parse_args(argv)
     state = Path(os.environ.get("GLAEDA_SEED_STATE") or FLEET_DIR / "ci")
-    print(json.dumps(run(args.apply, state)), flush=True)
+    print(json.dumps(run(args.apply, state, fuzz_now=args.fuzz)), flush=True)
     return 0
 
 
