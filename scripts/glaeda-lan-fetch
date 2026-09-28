@@ -68,6 +68,7 @@ MAX_OFFERS = 2  # peers tried per request, in the order their lookups answered
 BROKER_CONCURRENCY = 4  # fetches at a time
 BROKER_THREADS = 8  # connections at a time; more are answered busy at once
 MAX_BROKER_REQUEST = 4096
+RELOAD_CHECK_SECONDS = 5.0  # how often an idle broker looks for an updated copy of itself
 EXIT_HIT, EXIT_ERROR, EXIT_MISS = 0, 1, 3
 
 
@@ -370,7 +371,8 @@ def handle(conn: socket.socket, slots: threading.BoundedSemaphore) -> None:
             pass
 
 
-def serve_local(sock_path: Path | None = None, ready: threading.Event | None = None) -> int:
+def serve_local(sock_path: Path | None = None, ready: threading.Event | None = None,
+                reexec=os.execv, me: Path | None = None) -> int:
     """The broker: one Unix socket in a 0700 directory; BROKER_THREADS connections and BROKER_CONCURRENCY
     fetches at a time, and a connection past those answers busy at once."""
     sock_path = sock_path or SOCKET
@@ -387,18 +389,42 @@ def serve_local(sock_path: Path | None = None, ready: threading.Event | None = N
     slots = threading.BoundedSemaphore(BROKER_CONCURRENCY)
     handlers = threading.BoundedSemaphore(BROKER_THREADS)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=BROKER_THREADS)
+    active = [0]
+    active_lock = threading.Lock()
+    # launchd keeps this process running across tool updates (it reloads the agent only when its plist
+    # changes), so re-execute once this file changes and no request is in flight, as glaeda-gh does.
+    me = me or Path(__file__).resolve()
+    stamp = me.stat().st_mtime if me.exists() else None
+    server.settimeout(RELOAD_CHECK_SECONDS)
 
     def run(conn: socket.socket) -> None:
         try:
             handle(conn, slots)
         finally:
+            with active_lock:
+                active[0] -= 1
             handlers.release()
 
     if ready is not None:
         ready.set()
     try:
         while True:
-            conn, _ = server.accept()
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                with active_lock:
+                    idle = active[0] == 0
+                try:
+                    changed = stamp is not None and me.stat().st_mtime != stamp
+                except OSError:
+                    changed = False
+                if idle and changed:
+                    server.close()
+                    sock_path.unlink(missing_ok=True)
+                    reexec(sys.executable, [sys.executable, "-I", os.fspath(me), "serve-local"])
+                    return 0  # reexec only returns under test
+                continue
+            conn.settimeout(None)
             if not handlers.acquire(blocking=False):
                 with conn:
                     try:
@@ -408,6 +434,8 @@ def serve_local(sock_path: Path | None = None, ready: threading.Event | None = N
                     except OSError:
                         pass
                 continue
+            with active_lock:
+                active[0] += 1
             pool.submit(run, conn)
     finally:
         server.close()
