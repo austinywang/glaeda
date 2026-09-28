@@ -35,8 +35,8 @@ being measured.
 
 ## Totals
 
-- Exported modules: **205**
-- Reach: **97 binary**, **63 library**, **11 tests**, **34 none**
+- Exported modules: **206**
+- Reach: **98 binary**, **63 library**, **11 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -93,8 +93,9 @@ let the gate hold the line.
 | `adaptive_verification_compiler` | `all` | library | 2 |
 | `artifact` | `all` | binary | 162 |
 | `cache_inventory` | `all` | binary | 5 |
-| `cargo_target_holder_observation` | `target_os="linux"` | binary | 1 |
-| `cargo_target_observation` | `target_os="linux"` | binary | 4 |
+| `cargo_target_holder_observation` | `target_os="linux"` | binary | 4 |
+| `cargo_target_observation` | `target_os="linux"` | binary | 7 |
+| `cargo_target_reclaim` | `target_os="linux"` | binary | 2 |
 | `cmux_product_transport_adapter` | `all` | none | 0 |
 | `cmux_workload_verification_adapter` | `all` | library | 1 |
 | `compute_execution_request` | `all` | binary | 2 |

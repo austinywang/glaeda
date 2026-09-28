@@ -37,6 +37,16 @@ pub struct ObservedTimestamp {
 }
 
 impl ObservedTimestamp {
+    #[must_use]
+    pub const fn seconds(self) -> i64 {
+        self.seconds
+    }
+
+    #[must_use]
+    pub const fn nanoseconds(self) -> i64 {
+        self.nanoseconds
+    }
+
     fn from_stat(stat: &Stat) -> Result<Self, CargoTargetObservationError> {
         let nanoseconds = i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_shape())?;
         if !(0..1_000_000_000).contains(&nanoseconds) {
@@ -100,6 +110,11 @@ pub struct CargoTargetObservation {
 }
 
 impl CargoTargetObservation {
+    #[must_use]
+    pub const fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
+
     fn absent() -> Self {
         Self {
             schema_version: CARGO_TARGET_OBSERVATION_SCHEMA_VERSION,
@@ -547,6 +562,11 @@ pub struct CargoTargetObservationError {
 }
 
 impl CargoTargetObservationError {
+    #[must_use]
+    pub const fn kind(&self) -> CargoTargetObservationErrorKind {
+        self.kind
+    }
+
     #[must_use]
     pub const fn code(&self) -> &'static str {
         self.code
