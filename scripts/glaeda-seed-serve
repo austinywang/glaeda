@@ -7,6 +7,7 @@
 This runs only as that forced command. The client's requested command arrives in SSH_ORIGINAL_COMMAND:
 
     seed-v1 CODEC KEY [KEY ...]   CODEC is zstd or tar; KEYs nearest first, at most MAX_KEYS
+    seed-list-v1                  the kept seeds, newest first (the seed archive's filler asks this)
     ping-v1                       installation check
 
 It answers with one header line on stdout, then (on a hit) the stream:
@@ -16,6 +17,7 @@ It answers with one header line on stdout, then (on a hit) the stream:
     glaeda-seed-serve 1 busy               exit 4: every serve slot stayed taken for SLOT_WAIT seconds
     glaeda-seed-serve 1 refused REASON     exit 2: malformed request, or this host is not trusted-only
     glaeda-seed-serve 1 pong               exit 0: ping-v1
+    glaeda-seed-serve 1 list N             then N lines "KEY MTIME", newest first (at most MAX_LIST)
 
 With --role product (the mesh key every PR mini authorizes for the others, glaeda-seed-lan mesh) it
 answers only product verbs, from this mini's node-local compiled product cache (cmux
@@ -33,6 +35,13 @@ Unlike seeds, any PR mini serves products, and a PR job there can write its cach
 trusted here. The consumer's sha256 check against the digest GitHub recorded is what makes them safe,
 and it is not optional (glaeda-lan-fetch, then cmux peer_product_source.py again). The product role
 skips the trusted-receipt check and never answers seed verbs; the seed role never answers product verbs.
+
+With --role archive (cmux-lawrence, the fleet's seed archive: glaeda-seed-archive fills it from the
+trusted seeder) it answers the seed verbs from ARCHIVE/<KEY>.tar.zst, each a seed's zstd stream exactly as
+the seeder sent it, kept as one file. A hit streams the file as is
+(`hit KEY zstd`), or through `zstd -d` for a client that asked for tar; a hit touches the file's mtime,
+which the archive's prune reads as last use. The archive host runs no jobs: with a glaeda runner receipt
+present the archive role refuses everything, since PR code there could rewrite the archive.
 
 Only a KEY that matches KEY_RE (a seed key: no slash, no dot, no option) is looked up, and only as a real
 directory, never a symlink, directly under a canonical root's seed cache (STATE/seeds or
@@ -97,7 +106,11 @@ MAX_OBJECT_BYTES = 20 * 1024**3
 MAX_METADATA_BYTES = 64 * 1024
 MAX_PRODUCT_ENTRIES = 4096
 SHA_RE = re.compile(r"[a-f0-9]{64}")
-ROLES = ("seed", "product")
+ROLES = ("seed", "product", "archive")
+# The seed archive on cmux-lawrence (cmuxterm-hq#821): an APFS disk image glaeda-seed-archive attaches.
+ARCHIVE = "/Volumes/glaeda-seed-archive/seeds"
+ARCHIVE_SUFFIX = ".tar.zst"
+MAX_LIST = 512
 IP_RE = re.compile(r"[0-9A-Fa-f.:]{1,64}")
 
 
@@ -114,6 +127,8 @@ def parse_request(text: str, role: str = "seed") -> tuple[str, str, list[str]]:
     words = text.split(" ")
     if words == ["ping-v1"]:
         return "ping", "", []
+    if words == ["seed-list-v1"] and role != "product":
+        return "list", "", []
     if role == "product":
         if len(words) == 2 and words[0] in ("product-v1", "product-has-v1") and SHA_RE.fullmatch(words[1]):
             return words[0].removesuffix("-v1"), "", [words[1]]
@@ -177,6 +192,63 @@ def find(state: Path, keys: list[str]) -> tuple[Path, str] | None:
             if kept(seeds, key):
                 return seeds, key
     return None
+
+
+def archive_find(archive: Path, keys: list[str]) -> tuple[int, str] | None:
+    """(fd, key) of the first KEY the archive keeps, nearest first: a regular file, never a symlink."""
+    root = open_dir_path(archive)
+    if root is None:
+        return None
+    try:
+        for key in keys:
+            try:
+                # O_NONBLOCK: a FIFO in the archive must not hang the open; cleared once it is a regular file.
+                fd = os.open(key + ARCHIVE_SUFFIX, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
+            except OSError:
+                continue
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+                return fd, key
+            os.close(fd)
+    finally:
+        os.close(root)
+    return None
+
+
+def listing(role: str, state: Path, archive: Path) -> list[tuple[str, int]]:
+    """(key, mtime) of every kept seed, newest first, at most MAX_LIST; a key kept in several roots once."""
+    found: dict[str, int] = {}
+    if role == "archive":
+        try:
+            entries = [(e.name[:-len(ARCHIVE_SUFFIX)], e) for e in os.scandir(archive)
+                       if e.name.endswith(ARCHIVE_SUFFIX) and e.is_file(follow_symlinks=False)]
+        except OSError:
+            entries = []
+        for key, entry in entries:
+            if KEY_RE.fullmatch(key):
+                found[key] = int(entry.stat(follow_symlinks=False).st_mtime)
+    else:
+        for seeds in seed_dirs(state):
+            try:
+                names = os.listdir(seeds)
+            except OSError:
+                continue
+            for key in names:
+                if KEY_RE.fullmatch(key) and kept(seeds, key):
+                    found[key] = max(found.get(key, 0), int(os.lstat(seeds / key).st_mtime))
+    return sorted(found.items(), key=lambda item: (-item[1], item[0]))[:MAX_LIST]
+
+
+def stream_archive(fd: int, codec: str) -> int:
+    """Write the archived zstd stream in FD to stdout as is, or decompressed for CODEC tar."""
+    if codec == "zstd":
+        return stream_product(fd, os.fstat(fd).st_size)
+    proc = subprocess.Popen([zstd_tool() or "zstd", "-d", "-q", "-c"], stdin=fd, stdout=1, stderr=subprocess.DEVNULL)
+    try:
+        return proc.wait(timeout=SERVE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return 124
 
 
 def try_lock(path: Path) -> int | None:
@@ -404,7 +476,7 @@ def stream(seeds: Path, key: str, codec: str) -> int:
 
 
 def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, slot_wait: float,
-          role: str = "seed", products: Path = Path(PRODUCTS)) -> int:
+          role: str = "seed", products: Path = Path(PRODUCTS), archive: Path = Path(ARCHIVE)) -> int:
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     client = client if IP_RE.fullmatch(client) else "unknown"
     record: dict = {"time": int(time.time()), "client": client, "role": role}
@@ -412,6 +484,8 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
         verb, codec, keys = parse_request(request, role)
         if role == "seed" and not trusted(receipt):
             raise Refused("this host is not a trusted-only seeder")
+        if role == "archive" and os.path.lexists(receipt):
+            raise Refused("this host runs glaeda runners; it cannot be the seed archive")
     except Refused as error:
         say(f"refused {str(error).replace(' ', '-')}")
         log(run_dir, {**record, "outcome": "refused", "reason": str(error)})
@@ -422,13 +496,36 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
         return 0
     if verb in ("product", "product-has"):
         return serve_product(verb, keys[0], products, run_dir, client, slot_wait, record)
-    found = find(state, keys)
+    if verb == "list":
+        # Admitted like a product lookup: a scan of the seed caches is work a flood of clients must not multiply.
+        admitted = admit(run_dir, client)
+        if admitted is None:
+            say("busy")
+            log(run_dir, {**record, "outcome": "busy", "verb": "list"})
+            return 4
+        try:
+            kept_seeds = listing(role, state, archive)
+            say(f"list {len(kept_seeds)}")
+            os.write(1, "".join(f"{key} {mtime}\n" for key, mtime in kept_seeds).encode())
+        finally:
+            for held in admitted:
+                os.close(held)
+        log(run_dir, {**record, "outcome": "list", "count": len(kept_seeds)})
+        return 0
+    if role == "archive":
+        opened = archive_find(archive, keys)
+        found = None if opened is None else (opened[0], opened[1])
+    else:
+        found = find(state, keys)
     if found is None:
         say("miss")
-        log(run_dir, {**record, "outcome": "miss", "asked": len(keys)})
+        log(run_dir, {**record, "outcome": "miss", "asked": len(keys), "want": keys[0]})
         return 3
     seeds, key = found
-    if codec == "zstd" and zstd_tool() is None:
+    if role == "archive":
+        if zstd_tool() is None:
+            codec = "zstd"  # the file is zstd; only a client that asked for tar needs zstd here
+    elif codec == "zstd" and zstd_tool() is None:
         codec = "tar"
     try:
         os.nice(10)
@@ -439,15 +536,24 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
     if slot is None:
         for fd in admitted or []:
             os.close(fd)
+        if role == "archive":
+            os.close(seeds)
         say("busy")
         log(run_dir, {**record, "outcome": "busy", "key": key, "queued": admitted is not None})
         return 4
     started = time.monotonic()
     try:
         say(f"hit {key} {codec}")
-        status = stream(seeds, key, codec)
+        if role == "archive":
+            try:
+                os.utime(seeds)  # last use, for the archive's prune
+            except OSError:
+                pass
+            status = stream_archive(seeds, codec)
+        else:
+            status = stream(seeds, key, codec)
     finally:
-        for fd in [slot, *admitted]:
+        for fd in [slot, *admitted] + ([seeds] if role == "archive" else []):
             os.close(fd)
     log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "key": key, "codec": codec,
                   "distance": keys.index(key), "status": status, "seconds": round(time.monotonic() - started, 1)})
@@ -507,6 +613,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--slot-wait", type=float, default=SLOT_WAIT)
     parser.add_argument("--role", choices=ROLES, default="seed")
     parser.add_argument("--products", default=PRODUCTS)
+    parser.add_argument("--archive", default=ARCHIVE)
     args = parser.parse_args(argv)
     request = os.environ.get("SSH_ORIGINAL_COMMAND")
     if request is None:
@@ -514,7 +621,8 @@ def main(argv: list[str]) -> int:
         return 2
     client = (os.environ.get("SSH_CLIENT") or "").split(" ")[0]
     return serve(request, Path(args.state), Path(os.path.expanduser(args.run_dir)),
-                 Path(os.path.expanduser(args.receipt)), client, args.slot_wait, args.role, Path(args.products))
+                 Path(os.path.expanduser(args.receipt)), client, args.slot_wait, args.role, Path(args.products),
+                 Path(args.archive))
 
 
 if __name__ == "__main__":

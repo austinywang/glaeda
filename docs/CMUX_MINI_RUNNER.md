@@ -770,6 +770,45 @@ rewrites the plist within the hour). On the seeder, `~/.local/state/glaeda/seed-
 each request. Roll back with `scripts/glaeda-seed-lan remove --seeder cmux15 [HOST...] --apply`: without a
 config a mini skips the LAN step.
 
+## 2i2. The seed archive on cmux-lawrence
+
+cmuxterm-hq#821. cmux15 keeps only its recent seeds, and it is the only writer of the minis' j14 seeds. So
+before the archive, 189 of 195 LAN requests from cmux12s missed there, and the other minis fetched every
+seed from R2. That took 108-158 s idle and up to 760 s paced beside a job, one download per mini per seed.
+
+cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps, and the PR minis read from it:
+
+- **Fill.** The `glaeda-seed-archive` LaunchAgent runs every 5 minutes with `/usr/bin/python3`, so Local
+  Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
+  `seed-list-v1` and streams every seed the archive lacks, newest first.
+- **Storage.** Each seed is kept as `/Volumes/glaeda-seed-archive/seeds/<KEY>.tar.zst`: the zstd stream
+  exactly as cmux15 sent it, about 2.1-2.4 GB against 9 GB unpacked, so serving it is a read. The volume is
+  an APFS sparse bundle on the ExFAT X10 Pro (`glaeda-seed-archive.sparsebundle`, attached by each run).
+  macOS privacy lets a launchd job write into an attached image but not onto the external disk itself. The filler checks every file before renaming it into place: all entries
+  under `KEY/`, and the seed manifest present.
+- **Prune.** Oldest use first, while the archive holds more than 800 GiB or the disk has less than 300 GiB
+  free. Serving a seed touches it.
+- **Serving.** `glaeda-seed-serve --role archive` refuses everything on a host that has a glaeda runner
+  receipt.
+
+```sh
+# the archive as a client of the trusted seeder
+scripts/glaeda-seed-lan install --seeder cmux15 --address 172.20.21.202 cmux-lawrence --apply
+# the PR minis read from the archive (replaces their seeder config)
+scripts/glaeda-seed-lan install --seeder cmux-lawrence --role archive --user cmux-lawrence \
+  --address 172.20.21.158 HOST... --apply
+# on cmux-lawrence, over SSH: copy glaeda-seed-archive and glaeda-seed-prefetch to ~/.local/libexec, then
+# (creates and attaches the image, loads the LaunchAgent)
+~/.local/libexec/glaeda-seed-archive install --apply
+```
+
+The hq command `fleet seed-archive` runs all three. The fill log is
+`~/Library/Logs/glaeda-seed-archive.jsonl` on cmux-lawrence, and the serve log is
+`~/.local/state/glaeda/seed-serve/serve.jsonl`. A miss there records the wanted key.
+
+Roll back by pointing the minis at cmux15 again (`install --seeder cmux15 ...`). The archive can stay; it
+is regenerable.
+
 ## 2j. Compiled products over the LAN between PR minis
 
 A consumer of the app-host test product (the shards, E2E) downloads ~650-830 MB from GitHub in about

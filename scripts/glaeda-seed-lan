@@ -3,6 +3,7 @@
 
     glaeda-seed-lan install --seeder cmux15 --address IP [--address NAME] [--from CIDRS] HOST ...          plan
     glaeda-seed-lan install --seeder cmux15 --address IP [--address NAME] [--from CIDRS] HOST ... --apply
+    glaeda-seed-lan install --seeder cmux-lawrence --role archive --user cmux-lawrence --address IP HOST ... [--apply]
     glaeda-seed-lan remove  --seeder cmux15 [HOST ...]            plan removal (no HOST: every client)
     glaeda-seed-lan remove  --seeder cmux15 [HOST ...] --apply
     glaeda-seed-lan mesh HOST HOST ... [--address HOST=IP] [--from CIDRS] [--apply]   product mesh (below)
@@ -30,6 +31,12 @@ Only glaeda-seed-lan's own lines (comment glaeda-seed-lan@HOST with this forced 
 or removed. The seeder must be trusted-only: its glaeda runner receipt must name a trusted ref, and
 cmuxs-mac-mini-6 (PR code as the same user) is refused outright. Verification here runs from an SSH
 shell, where Local Network Privacy does not apply; docs/CMUX_MINI_RUNNER.md shows how to check under launchd.
+
+`install --role archive` makes the seed archive (cmux-lawrence, cmuxterm-hq#821) the minis' seeder: the
+forced command gets `--role archive` (glaeda-seed-serve answers from its archive directory), and instead of a
+trusted ref the archive host must have no glaeda runner receipt at all, since it runs no jobs. The archive
+itself is a client of the trusted seeder (plain `install --seeder cmux15 ... cmux-lawrence`), which
+glaeda-seed-archive uses to fill it.
 
 `mesh` sets up compiled products over the LAN between PR minis (glaeda-lan-fetch). Each HOST gets
 ~/.config/glaeda/lan-mesh/ with its own key, config.json naming every other HOST and its LAN address
@@ -131,6 +138,7 @@ try:
     out["trusted_ref"] = member.get("trustedRef") or ""
 except Exception:
     out["trusted_ref"] = ""
+out["runner_receipt"] = os.path.lexists(os.path.join(home, ".local/state/glaeda/cmux-runner/receipt.json"))
 try:
     out["serve_sha"] = hashlib.sha256(open(serve, "rb").read()).hexdigest()
 except OSError:
@@ -326,28 +334,40 @@ def check_names(seeder: str, hosts: list[str], addresses: list[str], cidrs: str)
         raise Failure(f"not a CIDR list: {cidrs!r}")
 
 
-def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, user: str, apply: bool) -> dict:
+ARCHIVE_ROLE = " --role archive"
+
+
+def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, user: str, apply: bool,
+            role: str = "seed") -> dict:
     check_names(seeder, hosts, addresses, cidrs)
+    suffix = ARCHIVE_ROLE if role == "archive" else ""
+    trusted_clients = sorted(h for h in hosts if h in TRUSTED_SEEDERS | NEVER_SEEDERS
+                             or h.split(".")[0] in TRUSTED_SEEDERS | NEVER_SEEDERS)
+    if role == "archive" and trusted_clients:
+        raise Failure(f"{', '.join(trusted_clients)} write trusted seeds: they never read from the archive")
     pm = prefetch_module()
     serve = (SCRIPT_DIR / "glaeda-seed-serve").read_bytes()
     serve_sha = hashlib.sha256(serve).hexdigest()
     report: dict = {"tool": "glaeda-seed-lan", "mode": "install", "apply": apply, "seeder": seeder, "hosts": {}}
-    probe = remote(seeder, SEEDER_REMOTE, {"mode": "probe", "tag": TAG})
+    probe = remote(seeder, SEEDER_REMOTE, {"mode": "probe", "tag": TAG, "command_suffix": suffix})
     forbidden = {name.lower() for name in NEVER_SEEDERS}
     if any(name.lower() in forbidden for name in probe.get("names", [])):
         raise Failure(f"{seeder} is {probe['names']}, which runs PR code: it can never be a seed source")
     if probe.get("ak_symlink"):
         raise Failure(f"{seeder}: ~/.ssh/authorized_keys is a symlink; refusing to replace it")
-    if not probe["trusted_ref"]:
+    if role == "archive":
+        if probe.get("runner_receipt", True):
+            raise Failure(f"{seeder}: it has a glaeda runner receipt; the seed archive must run no jobs")
+    elif not probe["trusted_ref"]:
         raise Failure(f"{seeder}: its glaeda runner receipt names no trusted ref; refusing to serve seeds from it")
     if not probe["host_key"].startswith("ssh-ed25519 "):
         raise Failure(f"{seeder}: no ed25519 host key")
-    report["seeder_state"] = {"trusted_ref": probe["trusted_ref"],
+    report["seeder_state"] = {"role": role, "trusted_ref": probe["trusted_ref"],
                               "serve": "current" if probe["serve_sha"] == serve_sha else
                                        ("stale" if probe["serve_sha"] else "missing")}
     known_hosts = f"{pm.LAN_HOST_KEY_ALIAS} {probe['host_key']}\n"
     config = json.dumps({"schema": 1, "seeder": seeder, "user": user, "addresses": addresses}, indent=1) + "\n"
-    options = f'restrict,from="{cidrs}",command="{forced_command(probe, seeder)}"'
+    options = f'restrict,from="{cidrs}",command="{forced_command(probe, seeder, suffix)}"'
     lines, manifest_keys, seen = [], [], set()
     for host in hosts:
         comment = comment_of(host)
@@ -370,7 +390,7 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
             entry["fingerprint"] = fingerprint(public_key)
             entry["authorized"] = "current" if probe["authorized"].get(comment) == line else "pending"
             manifest_keys.append({"id": f"seed-lan-{host}", "fingerprint": entry["fingerprint"], "comment": comment,
-                                  "role": f"seeds over the LAN: {host} reads kept seeds from {seeder} "
+                                  "role": f"seeds over the LAN: {host} reads {'archived' if suffix else 'kept'} seeds from {seeder} "
                                           "(glaeda-seed-serve, forced command)",
                                   "status": "active", "options": options, "public_key": f"{public_key} {comment}"})
         else:
@@ -378,7 +398,8 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
         report["hosts"][host] = entry
     if apply:
         done = remote(seeder, SEEDER_REMOTE, {"mode": "apply", "tag": TAG, "serve_sha": serve_sha,
-                                              "keep_backups": KEEP_BACKUPS,
+                                              "keep_backups": KEEP_BACKUPS, "command_suffix": suffix,
+                                              "require_trusted": role != "archive",
                                               "serve_b64": base64.b64encode(serve).decode(), "lines": lines})
         report["seeder_state"]["changed"] = done.get("changed", [])
         if done.get("backup"):
@@ -401,12 +422,13 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
     return report
 
 
-def remove(seeder: str, hosts: list[str], apply: bool) -> dict:
+def remove(seeder: str, hosts: list[str], apply: bool, role: str = "seed") -> dict:
+    suffix = ARCHIVE_ROLE if role == "archive" else ""
     for name in [seeder, *hosts]:
         if not HOST_RE.fullmatch(name):
             raise Failure(f"not a host name: {name!r}")
     report: dict = {"tool": "glaeda-seed-lan", "mode": "remove", "apply": apply, "seeder": seeder, "hosts": {}}
-    probe = remote(seeder, SEEDER_REMOTE, {"mode": "probe", "tag": TAG})
+    probe = remote(seeder, SEEDER_REMOTE, {"mode": "probe", "tag": TAG, "command_suffix": suffix})
     drop = [TAG + host for host in hosts] if hosts else list(probe["authorized"])
     report["seeder_state"] = {"would_drop": [c for c in drop if c in probe["authorized"]],
                               "serve": "present" if probe["serve_sha"] else "absent"}
@@ -414,7 +436,7 @@ def remove(seeder: str, hosts: list[str], apply: bool) -> dict:
         state = remote(host, CLIENT_REMOTE, {"mode": "remove" if apply else "probe"})
         report["hosts"][host] = {"changed": state.get("changed", []), "configured": bool(state["config"])}
     if apply:
-        done = remote(seeder, SEEDER_REMOTE, {"mode": "remove", "tag": TAG, "drop": drop,
+        done = remote(seeder, SEEDER_REMOTE, {"mode": "remove", "tag": TAG, "drop": drop, "command_suffix": suffix,
                                               "remove_serve": not hosts})
         report["seeder_state"]["changed"] = done.get("changed", [])
         report["seeder_state"]["remaining"] = sorted(done.get("authorized", {}))
@@ -704,11 +726,14 @@ def main(argv: list[str]) -> int:
                       "first is tried first")
     inst.add_argument("--from", dest="cidrs", default=DEFAULT_FROM, help="authorized_keys from= (comma separated)")
     inst.add_argument("--user", default="cmux")
+    inst.add_argument("--role", choices=("seed", "archive"), default="seed",
+                      help="archive: the seeder is the seed archive (glaeda-seed-serve --role archive)")
     inst.add_argument("--apply", action="store_true")
     inst.add_argument("hosts", nargs="+")
     rem = sub.add_parser("remove")
     rem.add_argument("--seeder", required=True)
     rem.add_argument("--apply", action="store_true")
+    rem.add_argument("--role", choices=("seed", "archive"), default="seed")
     rem.add_argument("hosts", nargs="*")
     msh = sub.add_parser("mesh")
     msh.add_argument("--address", action="append", default=[], help="HOST=IP, when ipconfig on HOST is wrong")
@@ -726,7 +751,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "install":
-            report = install(args.seeder, args.hosts, args.address, args.cidrs, args.user, args.apply)
+            report = install(args.seeder, args.hosts, args.address, args.cidrs, args.user, args.apply, args.role)
         elif args.command == "mesh":
             overrides = dict(item.split("=", 1) for item in args.address if "=" in item)
             report = mesh(args.hosts, overrides, args.cidrs, args.user, args.apply)
@@ -735,7 +760,7 @@ def main(argv: list[str]) -> int:
         elif args.command == "mesh-remove":
             report = mesh_remove(args.hosts, args.apply)
         else:
-            report = remove(args.seeder, args.hosts, args.apply)
+            report = remove(args.seeder, args.hosts, args.apply, args.role)
     except Failure as error:
         print(json.dumps({"tool": "glaeda-seed-lan", "error": str(error)}))
         return 1

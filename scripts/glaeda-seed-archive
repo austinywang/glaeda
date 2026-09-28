@@ -1,0 +1,423 @@
+#!/usr/bin/python3
+"""glaeda-seed-archive: keep the fleet's seed archive (cmux-lawrence) filled from the trusted seeder.
+
+    glaeda-seed-archive                    plan: the seeds the seeder keeps that the archive lacks
+    glaeda-seed-archive --apply            fetch them newest first, then prune (the 5-minute LaunchAgent)
+    glaeda-seed-archive install [--apply]  write and load that LaunchAgent (run on the archive host)
+
+cmuxterm-hq#821. The owned minis' j14 DerivedData seeds are built by one trusted-only seeder (cmux15), which
+keeps only its recent ones on a 460 GB disk. The archive keeps them all, up to BUDGET, on cmux-lawrence's
+X10 Pro SSD, and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
+then glaeda-seed-serve --role archive answers glaeda-seed-prefetch). A seed lands here within a few minutes of
+the seeder keeping it, over the LAN, instead of every mini downloading it from R2.
+
+Each seed is kept as ARCHIVE/<KEY>.tar.zst: exactly the zstd stream the seeder's glaeda-seed-serve sends (a
+tar of one top-level directory named KEY), so serving it is a plain read. ARCHIVE is inside IMAGE, an APFS
+sparse bundle on the (ExFAT) X10 Pro, mounted at MOUNT: macOS privacy (TCC) lets a launchd job running
+/usr/bin/python3 write into an attached disk image but not onto the external volume itself (measured on
+cmux-lawrence 2026-09-28, "Operation not permitted"; Lawrence's siso cache uses a sparse bundle on T5 EVO the
+same way). Each run attaches the image if it is not mounted; `install --apply`, run over SSH, creates it. The
+archive is a client of the seeder like any mini (glaeda-seed-lan install --seeder cmux15 ... cmux-lawrence
+writes SEED_LAN_CONFIG); it asks `seed-list-v1` for the seeder's kept seeds and `seed-v1 zstd KEY` for each
+one it lacks. A stream is written to a dot-file beside the archive, checked (every entry under KEY/, the seed
+manifest present, under LAN_MAX_BYTES of zstd), and only then renamed into place.
+
+Trust: the bytes come only from the trusted seeder, whose serve refuses unless its runner receipt names a
+trusted ref; this host runs no jobs (glaeda-seed-serve --role archive refuses on a host with a runner
+receipt), and the minis' keys here are forced-command, read-only.
+
+Prune: oldest mtime first (glaeda-seed-serve touches a seed it serves) while the archive holds more than
+BUDGET bytes or HOST_VOLUME has less than MIN_FREE free (the disk is Lawrence's). The newest KEEP_NEWEST and
+anything touched in the last GRACE seconds stay.
+
+Local Network Privacy: the LaunchAgent's program is /usr/bin/python3 and its children are /usr/bin/ssh and
+Homebrew zstd (which only reads a pipe), so the LAN connection is allowed (glaeda-seed-prefetch's notes).
+Prints one JSON line, also appended to LOG.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+HOME = Path(os.path.expanduser("~"))
+HOST_VOLUME = Path("/Volumes/X10 Pro")
+IMAGE = HOST_VOLUME / "glaeda-seed-archive.sparsebundle"
+IMAGE_SIZE = "1t"  # the most it can grow to; BUDGET keeps it below
+MOUNT = Path("/Volumes/glaeda-seed-archive")
+ARCHIVE = MOUNT / "seeds"  # glaeda-seed-serve ARCHIVE
+# The first version kept the files directly on the X10 Pro, where launchd jobs cannot write; install moves them.
+OLD_ARCHIVE = HOST_VOLUME / "glaeda-seed-archive"
+HDIUTIL = "/usr/bin/hdiutil"
+SUFFIX = ".tar.zst"
+STATE = HOME / ".local/state/glaeda/seed-archive"
+LOG = HOME / "Library/Logs/glaeda-seed-archive.jsonl"
+LOG_BYTES = 4 << 20
+BUDGET = 800 * 1024**3
+MIN_FREE = 300 * 1024**3
+KEEP_NEWEST = 4
+GRACE = 600  # a seed touched this recently may be streaming to a mini
+MAX_PER_RUN = 8  # ~25 s each at LAN speed; the next run takes the rest
+LIST_TIMEOUT = 30
+FETCH_TIMEOUT = 420  # the seeder may wait 60 s for a slot, then streams within its 180 s limit
+STALE_INCOMING = 3600
+LABEL = "com.teamleaderleo.glaeda.seed-archive"
+INTERVAL = 300
+
+
+def prefetch_module():
+    """glaeda-seed-prefetch, installed beside this script: its LAN client (config, ssh, header, zstd)."""
+    loader = importlib.machinery.SourceFileLoader("glaeda_seed_prefetch_for_archive",
+                                                  os.fspath(SCRIPT_DIR / "glaeda-seed-prefetch"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+pm = prefetch_module()
+
+
+def archived(archive: Path) -> dict[str, os.stat_result]:
+    """KEY -> stat of every archived seed (regular files named <KEY>.tar.zst)."""
+    found = {}
+    try:
+        entries = list(os.scandir(archive))
+    except OSError:
+        return found
+    for entry in entries:
+        key = entry.name[:-len(SUFFIX)]
+        if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key) and entry.is_file(follow_symlinks=False):
+            found[key] = entry.stat(follow_symlinks=False)
+    return found
+
+
+def ask(config: dict, request: str) -> subprocess.Popen:
+    """/usr/bin/ssh to the seeder with REQUEST; the caller reads the header then the stream."""
+    return subprocess.Popen(pm.ssh_command(config, config["addresses"][0], request), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def seeder_list(config: dict) -> tuple[list[tuple[str, int]], str]:
+    """The seeder's kept seeds (key, mtime), newest first, or [] and why."""
+    proc = ask(config, "seed-list-v1")
+    try:
+        out, err = proc.communicate(timeout=LIST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return [], "seed-list-v1 timed out"
+    head, _, body = out.partition(b"\n")
+    while head and not head.startswith(pm.SERVE_HEADER) and body:  # a noisy login shell printed first
+        head, _, body = body.partition(b"\n")
+    words = head[len(pm.SERVE_HEADER):].decode(errors="replace").split()
+    if not head.startswith(pm.SERVE_HEADER) or len(words) != 2 or words[0] != "list" or not words[1].isdigit():
+        detail = " ".join(words)[:120] or err.decode(errors="replace").strip()[-160:] or f"exit {proc.returncode}"
+        return [], f"seeder: {detail}"
+    kept = []
+    for line in body.decode(errors="replace").splitlines()[:int(words[1])]:
+        parts = line.split()
+        if len(parts) == 2 and pm.KEY_RE.fullmatch(parts[0]) and parts[1].isdigit():
+            kept.append((parts[0], int(parts[1])))
+    return kept, ""
+
+
+def check(path: Path, key: str) -> str:
+    """"" when PATH is a zstd tar of one directory KEY holding the seed manifest, else why not."""
+    zstd = pm.zstd_tool()
+    if not zstd:
+        return "no zstd"
+    unpack = subprocess.Popen([zstd, "-d", "-q", "-c", os.fspath(path)], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+    try:
+        listing = subprocess.run([pm.TAR, "-t", "-f", "-"], stdin=unpack.stdout, capture_output=True, timeout=600)
+        unpacked = unpack.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        unpack.kill()
+        unpack.wait()
+        return "check timed out"
+    finally:
+        unpack.stdout.close()
+    if unpacked != 0 or listing.returncode != 0:
+        return "not a readable zstd tar"
+    names = [n.rstrip("/") for n in listing.stdout.decode(errors="replace").splitlines()]
+    # Everything under KEY/ (bsdtar may add an AppleDouble ._KEY beside it), no absolute or .. paths.
+    stray = [n for n in names if n.startswith("/") or ".." in n.split("/")
+             or not (n in (key, "._" + key) or n.startswith(key + "/"))]
+    if stray:
+        return f"entry outside {key}: {stray[0][:80]}"
+    if f"{key}/{pm.MANIFEST}" not in names:
+        return "no seed manifest"
+    return ""
+
+
+def fetch(config: dict, key: str, archive: Path) -> dict:
+    """Stream KEY from the seeder into the archive; the outcome."""
+    started = time.monotonic()
+    incoming = archive / f".{key}{SUFFIX}.incoming-{os.getpid()}"
+    proc = ask(config, f"seed-v1 zstd {key}")
+    compress = None
+    try:
+        header = pm.read_header(proc.stdout.fileno())
+        words = header[len(pm.SERVE_HEADER):].decode(errors="replace").split()
+        if not header.startswith(pm.SERVE_HEADER):
+            proc.kill()
+            return {"key": key, "outcome": "unreachable",
+                    "detail": proc.stderr.read().decode(errors="replace").strip()[-160:]}
+        if words[:1] != ["hit"]:
+            proc.kill()
+            return {"key": key, "outcome": (words[:1] or ["empty"])[0]}  # miss, busy, refused
+        if len(words) != 3 or words[1] != key or words[2] not in ("zstd", "tar"):
+            proc.kill()
+            return {"key": key, "outcome": "bad-answer", "detail": " ".join(words)[:120]}
+        with open(incoming, "wb") as out:
+            source = proc.stdout
+            if words[2] == "tar":  # a seeder without zstd: compress here
+                if not pm.zstd_tool():
+                    proc.kill()
+                    return {"key": key, "outcome": "no-zstd"}
+                compress = subprocess.Popen([pm.zstd_tool(), "-1", "-T0", "-q", "-c"], stdin=proc.stdout,
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                proc.stdout.close()
+                source = compress.stdout
+            total, deadline = 0, time.monotonic() + FETCH_TIMEOUT
+            while chunk := source.read(1 << 20):
+                total += len(chunk)
+                if total > pm.LAN_MAX_BYTES or time.monotonic() > deadline:
+                    proc.kill()
+                    return {"key": key, "outcome": "too-big-or-slow", "bytes": total}
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        try:
+            failed = proc.wait(timeout=60) != 0 or (compress and compress.wait(timeout=60) != 0)
+        except subprocess.TimeoutExpired:
+            failed = True
+        if failed:
+            return {"key": key, "outcome": "stream-failed", "bytes": total}
+        streamed = time.monotonic() - started
+        if why := check(incoming, key):
+            return {"key": key, "outcome": "rejected", "detail": why, "bytes": total}
+        os.rename(incoming, archive / (key + SUFFIX))
+        return {"key": key, "outcome": "fetched", "bytes": total, "seconds": round(streamed, 1),
+                "checked_seconds": round(time.monotonic() - started - streamed, 1)}
+    finally:
+        for p in (proc, compress):
+            if p and p.poll() is None:
+                p.kill()
+                p.wait()
+            for pipe in (p.stdout, p.stderr) if p else ():
+                if pipe:
+                    pipe.close()
+        try:
+            incoming.unlink()
+        except OSError:
+            pass
+
+
+def prune(archive: Path, budget: int, min_free: int, apply: bool, spare: set[str] = frozenset()) -> list[dict]:
+    """Delete the oldest archived seeds while over BUDGET or under MIN_FREE; what was (or would be) deleted.
+
+    SPARE (the seeds the seeder still keeps) stay: deleting one would only fetch it again next run.
+    """
+    now = time.time()
+    for stale in archive.glob(".*.incoming-*"):
+        try:
+            if now - stale.stat().st_mtime > STALE_INCOMING and apply:
+                stale.unlink()
+        except OSError:
+            pass
+    seeds = sorted(archived(archive).items(), key=lambda item: item[1].st_mtime)
+    total = sum(st.st_size for _, st in seeds)
+    free = free_bytes(archive)
+    dropped = []
+    for key, st in seeds[:max(0, len(seeds) - KEEP_NEWEST)]:
+        if total <= budget and free >= min_free:
+            break
+        if now - st.st_mtime < GRACE or key in spare:
+            continue
+        if apply:
+            try:
+                (archive / (key + SUFFIX)).unlink()
+            except OSError:
+                continue
+        total -= st.st_size
+        free += st.st_size
+        dropped.append({"key": key, "bytes": st.st_size, "age_hours": round((now - st.st_mtime) / 3600, 1)})
+    return dropped
+
+
+def free_bytes(archive: Path) -> int:
+    """Free space for the archive: the image's own, and the X10 Pro's under it."""
+    free = shutil.disk_usage(archive).free
+    if archive.is_relative_to(MOUNT) and os.path.ismount(HOST_VOLUME):
+        free = min(free, shutil.disk_usage(HOST_VOLUME).free)
+    return free
+
+
+def attach() -> str:
+    """"" once MOUNT holds the image (attaching it if needed), else why not."""
+    if os.path.ismount(MOUNT):
+        return ""
+    if not IMAGE.is_dir():
+        return f"{IMAGE} does not exist (glaeda-seed-archive install --apply creates it)"
+    try:
+        proc = subprocess.run([HDIUTIL, "attach", "-quiet", "-nobrowse", "-mountpoint", os.fspath(MOUNT),
+                               os.fspath(IMAGE)], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "hdiutil attach timed out"
+    return "" if os.path.ismount(MOUNT) else f"hdiutil attach: {proc.stderr.strip()[-160:]}"
+
+
+def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: int = MIN_FREE,
+        mounted: bool = False) -> dict:
+    """One fill and prune. MOUNTED: ARCHIVE needs no image attached (tests)."""
+    record: dict = {"tool": "glaeda-seed-archive", "time": int(time.time()), "apply": apply,
+                    "archive": os.fspath(archive)}
+    if not mounted and (why := attach()):
+        return {**record, "state": "skipped", "reason": why}
+    if apply:
+        archive.mkdir(exist_ok=True)
+    elif not archive.is_dir():
+        return {**record, "state": "planned", "reason": "the archive directory does not exist yet"}
+    config = pm.lan_config()
+    if config is None:
+        return {**record, "state": "error", "reason": f"no seeder config at {pm.LAN_CONFIG} "
+                "(glaeda-seed-lan install --seeder cmux15 ... cmux-lawrence)"}
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = os.open(STATE / "lock", os.O_RDONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return {**record, "state": "skipped", "reason": "another run holds the lock"}
+    try:
+        kept, why = seeder_list(config)
+        if why:
+            return {**record, "state": "error", "reason": why}
+        have = archived(archive)
+        missing = list(dict.fromkeys(key for key, _ in kept if key not in have))
+        record["seeder_kept"] = len(kept)
+        record["missing"] = len(missing)
+        fetched = []
+        held = sum(st.st_size for st in have.values())
+        if held >= budget or free_bytes(archive) < min_free:
+            record["full"] = True  # fetch nothing until prune (of seeds the seeder dropped) makes room
+            missing = []
+        if apply:
+            for key in missing[:MAX_PER_RUN]:
+                result = fetch(config, key, archive)
+                fetched.append(result)
+                if result["outcome"] in ("busy", "unreachable", "refused"):
+                    break  # try again next run
+        else:
+            record["would_fetch"] = missing[:MAX_PER_RUN]
+        record["fetched"] = fetched
+        record["pruned"] = prune(archive, budget, min_free, apply, {key for key, _ in kept})
+        seeds = archived(archive)
+        record["archive_seeds"] = len(seeds)
+        record["archive_bytes"] = sum(st.st_size for st in seeds.values())
+        record["disk_free_bytes"] = free_bytes(archive)
+        record["state"] = "applied" if apply else "planned"
+        return record
+    finally:
+        os.close(lock)
+
+
+def append_log(record: dict) -> None:
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > LOG_BYTES:
+            LOG.replace(LOG.with_suffix(".jsonl.1"))
+        with LOG.open("a") as out:
+            out.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def plist(program: Path) -> dict:
+    return {
+        "Label": LABEL,
+        # /usr/bin/python3 as the program: Local Network Privacy lets its /usr/bin/ssh reach the LAN.
+        "ProgramArguments": ["/usr/bin/python3", "-I", os.fspath(program), "--apply"],
+        "StartInterval": INTERVAL,
+        "RunAtLoad": True,
+        "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.fspath(HOME)},
+        "StandardOutPath": os.fspath(HOME / "Library/Logs/glaeda-seed-archive.out"),
+        "StandardErrorPath": os.fspath(HOME / "Library/Logs/glaeda-seed-archive.err"),
+    }
+
+
+def install(apply: bool) -> dict:
+    program = SCRIPT_DIR / "glaeda-seed-archive"
+    path = HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
+    want = plistlib.dumps(plist(program))
+    current = path.read_bytes() if path.exists() else b""
+    report = {"tool": "glaeda-seed-archive", "mode": "install", "apply": apply, "plist": os.fspath(path),
+              "state": "current" if current == want else ("stale" if current else "missing"),
+              "image": "present" if IMAGE.is_dir() else "missing", "mounted": os.path.ismount(MOUNT)}
+    if apply and not IMAGE.is_dir():
+        if not os.path.ismount(HOST_VOLUME):
+            return {**report, "error": f"{HOST_VOLUME} is not mounted"}
+        subprocess.run([HDIUTIL, "create", "-quiet", "-type", "SPARSEBUNDLE", "-fs", "APFS", "-size", IMAGE_SIZE,
+                        "-volname", MOUNT.name, os.fspath(IMAGE)], check=True, timeout=300)
+        report["image"] = "created"
+    if apply:
+        if why := attach():
+            return {**report, "error": why}
+        ARCHIVE.mkdir(exist_ok=True)
+        moved = 0
+        if OLD_ARCHIVE.is_dir():
+            for old in OLD_ARCHIVE.iterdir():
+                if old.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(old.name[:-len(SUFFIX)]):
+                    shutil.move(os.fspath(old), os.fspath(ARCHIVE / old.name))
+                    moved += 1
+                elif ".incoming-" in old.name or old.name.startswith("._"):
+                    old.unlink()
+            try:
+                OLD_ARCHIVE.rmdir()
+            except OSError as error:
+                report["old_archive"] = f"left in place: {error}"
+        report["moved"] = moved
+        if current != want:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".tmp-{os.getpid()}")
+            tmp.write_bytes(want)
+            os.replace(tmp, path)
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["/bin/launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
+        boot = subprocess.run(["/bin/launchctl", "bootstrap", domain, os.fspath(path)], capture_output=True, text=True)
+        report["loaded"] = boot.returncode == 0
+        if boot.returncode:
+            report["error"] = boot.stderr.strip()[-200:]
+    return report
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("command", nargs="?", choices=("install",))
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command == "install":
+        report = install(args.apply)
+        print(json.dumps(report))
+        return 1 if report.get("error") or (args.apply and not report.get("loaded")) else 0
+    record = run(args.apply)
+    if args.apply:
+        append_log(record)
+    print(json.dumps(record))
+    return 1 if record["state"] == "error" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

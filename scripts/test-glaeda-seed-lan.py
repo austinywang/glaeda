@@ -210,10 +210,98 @@ class ServeTest(unittest.TestCase):
         self.assertTrue((self.run_dir / "serve.jsonl.1").exists())
         self.assertLess((self.run_dir / "serve.jsonl").stat().st_size, 1000)
 
+    def test_the_seeder_lists_its_kept_seeds_newest_first(self):
+        os.utime(self.keep(KEY), (100, 100))
+        os.utime(self.keep(OTHER, "cmux-ci-2"), (200, 200))
+        self.keep(KEY[:-3] + "fff", manifest=False)  # incomplete: not listed
+        os.utime(self.keep(OTHER), (150, 150))  # kept in two roots: listed once, newest time
+        code, out, _ = self.ask("seed-list-v1")
+        head, body = self.header(out)
+        self.assertEqual((code, head), (0, "list 2"))
+        self.assertEqual(body.decode().splitlines(), [f"{OTHER} 200", f"{KEY} 100"])
+        for request in ("seed-list-v1 x", "seed-list-v2"):
+            self.assertEqual(self.ask(request)[0], 2)
+
     def test_the_client_and_server_agree_on_keys(self):
         prefetch = load("glaeda_seed_prefetch_keys", ROOT / "scripts/glaeda-seed-prefetch")
         self.assertEqual(prefetch.KEY_RE.pattern, serve.KEY_RE.pattern)
         self.assertEqual(prefetch.MANIFEST, serve.MANIFEST)
+
+
+class ArchiveServeTest(unittest.TestCase):
+    """--role archive: seeds kept as ARCHIVE/<KEY>.tar.zst on a host that runs no jobs."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name).resolve()  # the serve walk refuses a symlinked /var
+        self.archive = base / "archive"
+        self.archive.mkdir()
+        self.run_dir = base / "run"
+        self.receipt = base / "receipt.json"  # absent: the archive host has no glaeda runner
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def store(self, key: str, body: bytes = b"zstd bytes") -> Path:
+        path = self.archive / (key + serve.ARCHIVE_SUFFIX)
+        path.write_bytes(body)
+        os.utime(path, (100, 100))
+        return path
+
+    def ask(self, request: str) -> tuple[int, bytes]:
+        env = {k: v for k, v in os.environ.items()}
+        env["SSH_ORIGINAL_COMMAND"] = request
+        env["SSH_CLIENT"] = "172.20.21.196 50000 22"
+        proc = subprocess.run([sys.executable, os.fspath(SERVE), "--role", "archive", "--archive",
+                               os.fspath(self.archive), "--run-dir", os.fspath(self.run_dir), "--receipt",
+                               os.fspath(self.receipt)], env=env, capture_output=True, timeout=60)
+        return proc.returncode, proc.stdout
+
+    def test_a_hit_streams_the_file_as_is_and_touches_it(self):
+        path = self.store(OTHER, b"\x28\xb5\x2f\xfd stored")
+        code, out = self.ask(f"seed-v1 zstd {KEY} {OTHER}")
+        self.assertEqual((code, out), (0, f"glaeda-seed-serve 1 hit {OTHER} zstd\n".encode() + b"\x28\xb5\x2f\xfd stored"))
+        self.assertGreater(path.stat().st_mtime, 1000)
+        log = [json.loads(line) for line in (self.run_dir / "serve.jsonl").read_text().splitlines()]
+        self.assertEqual((log[-1]["outcome"], log[-1]["role"], log[-1]["distance"]), ("served", "archive", 1))
+
+    @unittest.skipUnless(serve.zstd_tool(), "needs zstd")
+    def test_a_tar_client_gets_the_stream_decompressed(self):
+        raw = b"a tar stream"
+        packed = subprocess.run([serve.zstd_tool(), "-q", "-c"], input=raw, capture_output=True, check=True).stdout
+        self.store(KEY, packed)
+        code, out = self.ask(f"seed-v1 tar {KEY}")
+        self.assertEqual((code, out), (0, f"glaeda-seed-serve 1 hit {KEY} tar\n".encode() + raw))
+
+    def test_a_miss_logs_the_wanted_key(self):
+        self.assertEqual(self.ask(f"seed-v1 zstd {KEY} {OTHER}"), (3, b"glaeda-seed-serve 1 miss\n"))
+        log = json.loads((self.run_dir / "serve.jsonl").read_text().splitlines()[-1])
+        self.assertEqual((log["outcome"], log["want"]), ("miss", KEY))
+
+    def test_symlinks_and_other_names_are_not_served(self):
+        target = self.archive.parent / "elsewhere"
+        target.write_bytes(b"secret")
+        (self.archive / (KEY + serve.ARCHIVE_SUFFIX)).symlink_to(target)
+        self.assertEqual(self.ask(f"seed-v1 zstd {KEY}")[0], 3)
+        (self.archive / (OTHER + serve.ARCHIVE_SUFFIX)).mkdir()
+        self.assertEqual(self.ask(f"seed-v1 zstd {OTHER}")[0], 3)
+
+    def test_the_list_names_archived_seeds(self):
+        self.store(KEY)
+        os.utime(self.store(OTHER), (300, 300))
+        (self.archive / ".incoming").write_bytes(b"x")
+        code, out = self.ask("seed-list-v1")
+        self.assertEqual((code, out), (0, f"glaeda-seed-serve 1 list 2\n{OTHER} 300\n{KEY} 100\n".encode()))
+
+    def test_a_host_with_a_runner_receipt_refuses(self):
+        self.store(KEY)
+        self.receipt.write_text(json.dumps({"member": {"trustedRef": "refs/heads/main"}}))
+        code, out = self.ask(f"seed-v1 zstd {KEY}")
+        self.assertEqual(code, 2)
+        self.assertTrue(out.startswith(b"glaeda-seed-serve 1 refused this-host-runs-glaeda-runners"))
+
+    def test_product_verbs_are_refused(self):
+        self.assertEqual(self.ask("product-has-v1 " + "a" * 64)[0], 2)
 
 
 # Stands in for /usr/bin/ssh from the operator Mac: runs the remote command locally with HOME set to that
@@ -328,6 +416,42 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(self.tree(), before)
         self.assertEqual(again["seeder_state"]["changed"], [])
         self.assertTrue(all(h["changed"] == [] and h["authorized"] == "current" for h in again["hosts"].values()))
+
+    def test_the_archive_role_needs_a_host_without_runners(self):
+        archive = self.homes / "cmux-lawrence"
+        (archive / ".ssh").mkdir(parents=True)
+        (archive / ".ssh/authorized_keys").write_text(self.foreign + "\n")
+        argv = ("install", "--seeder", "cmux-lawrence", "--role", "archive", "--user", "cmux-lawrence",
+                "--address", "172.20.21.158", "cmux12s-mac-mini", "--apply")
+        code, report = self.cli(*argv)
+        self.assertEqual(code, 0, report)
+        command = f"/usr/bin/python3 -I {archive}/.local/libexec/glaeda-seed-serve --role archive"
+        lines = (archive / ".ssh/authorized_keys").read_text().splitlines()
+        self.assertEqual(lines[0], self.foreign)
+        self.assertEqual(len(lines), 2)
+        self.assertIn(f'restrict,from="172.20.20.0/22",command="{command}" ', lines[1])
+        self.assertTrue(lines[1].endswith(" glaeda-seed-lan@cmux12s-mac-mini"))
+        config = json.loads((self.homes / "cmux12s-mac-mini/.config/glaeda/seed-lan/config.json").read_text())
+        self.assertEqual((config["seeder"], config["user"]), ("cmux-lawrence", "cmux-lawrence"))
+        self.assertEqual(report["seeder_state"]["role"], "archive")
+        # Re-running is a no-op, and removal finds the archive's lines by their forced command.
+        before = self.tree()
+        self.assertEqual(self.cli(*argv)[0], 0)
+        self.assertEqual(self.tree(), before)
+        code, removed = self.cli("remove", "--seeder", "cmux-lawrence", "--role", "archive", "cmux12s-mac-mini",
+                                 "--apply")
+        self.assertEqual(removed["seeder_state"]["remaining"], [])
+        self.assertEqual((archive / ".ssh/authorized_keys").read_text().splitlines(), [self.foreign])
+        # The trusted seed writers never read from the archive.
+        code, report = self.cli("install", "--seeder", "cmux-lawrence", "--role", "archive", "--user", "cmux-lawrence",
+                                "--address", "172.20.21.158", "cmux12s-mac-mini", "cmux15", "--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("never read from the archive", report["error"])
+        # A host that runs glaeda runners (cmux15 here) can never be the archive.
+        code, report = self.cli("install", "--seeder", "cmux15", "--role", "archive", "--address", "x",
+                                "cmux12s-mac-mini", "--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("the seed archive must run no jobs", report["error"])
 
     def test_a_regenerated_client_key_replaces_its_line(self):
         self.install("cmux12s-mac-mini")
