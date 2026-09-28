@@ -16,11 +16,14 @@ Each run checks, as the runner user and without sudo:
                                      with no "Closing session", "Tearing down" or "Created session" after it, and
                                      every XCTest run here hangs. Healed while no test runs, with the runner hook's
                                      recycle_testmanagerd (glaeda#1281), the same stop a gui job does at its start.
-  tailscale_down                     Tailscale is not Running (Stopped, stuck Starting, no answer). Healed after two
-                                     runs in a row: `tailscale up` when Stopped, else a stop and start of the Tailscale
-                                     VPN service (scutil --nc), as mini-ops tailscale-unstick.sh does by hand. A status
-                                     that does not answer (a loaded mini can time out with the tunnel up), a
-                                     standalone tailscaled (root daemon) or a logged-out node is reported only.
+  tailscale_down                     `tailscale status --json` answered with a BackendState that is not Running
+                                     (Stopped, stuck Starting). Healed after two runs in a row: `tailscale up` when
+                                     Stopped, else a stop and start of the Tailscale VPN service (scutil --nc), as
+                                     mini-ops tailscale-unstick.sh does by hand. A standalone tailscaled (root daemon)
+                                     or a logged-out node is reported only.
+  tailscale_probe_error              the Tailscale CLI gave no BackendState (it timed out, failed or printed no JSON;
+                                     a loaded mini can time out with the tunnel up). The check could not look, so the
+                                     tunnel is not judged down: reported only, never healed.
   runner_stopped:<agent>             a runner LaunchAgent is loaded but not running (KeepAlive leaves it after a clean
                                      exit). Healed after two runs in a row with `launchctl kickstart`; nothing runs
                                      in it, so no job is disturbed. The listener gate's holds keep the agent running,
@@ -66,6 +69,9 @@ RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+)?")
 LOGINWINDOW = Path("/Library/Preferences/com.apple.loginwindow.plist")
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 TAILSCALE_STANDALONE = "/usr/local/bin/tailscale"
+# The app's binary is its CLI only when it sees a terminal or this; from a LaunchAgent it otherwise starts as the GUI
+# and prints "The Tailscale GUI failed to start" instead of the status.
+TAILSCALE_CLI_ENV = {"TAILSCALE_BE_CLI": "1"}
 TESTMANAGERD = "/usr/libexec/testmanagerd"
 SCHEMA = "glaeda-mini-health/v1"
 
@@ -83,11 +89,11 @@ SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created se
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
 
 
-def sh(argv: list[str], timeout: float = 15) -> tuple[int, str]:
+def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) -> tuple[int, str]:
     """(exit code, stdout); 127 when it could not run or timed out."""
     try:
         p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                           timeout=timeout, check=False)
+                           timeout=timeout, check=False, env=env)
     except (OSError, subprocess.SubprocessError):
         return 127, ""
     return p.returncode, p.stdout
@@ -176,19 +182,30 @@ class Mini:
             rows.append((at, str(row.get("eventMessage") or "")))
         return sorted(rows, key=lambda r: r[0])
 
-    def tailscale(self) -> tuple[str, str] | None:
-        """(flavor app|standalone, BackendState or "no answer"), or None without Tailscale."""
-        # the standalone CLI, not the app's "Install CLI" link into Tailscale.app; a dead tailscaled then reads "no answer"
+    def tailscale(self) -> tuple[str, str | None, str] | None:
+        """(flavor app|standalone, BackendState, what the CLI said), or None without Tailscale. BackendState is None
+        when the CLI gave none (timed out, failed, no JSON): a probe error, not a verdict on the tunnel."""
+        # the standalone CLI, not the app's "Install CLI" link into Tailscale.app; else the app's own binary
         standalone = os.path.exists(TAILSCALE_STANDALONE) and "Tailscale.app" not in os.path.realpath(TAILSCALE_STANDALONE)
         cli = TAILSCALE_STANDALONE if standalone else TAILSCALE_APP if os.path.exists(TAILSCALE_APP) else None
         if cli is None:
             return None
-        code, out = sh([cli, "status", "--json"], timeout=15)
+        flavor = "standalone" if standalone else "app"
         try:
-            state = str(json.loads(out).get("BackendState") or "no answer")
+            p = subprocess.run([cli, "status", "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               errors="replace", timeout=15, check=False, env={**os.environ, **TAILSCALE_CLI_ENV})
+        except subprocess.TimeoutExpired:
+            return flavor, None, f"{cli} status --json timed out after 15 s"
+        except (OSError, subprocess.SubprocessError) as e:
+            return flavor, None, f"{cli} status --json could not run: {e}"
+        try:
+            state = json.loads(p.stdout).get("BackendState")
         except (ValueError, AttributeError):
-            state = "no answer"
-        return ("standalone" if standalone else "app"), state
+            state = None
+        if isinstance(state, str) and state:
+            return flavor, state, ""
+        said = " ".join((p.stderr + " " + p.stdout).split())[:160] or "no output"
+        return flavor, None, f"{cli} status --json exited {p.returncode} without a BackendState: {said}"
 
     def vpn_service(self) -> str | None:
         m = re.search(r"([0-9A-F-]{36}).*io\.tailscale\.", sh(["/usr/sbin/scutil", "--nc", "list"])[1])
@@ -216,7 +233,7 @@ class Mini:
         return recycle() if recycle else None
 
     def tailscale_up(self) -> None:
-        sh([TAILSCALE_APP, "up"], timeout=30)
+        sh([TAILSCALE_APP, "up"], timeout=30, env={**os.environ, **TAILSCALE_CLI_ENV})
 
     def restart_vpn(self, service: str) -> None:
         sh(["/usr/sbin/scutil", "--nc", "stop", service])
@@ -285,16 +302,16 @@ def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
     got = mini.tailscale()
     if got is None or got[1] == "Running":
         return []
-    flavor, state = got
+    flavor, state, said = got
+    if state is None:  # the check could not look: never a tailscale_down, a heal or an unstick on a guess
+        return [finding("tailscale_probe_error", "warn", said, "impossible",
+                        "the probe got no BackendState from the Tailscale CLI; the tunnel is not judged down on it")]
     evidence = f"Tailscale BackendState {state}"
     if flavor == "standalone":
         return [finding("tailscale_down", "error", evidence + " (standalone tailscaled)", "impossible",
                         "root: sudo launchctl kickstart -k system/com.tailscale.tailscaled")]
     if state.startswith("Needs"):
         return [finding("tailscale_down", "error", evidence, "impossible", "a person logs the node in")]
-    if state == "no answer":  # a loaded mini can time out while the tunnel is up: never restart it on a guess
-        return [finding("tailscale_down", "warn", evidence, "impossible",
-                        "tailscale status did not answer; mini-ops tailscale-unstick.sh looks closer")]
     return [finding("tailscale_down", "error", evidence, "pending",
                     "tailscale up when Stopped, else a stop and start of the Tailscale VPN service")]
 
@@ -342,7 +359,7 @@ def heal_tailscale(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
         if state == "Running":
             return True, f"{what}: Running"
         mini.sleep(5)
-    return False, f"{what}: still {state}"
+    return False, f"{what}: still {state or 'no BackendState'}"
 
 
 def agent_label(agent: str) -> str:
