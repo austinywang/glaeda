@@ -4207,6 +4207,50 @@ class RunnerTest(unittest.TestCase):
             with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 15)):
                 self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI unlock TimeoutExpired")
 
+    def test_diagnostics_reporter_queues_are_emptied_before_it_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            panics, diagnostics, reports, home = (root / "PanicReporter", root / "DiagnosticsReporter",
+                                                  root / "DiagnosticReports", root / "home")
+            for folder in (panics, diagnostics, reports, home):
+                folder.mkdir()
+            summary = reports / ".contents.panic"
+            summary.write_text("summary")
+            full = reports / "panic-full-2026-09-25.panic"
+            full.write_text("full")
+            victim = home / "keep.txt"
+            victim.write_text("user file")
+            os.symlink(summary, panics / "current.panic")
+            # A planted entry naming a file outside the reports directory: only the entry goes.
+            os.symlink(f"{reports}/.contents.x/../../home/keep.txt", panics / "escape")
+            os.symlink(victim, panics / "other")
+            (diagnostics / "crash").mkdir()
+            (diagnostics / "crash" / "report").write_text("x")
+            os.symlink(home, diagnostics / "linked-dir")
+            calls: list[list[str]] = []
+
+            def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with mock.patch.object(hook.subprocess, "run", side_effect=fake):
+                note = hook.dequeue_diagnostics_reporter((panics, diagnostics, root / "missing"), reports, 501)
+            self.assertEqual(note, "dequeued 5 Diagnostics Reporter entries; closed Diagnostics Reporter")
+            self.assertEqual(list(panics.iterdir()) + list(diagnostics.iterdir()), [])
+            self.assertFalse(summary.exists(), "the unanswered summary goes with its entry")
+            self.assertEqual((full.read_text(), victim.read_text()), ("full", "user file"))
+            self.assertTrue(home.is_dir(), "a symlinked entry is removed, never followed")
+            self.assertEqual(calls, [["/usr/bin/pkill", "-KILL", "-u", "501", "-f",
+                                      "/Diagnostics Reporter.app/Contents/MacOS/"]],
+                             "closed only after the queues are empty")
+            with mock.patch.object(hook.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 1, "", "")):
+                self.assertEqual(hook.dequeue_diagnostics_reporter((panics, diagnostics), reports, 501), "")
+                # Another runner instance removed the entry first: gone, not a failure.
+                (panics / "raced").write_text("x")
+                with mock.patch.object(hook.Path, "unlink", side_effect=FileNotFoundError):
+                    self.assertEqual(hook.dequeue_diagnostics_reporter((panics,), reports, 501), "")
+
     def test_gui_unlock_script_cancels_every_queued_prompt(self) -> None:
         # Shell-function fakes: each kill finds SecurityAgent while a prompt is left.
         def run(unlock_code: int, prompts: int) -> tuple[int, list[str]]:

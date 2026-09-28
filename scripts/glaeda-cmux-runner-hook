@@ -1202,6 +1202,65 @@ def unlock_test_keychain_in_gui(home: Path, uid: int | None = None) -> str:
         return f"test keychain: GUI unlock {type(error).__name__}"
 
 
+# Diagnostics Reporter's LaunchAgent watches these QueueDirectories: launchd starts it while either holds an entry,
+# and an entry stays until someone answers the dialog it draws ("Your computer was restarted because of a problem"
+# after a kernel panic, "<app> cannot be opened because of a problem" after a crashed launch). On a PR mini nobody
+# answers: a panic queued on 2026-09-25 put that dialog over UI tests for two days, and the cmux e2e action's kill
+# only made launchd start it again with the same dialog. The directories are world-writable (not sticky).
+DIAGNOSTICS_QUEUES = (Path("/var/db/PanicReporter"), Path("/var/db/DiagnosticsReporter"))
+# A queued panic is a symlink to the unanswered summary the dialog shows, a `.contents.*` file here. The full
+# reports (panic-full-*.panic, crash reports) are never touched.
+DIAGNOSTIC_REPORTS = Path("/Library/Logs/DiagnosticReports")
+
+
+def dequeue_diagnostics_reporter(queues: tuple[Path, ...] = DIAGNOSTICS_QUEUES,
+                                 reports: Path = DIAGNOSTIC_REPORTS, uid: int | None = None) -> str:
+    """Empty Diagnostics Reporter's queues, then close it, so no crash or panic dialog is left over a job's GUI.
+
+    Emptied first: closing it alone lets launchd start it again for the same entry. A symlink entry is removed,
+    never followed; the summary it names is removed too only when it is a `.contents.*` file directly in
+    `reports`. Best effort: any failure leaves the dialog, never fails the job. Returns "" when nothing was queued
+    and nothing was closed."""
+    uid = os.getuid() if uid is None else uid
+    dequeued = failed = 0
+    for queue in queues:
+        try:
+            entries = list(os.scandir(queue))
+        except OSError:
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                target = os.readlink(path) if entry.is_symlink() else ""
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                dequeued += 1
+            except FileNotFoundError:
+                continue  # another runner instance starting a job at once removed it first
+            except OSError:
+                failed += 1
+                continue
+            summary = Path(target) if target else None
+            if summary is not None and summary.is_absolute() and ".." not in summary.parts \
+                    and summary.parent == reports and summary.name.startswith(".contents."):
+                with contextlib.suppress(OSError):
+                    summary.unlink()
+    closed = False
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        # Its name is longer than the 16 bytes pkill -x compares, so match the executable path.
+        closed = subprocess.run(["/usr/bin/pkill", "-KILL", "-u", str(uid), "-f",
+                                 "/Diagnostics Reporter.app/Contents/MacOS/"],
+                                capture_output=True, timeout=15).returncode == 0
+    parts = [f"dequeued {dequeued} Diagnostics Reporter entr{'y' if dequeued == 1 else 'ies'}"] if dequeued else []
+    if failed:
+        parts.append(f"could not dequeue {failed}")
+    if closed:
+        parts.append("closed Diagnostics Reporter")
+    return "; ".join(parts)
+
+
 def ensure_root_shim(bin_dir: Path) -> None:
     """Point FLEET_DIR/bin/glaeda-canonical-root at this hook's shim (the path cmux's restore step calls).
     Best effort and atomic: a symlink written aside and renamed over the old one."""
@@ -3601,6 +3660,12 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(testmanagerd)
             note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+        if sys.platform == "darwin":
+            dialogs = ""
+            with contextlib.suppress(Exception):  # must not fail an admitted job
+                dialogs = dequeue_diagnostics_reporter()
+            if dialogs:
+                print(f"{PREFIX}: {dialogs}", flush=True)
         if args.test_keychain:
             print(f"{PREFIX}: {ensure_test_keychain(Path.home())}", flush=True)
             print(f"{PREFIX}: {unlock_test_keychain_in_gui(Path.home())}", flush=True)
