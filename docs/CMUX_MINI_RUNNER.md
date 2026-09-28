@@ -128,11 +128,20 @@ What `--apply` does:
      run shares the user's testmanagerd with the GUI jobs, see 2h2),
      `swift-package-tests` and the side lanes `cli-pipe-regressions`,
      `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
-     as a compile. When units or a token are taken it retries for `--gui-wait` (240 s,
-     inside cmux's 360 s refusal window), then refuses with `refused: capacity: ...`,
-     which the refusal rescue re-runs on Blacksmith once the run ends. The listener gate
-     let the runner listen, so the mini had room a moment earlier and the wait usually
-     outlasts the job that took it. Because `flock` gives no preference to the exclusive waiter, it also
+     as a compile. When units or a token are taken a cmux job waits for them, with no
+     time limit, and never fails for capacity: GitHub has already handed the job to this
+     runner and cannot move it. Every 2 s it tries again; it logs what it waits for and who
+     holds it (`waiting (N s so far): all 2 canonical root tokens are taken (...); held by
+     root-1: RUNNER JOB (run N); ...`) when that changes and every minute. It leaves a
+     marker, `capacity/admit.want-<pid>` (the token kinds, or `units`, it lacks, since
+     when, and who it is), so a later admission that needs one of those kinds waits
+     behind it instead of taking a token the moment it frees, and the listener gate holds
+     the runners whose next job would compete for them (see below). A job that waits too
+     long in its runner's setup is cmux's owned-pool rescue's to move to Blacksmith, as a
+     job queued too long is. Before 2026-09-28 it refused after 240 s: cmux PR #15160's
+     compile admission was refused on cmux10s while two E2E builds on the mini's non-root
+     runners held both canonical roots, and a newer compile took the root that freed
+     during its wait. `--gui-wait N` caps the wait (then it refuses), for tests. Because `flock` gives no preference to the exclusive waiter, it also
      takes nothing while another process (the build worker in `with-host-lock`) is waiting
      for `host.lock`: it retries through the same wait, so the worker gets the host as soon
      as the running PR jobs end.
@@ -216,12 +225,15 @@ What `--apply` does:
        running compile and a light job took the next compile and refused it (90 of about
        400 refusals on 2026-09-25). The gui token is no reason to stop: a compile needs
        none, and holding for it kept second roots idle while roots were the bottleneck.
-       An app-host shard that meets a taken gui token waits up to 240 s for it
-       (`--gui-wait`, inside cmux's 360 s refusal window) instead of refusing.
+       An app-host shard that meets a taken gui token waits for it instead of refusing.
        (cmuxterm-hq#661, Workstream 7.) A side runner listens with one unit free, so
        a 2-unit side lane (cmux's release-build, reload-build, cmux-tui) that finds
-       fewer units than it needs waits for them the same 240 s instead of refusing,
-       as does a root runner that lost a race for its units.
+       fewer units than it needs waits for them instead of refusing, as does a root
+       runner that lost a race for its units.
+     - Every runner stops while a job already admitted to this mini waits for units
+       (`admit.want-<pid>`), a root runner also while one waits for a canonical root or
+       persistent-dd, and a gui runner while one waits for the gui token or a root. That
+       job goes first, so a job taken now would only queue behind it.
      - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
@@ -537,8 +549,8 @@ and disk rules. Job ids in the hook's table are cmux's (`--home-repo`, default `
 guest repository's job never takes a canonical root or the persistent-DerivedData token, whatever its
 id. It costs 2 units (isolated), or 1 unit when its id ends in `-light`, or 2 units plus the one
 simulator token when its id ends in `-sim` or `simulator`. A repository the hook cannot identify is a
-guest. cmux jobs are refused at once when a mini is full (its rescue workflow reroutes them); a guest
-has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Guests share
+guest. cmux jobs wait for room with no time limit (its rescue workflow moves one that waits too long); a
+guest has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Guests share
 the runner user's `$HOME` and `/Users/Shared/cmux-build-fleet`, so the trust boundary is anyone who
 can push a branch to any repository in the group (outside collaborators and bots such as Dependabot
 included), and these hosts hold no secrets.
@@ -672,7 +684,7 @@ Hook classes:
   `.build`, no canonical root).
 - `ios-simulator` and `screenshots` are `simulator` (2 units plus the per-mini `simulator` token: they
   reuse, erase and boot named devices in the user's one CoreSimulator service). A job refused only for
-  that token waits `--gui-wait` (240 s) for it at job start, as a gui-token refusal does.
+  that token waits for it at job start, as any capacity wait does.
 - `validate` (ios-streamed-validate) stays on Blacksmith. It binds fixed ports, restarts a local Postgres
   under /tmp, changes the GUI session (open, launchctl setenv, system dark mode) and writes credentials
   to `$HOME`.

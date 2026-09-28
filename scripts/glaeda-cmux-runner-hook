@@ -40,8 +40,8 @@ Otherwise it takes that lock for the job: a small detached holder keeps it until
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
 With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2d) it takes a weighted
 share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity). When
-they are taken it retries for --gui-wait seconds (--guest-wait for another repository's job, CAPACITY_WAIT), then
-refuses with "refused: capacity: ...".
+they are taken a cmux job waits for them, with no time limit, and logs what it waits for and who holds it
+(CAPACITY_WAIT); another repository's job waits --guest-wait seconds and then refuses with "refused: capacity: ...".
 Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
 
 An admitted job also gets a detached host sampler (unless --no-telemetry): it records load, the cores used by
@@ -184,10 +184,10 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # leaves the console session to other GUI jobs (a shard held the token for its whole job at about 0.13 cores,
 # cmux CI 2026-09-26). It takes the token before the producer's root, the order gui jobs take them in, so it
 # never holds a root while it waits for the token. A one-root mini gives it gui and the root at job start, as
-# for gui, so a shard there still waits GUI_WAIT_S for a sibling's token and take-gui is a no-op. A cmux
+# for gui, so a shard there still waits for a sibling's token (CAPACITY_WAIT) and take-gui is a no-op. A cmux
 # revision without the take-gui step would run its tests without the token, so this class ships after that
 # step (cmux#15012). test-e2e's `test` job is gui-step too (cmux#15037): it runs only when the build's take-gui
-# could not get the token, so asking for it again at job start waited GUI_WAIT_S and was refused.
+# could not get the token, so taking it again at job start would wait for it a second time.
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
@@ -199,27 +199,24 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 
 
 GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
-GUEST_POLL_S = 5.0
-# A cmux GUI job (app-host shard, tests-build-and-lag, test-e2e's test) refused only because another
-# GUI job holds this mini's one gui token waits this long for it instead. Two root runners share one gui token,
-# so a full suite's shards often meet on a mini, and a GUI job there runs about 90 s, while a refusal's rescue
-# round trip took 71 s to 18 min (median 126 s, 16 refusals, cmux PR CI 2026-09-25 07:00-09:00Z) and sent the
-# re-run shards to Blacksmith. test-e2e's build takes the token only for its tests (take-gui), so it holds it
-# about as long as a shard does.
-# It must fit inside cmux's owned_pool_rescue.REFUSAL_SECONDS (360 since cmux#14758, 120 before) with room to
-# spare: a job that fails later than that after starting no longer counts as refused, so the rescue would not
-# re-run it. Around the wait go about 5 s of runner setup before the hook, the last try (normally under a second,
-# but up to tens of seconds on a loaded mini: admission.lock, lsof and ps timeouts) and 5 to 10 s of steps after
-# a refusal. 240 s covers a sibling shard's gui hold (about 90 s, up to about 4 min on a loaded mini), so the
-# listener gate need not hold a root runner off for the gui token (hq#661 Workstream 7).
-GUI_WAIT_S = 240.0
-# CAPACITY_WAIT: every capacity refusal of a cmux job waits the same GUI_WAIT_S (--gui-wait) before it refuses,
-# not only the gui token's. That covers units, the simulator token (an iOS job holds it about 2 to 5 min), root
-# and persistent-dd tokens and a fleet build on the host lock. The listener gate let this runner listen, so the
-# mini had room a moment ago and another runner's job took it first, a race the gate cannot close. cmux's rescue
-# re-runs a refused job only after its whole run ends (cmux#14766), on Blacksmith (cmux#15035), so refusing fast
-# gains nothing, and the wait usually outlasts the other job's hold. Units, token and host-lock refusals were
-# 40 of the fleet's 151 refusals in the 24 h to 2026-09-27 18:00Z, besides 35 gui-token ones already waited for.
+# CAPACITY_WAIT: a cmux job that finds its units or tokens taken waits for them, with no time limit, instead of
+# failing. GitHub handed the job to this runner and never moves it to another one, so a refusal only turned a
+# capacity problem into a red job and a rescue round trip (cmux PR #15160's compile admission, 2026-09-28: refused
+# after 240 s on cmux10s while two E2E builds on the mini's non-root runners held both canonical roots). A job
+# waiting here is still in its runner's setup, and cmux's owned-pool rescue re-runs a job that waits there too
+# long on Blacksmith, as it does a job queued too long. --gui-wait N caps the wait (then it refuses), for tests.
+# The waiter polls every ADMIT_POLL_S and logs what it waits for, and who holds it, when that changes and every
+# ADMIT_NOTE_S. It leaves a marker, capacity/admit.want-<pid> (ADMIT_WANT: the token kinds it needs, since when,
+# and who it is), rewritten every poll: a later admission that needs one of those kinds waits behind it instead
+# of taking a token the moment it frees (fair_turn), and the listener gate holds this mini's runners whose next
+# job would compete for them (mini_full), so GitHub keeps such jobs queued for other minis.
+ADMIT_POLL_S = 2.0
+ADMIT_NOTE_S = 60.0
+ADMIT_WANT = "admit.want-"
+# A waiter rewrites its marker after every try, and one try can take a minute on a loaded mini (admission.lock,
+# a preempted fleet build, lsof and ps timeouts), so a marker counts until it is this old or its pid is gone.
+ADMIT_FRESH_S = 180.0
+HOLDERS_BUDGET_S = 10.0  # token_holders stops looking after this long: the log line is not worth more
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -1849,15 +1846,114 @@ def holder_pids(state_dir: Path) -> set[int]:
     return pids
 
 
+def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, Any]]:
+    """The live jobs waiting for capacity on this mini (CAPACITY_WAIT), oldest first: pid, since (Unix seconds),
+    wants (token kinds, and "units" while it lacks units) and who. A marker older than ADMIT_FRESH_S, or whose
+    waiter is gone, is removed. Markers are written by jobs on this mini, so they are read as untrusted."""
+    waiters: list[dict[str, Any]] = []
+    for marker in capacity_dir.glob(f"{ADMIT_WANT}*"):
+        if marker.name.endswith(".tmp"):
+            continue
+        try:
+            pid = int(marker.name[len(ADMIT_WANT):])
+            fresh = time.time() - marker.stat().st_mtime < ADMIT_FRESH_S
+        except (OSError, ValueError):
+            continue
+        if pid == skip_pid:
+            continue
+        if not fresh or not pid_alive(pid):
+            with contextlib.suppress(OSError):
+                marker.unlink()  # a waiter that was killed
+            continue
+        try:
+            data = json.loads(read_bounded(marker) or b"")
+            since = float(data["since"])
+            wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            continue
+        waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200]})
+    return sorted(waiters, key=lambda waiter: (waiter["since"], waiter["pid"]))
+
+
+def fair_turn(capacity_dir: Path, needs: set[str], since: float) -> str | None:
+    """Why an admission needing these kinds (tokens and "units") must wait behind an older waiter, or None."""
+    for waiter in admission_waiters(capacity_dir, os.getpid()):
+        if (waiter["since"], waiter["pid"]) >= (since, os.getpid()):
+            break
+        shared = needs & set(waiter["wants"])
+        if shared:
+            return (f"capacity: {waiter['who'] or 'pid ' + str(waiter['pid'])} has waited longer here for "
+                    f"{', '.join(sorted(shared))}")
+    return None
+
+
+def job_who() -> str:
+    """This job as a waiter marker and the log name it: runner, job id and run."""
+    return " ".join(filter(None, (os.environ.get("RUNNER_NAME"), os.environ.get("GITHUB_JOB") or "a job",
+                                  f"(run {os.environ['GITHUB_RUN_ID']})" if os.environ.get("GITHUB_RUN_ID") else "")))
+
+
+def write_want(marker: Path, since: float, wants: list[str]) -> None:
+    with contextlib.suppress(OSError):
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text(json.dumps({"since": since, "wants": wants, "who": job_who()}) + "\n")
+        tmp.replace(marker)
+
+
+TOKEN_ENV = re.compile(r"(?:^|\s)(RUNNER_NAME|GITHUB_JOB|GITHUB_RUN_ID)=(\S+)")
+
+
+def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, roots: int) -> str:
+    """Who holds the tokens of these kinds, for a waiting job's log line: "root-1: RUNNER JOB (run N)" per taken
+    token, from lsof and the holder's environment (ps -E, this user's own processes); "" when nothing is known."""
+    names: list[str] = []
+    for kind in wants:
+        if kind == "root":
+            names += [f"root-{k}" for k in range(1, max(1, roots) + 1)]
+        elif kind == "persistent-dd":
+            names += ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, max(1, compile_slots))]
+        elif kind in ("gui", "simulator"):
+            names.append(kind)
+    notes = []
+    deadline = time.monotonic() + HOLDERS_BUDGET_S
+    for name in names:
+        path = capacity_dir / f"{name}.token"
+        if time.monotonic() >= deadline:
+            break
+        if probe(path):
+            continue
+        try:
+            pids = subprocess.run([LSOF, "-t", "--", str(path)], stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=5, check=False).stdout.split()
+            listing = subprocess.run(["/bin/ps", "-E", "-ww", "-o", "command=", "-p", ",".join(pids)],
+                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                                     timeout=5, check=False).stdout if pids else ""
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in listing.splitlines()[:1]:
+            env = dict(TOKEN_ENV.findall(line))
+            if "GITHUB_JOB" in env:
+                who = f"{env.get('RUNNER_NAME', '?')} {env['GITHUB_JOB']}" + (
+                    f" (run {env['GITHUB_RUN_ID']})" if "GITHUB_RUN_ID" in env else "")
+            else:
+                who = "an idle warm build" if is_idle_warm(line) else os.path.basename(line.split(None, 1)[0])
+            notes.append(f"{name}: {who}")
+    return "; ".join(notes)
+
+
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
-                  one_holder: bool = False) -> tuple[bool, str]:
+                  one_holder: bool = False, since: float | None = None) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
-    When held, taken_out (if given) receives the units and tokens taken, for the job log. klass, when given,
+    When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
+    receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
+    every token kind its class takes. since is when this job began to wait (a
+    waiter's own tries): it goes ahead of any admission that began later and behind any that began earlier and
+    needs a kind it needs (fair_turn); None is a newcomer. klass, when given,
     is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id. one_holder
     refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
@@ -1891,6 +1987,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 time.sleep(0.1)
         if one_holder and holder_alive(holder_file(state_dir)):
             return False, f"{job or 'this job'} is already admitted"
+        if taken_out is not None:
+            taken_out["wants"] = list(tokens)
+        behind = fair_turn(capacity_dir, {*tokens, "units"}, time.time() if since is None else since)
+        if behind:
+            return False, behind
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if "gui" in tokens:  # this job will drive the console session: the idle fuzzer's app must be gone first
             yielded += yield_idle_fuzz(capacity_dir)
@@ -1959,6 +2060,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             else:
                 what = "canonical root" if token == "root" else token
                 held = f"all {copies} {what} tokens are taken" if copies > 1 else f"the {what} token is taken"
+                if taken_out is not None:
+                    taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         got = 0
         for slot in range(total):
@@ -1969,6 +2072,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 fds.append(fd)
                 got += 1
         if got < units:
+            if taken_out is not None:
+                taken_out["wants"] = ["units"]
             return False, (f"capacity: {got} of {total} units free, {job or 'an unknown job'} ({klass}) needs {units}")
         root = next((name for name in taken if name.startswith("root-")), None)
         split = named[root] if root and klass in ROOT_SWITCHERS else None
@@ -2141,7 +2246,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
     build waits for it (host_waiters, which admission refuses for too, so a worker never leases a step it
     would hand back), and under
     admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
-    free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job)."""
+    free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job), and
+    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first)."""
     if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
         return []
     try:
@@ -2165,10 +2271,11 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
             return name in yielding or probe(capacity_dir / name)
 
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
+        waited = {kind for waiter in admission_waiters(capacity_dir) for kind in waiter["wants"]}
         fits = []
         for klass in STEP_CLASSES:
             need, tokens = CLASS_COST[klass]
-            if units < min(need, total):
+            if units < min(need, total) or waited & {*tokens, "units"}:  # a waiting job goes first (fair_turn)
                 continue
             copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots)}
             if all(any(free((f"root-{c + 1}" if token == "root" else token if c == 0 else f"{token}-{c}")
@@ -2310,13 +2417,18 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     in GitHub's queue for this one (hq#661 Workstream 7). The gui token is not a reason to hold: a compile
     needs none, and holding the root runner for it kept a mini's second root idle while roots were the fleet's
     bottleneck (09-25 22:30Z: 18 of 18 roots busy, 5 held off). A shard that meets a taken gui token waits for
-    it (GUI_WAIT_S) instead of refusing.
+    it (CAPACITY_WAIT) instead of refusing.
 
     With the scope of a gui runner (scope.gui, the gui pool label: app-host shards, tests-build-and-lag,
     app-host-test-rerun), full also means the gui token is taken (test-e2e's take-gui, or a GUI job that reached a
     root runner) or every canonical root is: a GUI job takes the producer's root in its restore step and would
     wait there holding the gui token. Held off, GitHub hands the job to another mini's gui runner. Only this
-    runner carries the label, so holding it never keeps a compile off the mini."""
+    runner carries the label, so holding it never keeps a compile off the mini.
+
+    Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
+    for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
+    runner: the gui token or a root). That job goes first, so a job this runner took now would only queue
+    behind it here, while GitHub could hand it to a mini with room."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -2349,6 +2461,13 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         if free < need:
             return (f"only {free} of {total} capacity units on this mini are free; "
                     f"{'a compile' if root else 'its next job'} needs {need}")
+        # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
+        compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
+            {"gui", "root"} if scope is not None and scope.gui else set())
+        for waiter in admission_waiters(capacity_dir):
+            shared = compete & set(waiter["wants"])
+            if shared:
+                return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
         if scope is not None and scope.gui:
             if not probe(capacity_dir / "gui.token"):
                 return "the gui token is taken"
@@ -3581,8 +3700,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="the repository whose job ids JOB_CLASSES names; other repos are guests (see job_class)")
     p.add_argument("--guest-wait", type=float, default=GUEST_WAIT_S,
                    help="seconds a guest job waits for room on a full mini before it is refused")
-    p.add_argument("--gui-wait", type=float, default=GUI_WAIT_S,
-                   help="seconds a home-repository job refused only for the gui or simulator token waits for it")
+    p.add_argument("--gui-wait", type=float, default=None,
+                   help="cap, in seconds, on a home-repository job's wait for capacity (default: no cap)")
     p.add_argument("--allow-event", action="append", default=[],
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--trusted-ref", help="admit only push and schedule jobs on this ref (needs --trusted-repo)")
@@ -3718,25 +3837,41 @@ def main(argv: list[str] | None = None) -> int:
             roots_file(args.state_dir).unlink(missing_ok=True)  # a crashed job's record must not look held
             gui_file(args.state_dir).unlink(missing_ok=True)
             ensure_root_shim(Path(FLEET_DIR) / "bin")
-            guest = is_guest(repo, args.home_repo)
-            start = time.monotonic()
-            while True:
-                held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
-                                           os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
-                                           args.state_dir, args.compile_slots, args.canonical_roots,
-                                           repo, args.home_repo, instance=args.instance,
-                                           workflow=job_workflow(),
-                                           warm_keys=job_warm_keys(event), taken_out=taken,
-                                           warm_target=job_warm_target(event))
-                # A guest has no rescue workflow, so it waits GUEST_WAIT_S for room. A cmux job waits GUI_WAIT_S
-                # for any capacity refusal (CAPACITY_WAIT).
-                if held or not note.startswith("capacity:"):
-                    break
-                wait = args.guest_wait if guest else args.gui_wait
-                left = start + wait - time.monotonic()
-                if left <= 0:
-                    break
-                time.sleep(min(GUEST_POLL_S, left))  # never start a try after the deadline
+            # A cmux job waits for capacity with no limit (CAPACITY_WAIT); a guest has no rescue workflow, so it
+            # waits GUEST_WAIT_S for room and is then refused.
+            cap = args.guest_wait if is_guest(repo, args.home_repo) else args.gui_wait
+            start, since = time.monotonic(), time.time()
+            marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
+            shown, shown_at = "", 0.0
+            try:
+                while True:
+                    held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
+                                               os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
+                                               args.state_dir, args.compile_slots, args.canonical_roots,
+                                               repo, args.home_repo, instance=args.instance,
+                                               workflow=job_workflow(),
+                                               warm_keys=job_warm_keys(event), taken_out=taken,
+                                               warm_target=job_warm_target(event), since=since)
+                    if held or not note.startswith("capacity:"):
+                        break
+                    waited = time.monotonic() - start
+                    left = math.inf if cap is None else cap - waited
+                    if left <= 0:
+                        break
+                    wants = list(taken.get("wants") or [])
+                    write_want(marker, since, wants)
+                    if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
+                        holders = ""
+                        with contextlib.suppress(Exception):  # naming holders must never fail the wait
+                            holders = token_holders(args.capacity_dir, wants, args.compile_slots,
+                                                    args.canonical_roots)
+                        print(f"{PREFIX}: waiting ({waited:.0f} s so far): {note.removeprefix('capacity: ')}"
+                              + (f"; held by {holders}" if holders else ""), flush=True)
+                        shown, shown_at = note, time.monotonic()
+                    time.sleep(min(ADMIT_POLL_S, left))  # never start a try after the deadline
+            finally:
+                with contextlib.suppress(OSError):
+                    marker.unlink()
         else:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)

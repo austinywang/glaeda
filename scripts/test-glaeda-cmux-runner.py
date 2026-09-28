@@ -369,8 +369,8 @@ class HookTest(unittest.TestCase):
 
     def started(self, *extra: str, watch: int | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         push = event(self.dir, "push", {"repository": CMUX})
-        # --gui-wait 0 unless a test passes its own (the last one wins): every cmux capacity refusal waits
-        # GUI_WAIT_S by default, which the tests of refusals themselves must not sit through
+        # --gui-wait 0 unless a test passes its own (the last one wins): a cmux job waits for capacity with no
+        # limit by default (CAPACITY_WAIT), which the tests of refusals themselves must not sit through
         args = ["--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
                 "--watch-pid", str(watch or os.getpid()), "--gui-wait", "0", *extra]
         return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=env)
@@ -1801,6 +1801,87 @@ time.sleep(60)
             for runner in ("w0", "w1", "w2", "w3", "w4", "w5"):
                 self.finish(runner)
 
+    def test_capacity_a_cmux_job_waits_for_a_root_with_no_limit_and_in_turn(self) -> None:
+        # cmux PR #15160 (2026-09-28): a compile handed to a root runner while both roots were held was refused
+        # after 240 s, and a newer compile took the root that freed meanwhile. It now waits, with no limit, says
+        # for what and who holds it, and a later compile waits behind it.
+        self.fleet()
+        capacity = self.dir / "capacity"
+        slots = ("--compile-slots", "2", "--canonical-roots", "2")
+        root = hook.RunnerScope(units=8, compile_slots=2, roots=2, root=True)
+        side = hook.RunnerScope(units=8, compile_slots=2, roots=2, root=False)
+        waiter = None
+        try:
+            for n in range(2):
+                held = self.job("macos-compile-admission", f"h{n}", 8, None, *slots, "--instance", str(n),
+                                env={"GITHUB_RUN_ID": f"10{n}"})
+                self.assertEqual(held.returncode, 0, held.stdout + held.stderr)
+            push = event(self.dir, "push", {"repository": CMUX})
+            environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                       "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                       "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                       "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "macos-compile-admission",
+                       "RUNNER_NAME": "w0", "GITHUB_RUN_ID": "200"}
+            # no --gui-wait: the default has no limit
+            waiter = subprocess.Popen([sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo",
+                                       "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                                       "--watch-pid", str(os.getpid()), "--capacity-units", "8", "--capacity-dir",
+                                       os.fspath(capacity), *slots, "--instance", "1"],
+                                      env=environ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            deadline = time.monotonic() + 20
+            while not list(capacity.glob("admit.want-*")) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertTrue(list(capacity.glob("admit.want-*")), "the waiter leaves its marker")
+            self.assertIsNone(waiter.poll(), "it waits instead of refusing")
+            # the root runners stop listening while it waits for a root; a side runner's light job still fits
+            self.assertEqual(hook.mini_full(capacity, 8, root),
+                             "w0 macos-compile-admission (run 200) waits here for persistent-dd")
+            self.assertIsNone(hook.mini_full(capacity, 8, side))
+            # a newer compile waits behind the older waiter (--gui-wait 0 refuses at once), a light job does not
+            late = self.job("macos-compile-admission", "n0", 8, None, *slots, "--instance", "0")
+            self.assertEqual(late.returncode, 1, late.stdout)
+            self.assertIn("w0 macos-compile-admission (run 200) has waited longer here for persistent-dd",
+                          late.stdout)
+            self.assertEqual(self.job("swift-package-tests", "l0", 8).returncode, 0, "a light job needs no root")
+            self.finish("h0")
+            out, _ = waiter.communicate(timeout=30)
+            self.assertEqual(waiter.returncode, 0, out)
+            self.assertRegex(out, r"waiting \(\d+ s so far\): all 2 persistent-dd tokens are taken "
+                                  r"\(macos-compile-admission is compile\)")
+            if sys.platform == "darwin":  # the holders come from lsof and ps -E, macOS here
+                self.assertIn("held by persistent-dd: h0 macos-compile-admission (run 100); "
+                              "persistent-dd-1: h1 macos-compile-admission (run 101)", out)
+            self.assertIn("admitted:", out)
+            self.assertIn("persistent-dd+root-1", out)
+            self.assertEqual(list(capacity.glob("admit.want-*")), [], "the marker goes with the wait")
+            self.assertIsNone(hook.mini_full(capacity, 8, side))
+        finally:
+            if waiter is not None and waiter.poll() is None:
+                waiter.kill()
+                waiter.communicate()
+            for runner in ("h0", "h1", "w0", "n0", "l0"):
+                self.finish(runner)
+
+    def test_capacity_waiter_markers_are_ordered_and_expire(self) -> None:
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        now = time.time()
+        for pid, since, wants in ((os.getppid(), now - 5, ["root"]), (1, now - 9, ["units"])):
+            (capacity / f"admit.want-{pid}").write_text(json.dumps({"since": since, "wants": wants, "who": str(pid)}))
+        (capacity / "admit.want-999999").write_text(json.dumps({"since": now - 20, "wants": ["root"]}))
+        stale = capacity / f"admit.want-{os.getpid() + 0}"
+        stale.write_text(json.dumps({"since": now - 30, "wants": ["root"]}))
+        old = now - hook.ADMIT_FRESH_S - 5
+        os.utime(stale, (old, old))
+        (capacity / "admit.want-junk").write_text("{}")
+        waiters = hook.admission_waiters(capacity)
+        self.assertEqual([w["who"] for w in waiters], ["1", str(os.getppid())], "oldest first, live and fresh only")
+        self.assertFalse((capacity / "admit.want-999999").exists(), "a dead waiter's marker is removed")
+        self.assertFalse(stale.exists(), "a stale marker is removed")
+        self.assertIn("has waited longer here for units", hook.fair_turn(capacity, {"units"}, now))
+        self.assertIsNone(hook.fair_turn(capacity, {"simulator"}, now), "no shared kind: no turn to wait for")
+        self.assertIsNone(hook.fair_turn(capacity, {"root", "units"}, now - 60), "an older admission goes first")
+
     def test_capacity_runners_wait_for_units(self) -> None:
         # a 2-unit side lane waits for units instead of refusing, on a side runner (instance past
         # --canonical-roots) and on a root runner alike
@@ -2470,6 +2551,21 @@ else:
         result = self.eligible_start()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.done()
+
+    def test_eligible_node_is_admitted_to_capacity(self) -> None:
+        # every fleet member passes --require-eligible and --capacity-units together; the capacity wait's marker
+        # once shadowed the eligibility want and crashed toolchain_refusal after admission
+        self.fleet()
+        self.node()
+        result = self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode",
+                              "/Applications/Xcode_26.6.app", "--capacity-units", "4", "--capacity-dir",
+                              os.fspath(self.dir / "capacity"),
+                              env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin", "GITHUB_JOB": "swift-package-tests",
+                                   "RUNNER_NAME": "e0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("admitted:", result.stdout)
+        self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                      env={"RUNNER_NAME": "e0"})
 
     def test_ineligible_nodes_refuse(self) -> None:
         self.fleet()
