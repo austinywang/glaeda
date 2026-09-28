@@ -129,8 +129,8 @@ pub struct CacheInventoryDocument {
 
 #[cfg(target_os = "linux")]
 impl CacheInventoryDocument {
-    pub(crate) fn from_unknown_hot_run_states(
-        states: Vec<(CacheStateId, u64, u64)>,
+    pub(crate) fn from_observed_hot_run_states(
+        states: Vec<(CacheStateId, u64, u64, Option<bool>)>,
     ) -> Result<Self, CacheInventoryError> {
         if states.len() > MAX_CACHE_INVENTORY_STATES {
             return Err(error(
@@ -140,7 +140,7 @@ impl CacheInventoryDocument {
         }
         let mut identities = BTreeSet::new();
         let mut observations = Vec::with_capacity(states.len());
-        for (state_id, logical_bytes, allocated_bytes) in states {
+        for (state_id, logical_bytes, allocated_bytes, active_lock) in states {
             if !identities.insert(state_id.clone()) {
                 return Err(error(
                     CacheInventoryErrorKind::DuplicateState,
@@ -156,7 +156,7 @@ impl CacheInventoryDocument {
                 logical_bytes,
                 allocated_bytes,
                 active_lease: None,
-                active_lock: None,
+                active_lock,
                 mounted: None,
                 open_file_count: None,
                 live_owned_process_count: None,
@@ -634,11 +634,16 @@ fn classify_state(state: &CacheStateObservation) -> CacheStateReport {
         &mut unknown_reasons,
     );
 
+    let active_reasons = known_active_reasons(state);
     let (classification, reasons) = if state.quarantined == Some(true) {
         (
             CacheStateClassification::Quarantined,
             vec![CacheStateReason::Quarantined],
         )
+    } else if !active_reasons.is_empty() {
+        let mut reasons = active_reasons;
+        reasons.extend(unknown_reasons);
+        (CacheStateClassification::InUse, reasons)
     } else if !unknown_reasons.is_empty() {
         (CacheStateClassification::Unknown, unknown_reasons)
     } else {
@@ -667,28 +672,7 @@ fn collect_unknown_bool(
 fn classify_complete_state(
     state: &CacheStateObservation,
 ) -> (CacheStateClassification, Vec<CacheStateReason>) {
-    let mut active = Vec::new();
-    if state.active_lease == Some(true) {
-        active.push(CacheStateReason::ActiveLease);
-    }
-    if state.active_lock == Some(true) {
-        active.push(CacheStateReason::ActiveLock);
-    }
-    if state.mounted == Some(true) {
-        active.push(CacheStateReason::Mounted);
-    }
-    if state.open_file_count.is_some_and(|count| count > 0) {
-        active.push(CacheStateReason::OpenFiles);
-    }
-    if state
-        .live_owned_process_count
-        .is_some_and(|count| count > 0)
-    {
-        active.push(CacheStateReason::LiveOwnedProcesses);
-    }
-    if !active.is_empty() {
-        return (CacheStateClassification::InUse, active);
-    }
+    debug_assert!(known_active_reasons(state).is_empty());
 
     let mut warm = Vec::new();
     if state.generation == GenerationObservation::Current {
@@ -730,6 +714,29 @@ fn classify_complete_state(
     } else {
         (CacheStateClassification::Unknown, Vec::new())
     }
+}
+
+fn known_active_reasons(state: &CacheStateObservation) -> Vec<CacheStateReason> {
+    let mut active = Vec::new();
+    if state.active_lease == Some(true) {
+        active.push(CacheStateReason::ActiveLease);
+    }
+    if state.active_lock == Some(true) {
+        active.push(CacheStateReason::ActiveLock);
+    }
+    if state.mounted == Some(true) {
+        active.push(CacheStateReason::Mounted);
+    }
+    if state.open_file_count.is_some_and(|count| count > 0) {
+        active.push(CacheStateReason::OpenFiles);
+    }
+    if state
+        .live_owned_process_count
+        .is_some_and(|count| count > 0)
+    {
+        active.push(CacheStateReason::LiveOwnedProcesses);
+    }
+    active
 }
 
 fn summarize(states: &[CacheStateReport]) -> Result<CacheInventorySummary, CacheInventoryError> {
@@ -946,6 +953,48 @@ mod tests {
         assert_eq!(
             report.states()[0].reasons(),
             &[CacheStateReason::ActiveLeaseUnknown]
+        );
+    }
+
+    #[test]
+    fn definitely_active_evidence_dominates_unrelated_unknowns() {
+        let active = state(
+            "state-one",
+            &[
+                ("ownership", json!("unknown")),
+                ("generation", json!("unknown")),
+                ("worktree", json!("unknown")),
+                ("reconstruction", json!("unknown")),
+                ("active_lease", Value::Null),
+                ("active_lock", json!(true)),
+                ("mounted", Value::Null),
+                ("open_file_count", Value::Null),
+                ("live_owned_process_count", Value::Null),
+                ("interrupted_cleanup", Value::Null),
+                ("quarantined", Value::Null),
+            ],
+        );
+        let inventory = decode_cache_inventory(&document(vec![active])).expect("decode inventory");
+        let report = build_cache_inventory_report(&inventory, &CacheReportRequest::Status)
+            .expect("build report");
+
+        assert_eq!(
+            report.states()[0].classification(),
+            CacheStateClassification::InUse
+        );
+        assert_eq!(
+            report.states()[0].reasons()[0],
+            CacheStateReason::ActiveLock
+        );
+        assert!(
+            report.states()[0]
+                .reasons()
+                .contains(&CacheStateReason::OwnershipUnknown)
+        );
+        assert!(
+            report.states()[0]
+                .reasons()
+                .contains(&CacheStateReason::QuarantineStatusUnknown)
         );
     }
 

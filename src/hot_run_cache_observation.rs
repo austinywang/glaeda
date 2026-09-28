@@ -1,10 +1,12 @@
 //! Bounded filesystem-metadata observation of one explicitly supplied hot-run cache root.
 //!
-//! The observer follows no symlinks, reads no file contents, emits no paths, and performs no
-//! mutation. A matching opaque name does not establish ownership: every produced lifecycle fact
-//! remains unknown and the downstream classifier therefore cannot authorize reclamation.
+//! The observer follows no symlinks, reads no cache file contents, emits no paths, and performs no
+//! mutation. It may conservatively correlate recognized lock-file identities with a bounded
+//! `/proc/locks` snapshot. A matching opaque name does not establish ownership, and absence from
+//! the kernel snapshot never establishes that a state is unlocked.
 
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::fmt;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::Path;
@@ -18,10 +20,12 @@ use crate::cache_inventory::{
     CacheInventorySummary, CacheReportOperation, CacheStateId, CacheStateReport,
     MAX_CACHE_INVENTORY_STATES, build_local_hot_run_cache_report,
 };
+use crate::linux_kernel_file_locks::{KernelFileIdentity, observe_exclusive_whole_file_flocks};
 
 pub const MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES: u64 = 2_000_000;
 pub const MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH: u16 = 64;
 pub const HOT_RUN_CACHE_OBSERVATION_REPORT_SCHEMA_VERSION: u8 = 2;
+pub const MAX_HOT_RUN_CACHE_LOCK_CANDIDATES: usize = 512;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -29,6 +33,7 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOATIME)
     .union(OFlags::CLOEXEC);
 const ALLOCATION_BLOCK_BYTES: u64 = 512;
+const RUNTIME_STATE_PREFIX: &[u8] = b"runtime-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -272,6 +277,8 @@ pub fn observe_hot_run_cache(
 
     let mut global_objects = BTreeMap::new();
     let mut entries_seen = 0_u64;
+    let mut lock_discovery_entries_seen = 0_u64;
+    let mut lock_candidates_seen = 0_usize;
     let mut states = Vec::with_capacity(names.len());
     for (state_ordinal, name) in names.iter().enumerate() {
         let path_stat =
@@ -305,6 +312,15 @@ pub fn observe_hot_run_cache(
         ) {
             return partial_or_error(&root, root_before, &names, error);
         }
+        let lock_candidates = match expected_lock_identities(
+            &state,
+            root.snapshot.device,
+            &mut lock_discovery_entries_seen,
+            &mut lock_candidates_seen,
+        ) {
+            Ok(lock_candidates) => lock_candidates,
+            Err(error) => return partial_or_error(&root, root_before, &names, error),
+        };
         state.revalidate()?;
         let rebound = match BoundDirectory::open_child(&root.fd, name.as_c_str()) {
             Ok(rebound) => rebound,
@@ -316,15 +332,39 @@ pub fn observe_hot_run_cache(
         let state_id =
             CacheStateId::parse(std::str::from_utf8(name.as_bytes()).map_err(|_| unsafe_shape())?)
                 .map_err(|_| unsafe_shape())?;
-        states.push((state_id, totals.logical_bytes, totals.allocated_bytes));
+        states.push(ObservedHotRunState {
+            state_id,
+            logical_bytes: totals.logical_bytes,
+            allocated_bytes: totals.allocated_bytes,
+            lock_candidates,
+        });
     }
 
     root.revalidate()?;
     if root.snapshot != root_before {
         return Err(changed());
     }
+    let held_locks = observe_exclusive_whole_file_flocks();
+    let states = states
+        .into_iter()
+        .map(|state| {
+            let active_lock = held_locks.as_ref().and_then(|held| {
+                state
+                    .lock_candidates
+                    .iter()
+                    .any(|candidate| held.contains(&candidate.identity))
+                    .then_some(true)
+            });
+            (
+                state.state_id,
+                state.logical_bytes,
+                state.allocated_bytes,
+                active_lock,
+            )
+        })
+        .collect();
     let document =
-        CacheInventoryDocument::from_unknown_hot_run_states(states).map_err(|_| unsafe_shape())?;
+        CacheInventoryDocument::from_observed_hot_run_states(states).map_err(|_| unsafe_shape())?;
     Ok(HotRunCacheObservation::Complete(document))
 }
 
@@ -361,6 +401,14 @@ fn partial_or_error(
         state_count,
         problem,
     })
+}
+
+#[derive(Debug)]
+struct ObservedHotRunState {
+    state_id: CacheStateId,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    lock_candidates: Vec<BoundLockFile>,
 }
 
 fn state_names(root: &OwnedFd) -> Result<Vec<std::ffi::CString>, HotRunCacheObservationError> {
@@ -476,6 +524,128 @@ fn observe_directory(
         totals.add_object(snapshot.size, snapshot.blocks)?;
     }
     directory.revalidate_against(before)
+}
+
+fn expected_lock_identities(
+    state: &BoundDirectory,
+    root_device: u64,
+    entries_seen: &mut u64,
+    candidates_seen: &mut usize,
+) -> Result<Vec<BoundLockFile>, HotRunCacheObservationError> {
+    let mut identities = Vec::new();
+    let lock_name = c"lock";
+    if let Some(identity) = expected_lock_identity(&state.fd, lock_name, root_device)? {
+        push_lock_candidate(&mut identities, identity, candidates_seen)?;
+    }
+
+    let before = state.snapshot;
+    let mut entries = Dir::read_from(&state.fd).map_err(read_error)?;
+    for entry in &mut entries {
+        let entry = entry.map_err(read_error)?;
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        *entries_seen = entries_seen.checked_add(1).ok_or_else(too_large)?;
+        if *entries_seen > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
+            return Err(too_large());
+        }
+        if !is_runtime_state_name(bytes) {
+            continue;
+        }
+        let first = rustix_fs::statat(state.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| changed())?;
+        if first.st_dev != root_device || !FileType::from_raw_mode(first.st_mode).is_dir() {
+            continue;
+        }
+        let runtime = BoundDirectory::open_child(&state.fd, name)?;
+        if !same_directory_identity(&first, &runtime.snapshot) {
+            return Err(changed());
+        }
+        if let Some(identity) = expected_lock_identity(&runtime.fd, lock_name, root_device)? {
+            push_lock_candidate(&mut identities, identity, candidates_seen)?;
+        }
+        runtime.revalidate()?;
+        let rebound = BoundDirectory::open_child(&state.fd, name)?;
+        if rebound.snapshot != runtime.snapshot {
+            return Err(changed());
+        }
+    }
+    state.revalidate_against(before)?;
+    Ok(identities)
+}
+
+fn push_lock_candidate(
+    candidates: &mut Vec<BoundLockFile>,
+    candidate: BoundLockFile,
+    candidates_seen: &mut usize,
+) -> Result<(), HotRunCacheObservationError> {
+    *candidates_seen = candidates_seen.checked_add(1).ok_or_else(too_large)?;
+    if *candidates_seen > MAX_HOT_RUN_CACHE_LOCK_CANDIDATES {
+        return Err(too_large());
+    }
+    candidates.push(candidate);
+    Ok(())
+}
+
+fn expected_lock_identity(
+    parent: &OwnedFd,
+    name: &CStr,
+    root_device: u64,
+) -> Result<Option<BoundLockFile>, HotRunCacheObservationError> {
+    let first = match rustix_fs::statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    if first.st_dev != root_device
+        || !FileType::from_raw_mode(first.st_mode).is_file()
+        || first.st_nlink != 1
+    {
+        return Ok(None);
+    }
+    let fd = rustix_fs::openat(
+        parent.as_fd(),
+        name,
+        OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC),
+        Mode::empty(),
+    )
+    .map_err(|_| changed())?;
+    let held = rustix_fs::fstat(&fd).map_err(|_| changed())?;
+    if !FileType::from_raw_mode(held.st_mode).is_file()
+        || held.st_nlink != 1
+        || held.st_dev != root_device
+        || ObjectSnapshot::from_stat(&first)? != ObjectSnapshot::from_stat(&held)?
+    {
+        return Err(changed());
+    }
+    let rebound = rustix_fs::statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| changed())?;
+    if ObjectSnapshot::from_stat(&held)? != ObjectSnapshot::from_stat(&rebound)? {
+        return Err(changed());
+    }
+    Ok(Some(BoundLockFile {
+        identity: KernelFileIdentity {
+            device: held.st_dev,
+            inode: held.st_ino,
+        },
+        _fd: fd,
+    }))
+}
+
+fn is_runtime_state_name(name: &[u8]) -> bool {
+    name.len() == RUNTIME_STATE_PREFIX.len() + 64
+        && name.starts_with(RUNTIME_STATE_PREFIX)
+        && name[RUNTIME_STATE_PREFIX.len()..]
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[derive(Debug)]
+struct BoundLockFile {
+    identity: KernelFileIdentity,
+    _fd: OwnedFd,
 }
 
 #[derive(Debug, Default)]
@@ -775,15 +945,21 @@ fn overflow() -> HotRunCacheObservationError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::OpenOptions;
     use std::os::unix::fs::{MetadataExt as _, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use rustix::fs::{self as rustix_fs, FlockOperation};
+
+    use crate::cache_inventory::{CacheStateClassification, CacheStateReason};
+
     use super::{
         HotRunCacheObservationCompleteness, HotRunCacheObservationErrorKind,
-        HotRunCacheObservationProblem, MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH,
-        build_hot_run_cache_observation_report, observe_hot_run_cache,
+        HotRunCacheObservationProblem, MAX_HOT_RUN_CACHE_LOCK_CANDIDATES,
+        MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH, build_hot_run_cache_observation_report,
+        observe_hot_run_cache,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -888,6 +1064,38 @@ mod tests {
     }
 
     #[test]
+    fn partial_observation_never_classifies_a_held_lock() {
+        let root = TempRoot::new();
+        let state = root.state('a');
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(state.join("lock"))
+            .expect("open held lock fixture");
+        rustix_fs::flock(&lock, FlockOperation::LockExclusive).expect("hold lock fixture");
+        let status = Command::new("/usr/bin/mkfifo")
+            .arg(state.join("protected-shape"))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "create fixture FIFO");
+
+        let observation = observe_hot_run_cache(root.path()).expect("observe partial fixture");
+        let report =
+            build_hot_run_cache_observation_report(observation).expect("build partial report");
+        let encoded = serde_json::to_value(&report).expect("encode partial report");
+
+        assert_eq!(
+            report.completeness(),
+            HotRunCacheObservationCompleteness::Partial
+        );
+        assert!(report.states().is_empty());
+        assert!(encoded["summary"]["in_use_count"].is_null());
+        assert!(encoded["summary"]["unknown_count"].is_null());
+    }
+
+    #[test]
     fn classifies_permission_errors_without_private_evidence() {
         let error = super::read_error(rustix::io::Errno::ACCESS);
         assert_eq!(
@@ -937,5 +1145,146 @@ mod tests {
         }
         let error = observe_hot_run_cache(root.path()).expect_err("reject deep tree");
         assert_eq!(error.kind(), HotRunCacheObservationErrorKind::TooLarge);
+    }
+
+    #[test]
+    fn direct_and_runtime_kernel_flocks_are_definitely_in_use_but_absence_stays_unknown() {
+        let root = TempRoot::new();
+        let direct = root.state('a');
+        let direct_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(direct.join("lock"))
+            .expect("open direct lock fixture");
+        rustix_fs::flock(&direct_lock, FlockOperation::LockExclusive)
+            .expect("hold direct lock fixture");
+
+        let runtime_state = root.state('b');
+        let runtime = runtime_state.join(format!("runtime-{}", "c".repeat(64)));
+        fs::create_dir(&runtime).expect("create runtime state fixture");
+        let runtime_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(runtime.join("lock"))
+            .expect("open runtime lock fixture");
+        rustix_fs::flock(&runtime_lock, FlockOperation::LockExclusive)
+            .expect("hold runtime lock fixture");
+
+        let observation = observe_hot_run_cache(root.path()).expect("observe held locks");
+        let report =
+            build_hot_run_cache_observation_report(observation).expect("classify held locks");
+        assert_eq!(report.summary().state_count(), 2);
+        for state in report.states() {
+            assert_eq!(state.classification(), CacheStateClassification::InUse);
+            assert_eq!(state.reasons()[0], CacheStateReason::ActiveLock);
+            assert!(
+                state
+                    .reasons()
+                    .contains(&CacheStateReason::OwnershipUnknown)
+            );
+        }
+
+        drop(runtime_lock);
+        drop(direct_lock);
+        let observation = observe_hot_run_cache(root.path()).expect("observe unlocked files");
+        let report =
+            build_hot_run_cache_observation_report(observation).expect("classify unlocked files");
+        for state in report.states() {
+            assert_eq!(state.classification(), CacheStateClassification::Unknown);
+            assert!(
+                state
+                    .reasons()
+                    .contains(&CacheStateReason::ActiveLockUnknown)
+            );
+        }
+    }
+
+    #[test]
+    fn symlinked_and_hardlinked_lock_names_never_establish_activity() {
+        let root = TempRoot::new();
+        let symlink_state = root.state('a');
+        let outside_root = TempRoot::new();
+        let outside_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(outside_root.path().join("outside-lock"))
+            .expect("open outside lock fixture");
+        symlink(
+            outside_root.path().join("outside-lock"),
+            symlink_state.join("lock"),
+        )
+        .expect("symlink lock fixture");
+        rustix_fs::flock(&outside_lock, FlockOperation::LockExclusive)
+            .expect("hold outside lock fixture");
+
+        let hardlink_state = root.state('b');
+        let hardlink_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(hardlink_state.join("lock"))
+            .expect("open hardlink lock fixture");
+        fs::hard_link(
+            hardlink_state.join("lock"),
+            hardlink_state.join("lock-alias"),
+        )
+        .expect("hardlink lock alias");
+        rustix_fs::flock(&hardlink_lock, FlockOperation::LockExclusive)
+            .expect("hold hardlinked lock fixture");
+
+        let observation = observe_hot_run_cache(root.path()).expect("observe ambiguous locks");
+        let report =
+            build_hot_run_cache_observation_report(observation).expect("classify ambiguous locks");
+        for state in report.states() {
+            assert_eq!(state.classification(), CacheStateClassification::Unknown);
+            assert!(
+                state
+                    .reasons()
+                    .contains(&CacheStateReason::ActiveLockUnknown)
+            );
+            assert!(!state.reasons().contains(&CacheStateReason::ActiveLock));
+        }
+    }
+
+    #[test]
+    fn lock_candidate_descriptors_have_an_aggregate_bound() {
+        let root = TempRoot::new();
+        let state = root.state('a');
+        for index in 0..=MAX_HOT_RUN_CACHE_LOCK_CANDIDATES {
+            let runtime = state.join(format!("runtime-{index:064x}"));
+            fs::create_dir(&runtime).expect("create bounded runtime fixture");
+            fs::write(runtime.join("lock"), b"").expect("create bounded lock fixture");
+        }
+
+        let error = observe_hot_run_cache(root.path()).expect_err("reject excess lock candidates");
+        assert_eq!(error.kind(), HotRunCacheObservationErrorKind::TooLarge);
+    }
+
+    #[test]
+    fn secondary_lock_discovery_has_an_independent_entry_bound() {
+        let root = TempRoot::new();
+        let state_path = root.state('a');
+        fs::write(state_path.join("ordinary-entry"), b"").expect("create discovery fixture");
+        let state = super::BoundDirectory::open_root(&state_path).expect("bind state fixture");
+        let mut entries_seen = super::MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES;
+        let mut candidates_seen = 0;
+
+        let error = super::expected_lock_identities(
+            &state,
+            state.snapshot.device,
+            &mut entries_seen,
+            &mut candidates_seen,
+        )
+        .expect_err("reject excess secondary discovery work");
+
+        assert_eq!(error.kind(), HotRunCacheObservationErrorKind::TooLarge);
+        assert_eq!(candidates_seen, 0);
     }
 }

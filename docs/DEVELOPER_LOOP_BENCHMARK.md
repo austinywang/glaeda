@@ -710,6 +710,56 @@ reconstruction or selecting a new state, not deletion by this command. The obser
 ownership, generation, non-use, reconstruction, retirement, or cleanup authority; later lifecycle
 work must supply those facts before bounded eviction can exist.
 
+## Definitely-held hot-run lock observation — 2026-08-30
+
+Exact clean base `b92a1a6e67d50ea606bfe2fc9f677a48338f284b` / tree
+`828606368f0a34219a390096e942baefba788f71` retained the bounded physical observer above and
+classified every state with an unknown active-lock fact. Exact measured candidate
+`89779b371595e5d0b795e3aac17dfad434090079` / tree
+`6692ec5e9a48be725af3ea439017a9f82d302abd` added a bounded, read-only Linux `/proc/locks`
+snapshot. It recognizes only definitely-held whole-file exclusive `flock` locks on the exact
+direct or runtime-generation lock inode retained through an `O_PATH` descriptor. Missing,
+released, malformed, ambiguous, partial, POSIX, read, blocked, changed, symlinked, or hardlinked
+evidence remains unknown. The observer still grants no ownership, adoption, cleanup, or eviction
+authority. The lock table is capped at 1 MiB / 16,384 rows, and candidate descriptors are capped at
+512 across the observation, leaving substantial headroom under the normal inherited 1,024-file
+soft descriptor limit. An already descriptor-heavy caller can still fail closed as unreadable.
+
+The physical control was the same unchanged four-state big-red namespace: 1,090,037,078 logical
+bytes, 1,093,828,608 allocated bytes, and zero reclaimable bytes. One existing direct state lock
+was held transiently with `flock`; its device, inode, size, mode, owner, atime, mtime, and ctime were
+identical before and after. Releasing it restored a nonblocking acquisition and the candidate
+returned to four unknown states. Base and candidate release binaries were built from isolated
+target generations and identified by SHA-256
+`85f653e59b45cc083fc3a401116eab374b7982b37fc548de13a66031d8bee6b1` and
+`311e7d475d1ca569e9b032b55203f402ad7640dd1b395f2473077caba5042865` respectively.
+
+Each phase used three warmups and 40 measured samples per arm in rotating/reversed A-B-B-A order.
+Every sample validated the exact byte totals and zero reclaimable result. Base always reported four
+unknown states; the candidate reported four unknown states while no lock was held and exactly one
+in-use plus three unknown states while the control lock was held.
+
+| Phase | Arm | Median (ms) | p90 (ms) | Min–max (ms) | Max RSS (KiB) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| no lock held | base | 7.725 | 8.235 | 7.275–8.438 | 4,492 |
+| no lock held | candidate | 7.985 | 16.140 | 7.385–20.110 | 4,524 |
+| one exact lock held | base | 7.652 | 8.459 | 7.410–11.168 | 4,480 |
+| one exact lock held | candidate | 7.881 | 18.442 | 7.234–24.578 | 4,492 |
+
+Known-active classification cost 0.230 ms / 3.00% at the median; the inactive cost was 0.260 ms /
+3.37%. Candidate p90 and maximum were noisier in both phases, so the median improvement in truth is
+not presented as a latency win. The product win is replacing one false unknown with kernel-proven
+in-use evidence for about a quarter millisecond while keeping absence non-authoritative.
+
+One invalid build attempt exposed a separate cache-identity control. After building the base, a
+candidate build pointed at the same `CARGO_TARGET_DIR` returned in 0.02 seconds and emitted the
+byte-identical base binary even though the worktree was at the candidate commit. The changed source
+mtimes preceded the shared output mtime, so Cargo's local freshness check did not distinguish the
+worktree generations. Rebuilding in an isolated candidate target took 58.10 seconds and produced
+the distinct candidate digest above. Glaeda must therefore bind cross-worktree compiler-cache
+reuse to validated source/toolchain/target identity or normalize freshness deliberately; an
+unqualified shared target directory is neither a valid benchmark arm nor a safe fast path.
+
 ## Cross-worktree Cargo target environment binding — 2026-08-30
 
 While building the lock-observer candidate, a deliberate shared-`CARGO_TARGET_DIR` control exposed

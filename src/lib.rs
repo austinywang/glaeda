@@ -204,6 +204,8 @@ pub mod linux_installation_enrollment;
 /// Staged, durable, no-replace publication of complete project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_publication;
+#[cfg(target_os = "linux")]
+mod linux_kernel_file_locks;
 /// Durable, revision-checked lease persistence beneath one installation directory.
 #[cfg(target_os = "linux")]
 pub mod linux_lease_store;

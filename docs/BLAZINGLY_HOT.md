@@ -724,11 +724,13 @@ glaeda --output json cache observe-hot-run --root <explicit-hot-run-root>
 
 This is filesystem-metadata observation only. It follows no symlinks, reads no file contents, and
 stays on the root filesystem. A complete observation rejects more than 1,024 states, 2,000,000
-objects, depth over 64, cross-state hardlinks, drift, and unsupported filesystem shapes. Logical
-bytes match GNU `du --apparent-size` semantics by excluding directory entry sizes; allocated bytes
-sum unique per-state `st_blocks * 512`, including directories. The namespace root itself is
-excluded from the per-state aggregate. As with `du`, `st_blocks` is inode-reported allocation
-rather than unique backing usage when reflinks or block-level deduplication share extents.
+objects, more than 512 recognized lock candidates, depth over 64, cross-state hardlinks, drift, and
+unsupported filesystem shapes. Logical bytes match GNU `du --apparent-size` semantics by excluding
+directory entry sizes; allocated bytes sum unique per-state `st_blocks * 512`, including
+directories. The namespace root itself is excluded from the per-state aggregate. As with `du`,
+`st_blocks` is inode-reported allocation rather than unique backing usage when reflinks or
+block-level deduplication share extents. The secondary runtime-lock discovery pass has its own
+2,000,000-entry work bound rather than relying on the first traversal's count.
 
 Protected OverlayFS work directories and nested special nodes produce a successful path-free
 schema-v2 `completeness: partial` observation after the top-level state set is revalidated. Its
@@ -738,11 +740,19 @@ or run the development binary with extra privilege to fill it in. Root unavailab
 top-level state shape, drift or rebinding, cross-state physical attribution, bounds, and arithmetic
 failure remain hard errors.
 
+On Linux, a complete observation also reads one bounded `/proc/locks` snapshot. An exact held
+whole-file exclusive BSD flock on the descriptor-retained direct `lock` file or a direct
+`runtime-<64hex>/lock` file establishes `active_lock: true` for that state. An absent, malformed or
+oversized snapshot remains unknown, as do POSIX/OFD/read/partial/blocked rows and every recognized
+lock file without a matching held row. The command never reports lock absence. A partial
+observation never enters the classifier and therefore never emits an active-lock fact.
+
 Every state in a complete observation remains `ownership_unknown` with generation, worktree,
-reconstruction, lease, lock, mount, open-file, process, cleanup, and quarantine evidence unknown.
-A complete observation therefore reports disk occupancy but cannot make any state reclaimable. A
-partial observation does not enter the classifier at all. Neither form creates catalog, marker,
-adoption, retirement, or cleanup authority.
+reconstruction, lease, mount, open-file, process, cleanup, and quarantine evidence unknown. Lock
+evidence is either definitely active at the bounded kernel snapshot or unknown. A complete
+observation therefore reports disk occupancy and can conservatively identify an in-use state, but
+cannot make any state reclaimable. Neither complete nor partial observation creates catalog,
+marker, adoption, retirement, signaling, or cleanup authority.
 
 An explicit checkout-local Cargo target has a separate Linux observation front door:
 
