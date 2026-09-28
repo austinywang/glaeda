@@ -179,6 +179,45 @@ class GlaedaDiskTest(unittest.TestCase):
         (self.root / "repo/sub/.git").mkdir(parents=True)
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
 
+    def test_tool_caches_are_not_searched_for_git(self) -> None:
+        # The Go build cache and Bazel's output outgrow git_state's budget, so they stayed "unchecked"
+        # and were never evicted. A family names them in git_free; any other deep tree stays unchecked.
+        self.fam = gd.Family("user-cache", self.root, True, "re-download", git_free=gd.TOOL_CACHES)
+        go = make(self.root / "go-build")
+        for i in range(3):
+            (go / f"{i:02x}" / "a/b/c/d/e/f").mkdir(parents=True)
+        bazel = make(self.root / "bazel")
+        (bazel / "external/some_repo/.git").mkdir(parents=True)
+        other = make(self.root / "other-tool")
+        (other / "a/b/c/d/e/f/g").mkdir(parents=True)
+        old = time.time() - 48 * 3600
+        for top in (go, bazel, other):
+            for dirpath, dirs, files in os.walk(top):
+                for n in dirs + files:
+                    os.utime(os.path.join(dirpath, n), (old, old))
+            os.utime(top, (old, old))
+        self.assertEqual(gd.git_state(go), "unchecked")
+        self.assertEqual(self.verdicts(), {"go-build": "reclaimable", "bazel": "reclaimable",
+                                           "other-tool": "unchecked"})
+        items = [i for i in gd.survey([self.fam], 24, 0) if i.verdict == "reclaimable"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.root.parent / f"{self.root.name}-r.jsonl", None, 24)
+        (self.root.parent / f"{self.root.name}-r.jsonl").unlink(missing_ok=True)
+        self.assertFalse(go.exists() or bazel.exists())
+        self.assertTrue(other.exists())
+        go = make(self.root / "go-build")
+        # an open cache is still in use, whatever its name
+        gd.process_evidence = lambda: ([str(go)], "")
+        self.assertEqual(self.verdicts()["go-build"], "in-use")
+
+    def test_cache_families_name_the_tool_caches(self) -> None:
+        for fam in gd.default_families():
+            if fam.id in ("user-cache", "library-caches"):
+                self.assertEqual(fam.git_free, gd.TOOL_CACHES)
+            else:
+                self.assertEqual(fam.git_free, (), fam.id)
+        self.assertIn("go-build", gd.TOOL_CACHES)
+
     def test_tmp_alias_and_comma_lists_count_as_named(self) -> None:
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --out /tmp/foo/dist\n"))
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --dirs=/private/tmp/foo,/x\n"))

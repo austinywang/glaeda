@@ -24,6 +24,8 @@ Only families whose contents are reproducible build output or scratch space are
 ever deleted. Everything else is reported so the space is at least visible.
 An item is never deleted while a process has its cwd inside it, a process command
 line names it, it holds a git checkout, or it changed within the idle window.
+A tool's own cache named in TOOL_CACHES (the Go build cache, Bazel, Edge) is not
+searched for git: it is too large for the search to finish, and it holds no work.
 Every deletion is appended to a JSONL receipt.
 
 On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
@@ -113,6 +115,8 @@ class Family:
     include: tuple[str, ...] = ()  # when set, only candidates whose name starts with one of these
     min_idle_hours: float = 0.0  # an item must also be idle this long, whatever the idle window
     max_idle_hours: float | None = None  # a hot-tier item goes once idle this long, whatever the idle window
+    # candidates by name that a tool fills with its own cache: never searched for git (see TOOL_CACHES)
+    git_free: tuple[str, ...] = ()
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -276,14 +280,14 @@ def default_families() -> list[Family]:
                # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
                # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
                skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
-               owner="tools (XDG cache)", rebuild_minutes=5),
+               owner="tools (XDG cache)", rebuild_minutes=5, git_free=TOOL_CACHES),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
                skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
-               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
+               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5, git_free=TOOL_CACHES),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)"),
         Family("projects", projects, False, "checkouts (report only)",
@@ -500,10 +504,21 @@ DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this be
 
 
 def derived_data(fam: Family, path: Path) -> bool:
-    """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), and a tree
-    remove() had already renamed aside when it was interrupted, which is only ever reclaimed."""
-    return bool(fam.build_output or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
+    """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), a tool's own
+    cache the family names in git_free (TOOL_CACHES), and a tree remove() had already renamed aside
+    when it was interrupted, which is only ever reclaimed. None of these is searched for git."""
+    return bool(fam.build_output or path.name in fam.git_free
+            or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
             or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
+
+
+# Caches a tool fills and refills by itself, too large for git_state to finish (the Go build cache
+# held 18 GiB and far more than its 20000-entry budget on Air Blue, 2026-09-27), so without this
+# they stayed "unchecked" and were never evicted. No work lives in them: a git clone inside (Bazel's
+# git_repository, say) is a fetch the tool repeats. They are still kept while in use or recent.
+# Named per filesystem spelling: ~/Library/Caches on macOS, ~/.cache (XDG) on Linux.
+TOOL_CACHES = ("go-build", "bazel", "bazelisk", "node-gyp", "Microsoft Edge", "com.microsoft.edgemac",
+               "microsoft-edge")
 
 
 REPRODUCIBLE_DIRS = frozenset({"node_modules", ".build", "DerivedData", "target", ".venv",
