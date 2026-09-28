@@ -178,19 +178,29 @@ class MiniSetupTest(unittest.TestCase):
 
         def fake_run(argv, **kwargs):
             runs.append(argv)
-            return subprocess.CompletedProcess(argv, fake_run.code, b"", b"")
+            code = fake_run.codes.pop(0) if fake_run.codes else fake_run.code
+            return subprocess.CompletedProcess(argv, code, b"", b"")
 
-        with mock.patch.object(ms.Path, "glob", fake_glob), mock.patch.object(ms.subprocess, "run", fake_run):
-            fake_run.code = 0
+        with mock.patch.object(ms.Path, "glob", fake_glob), mock.patch.object(ms.subprocess, "run", fake_run), \
+             mock.patch.object(ms.time, "sleep") as sleep:
+            fake_run.code, fake_run.codes = 0, []
             ms.apple_python.cache_clear()
             self.assertEqual(ms.apple_python("macos"), "/usr/bin/python3")
-            fake_run.code = 69  # xcrun: Xcode licence not accepted
+            fake_run.code = 69  # xcrun: Xcode licence not accepted, on every attempt
+            runs.clear()
             ms.apple_python.cache_clear()
             self.assertIsNone(ms.apple_python("macos"))
+            self.assertEqual(len(runs), ms.APPLE_PYTHON_PROBES)
+            # One failed probe (a job switching Xcode, a cold xcrun cache) is asked again, not believed.
+            fake_run.code, fake_run.codes = 0, [1]
+            ms.apple_python.cache_clear()
+            self.assertEqual(ms.apple_python("macos"), "/usr/bin/python3")
+            self.assertTrue(sleep.called)
+        # A slow probe beside a compile is Apple's python3 under load, not a broken one (mini-3, 2026-09-28).
         with mock.patch.object(ms.Path, "glob", fake_glob), \
-             mock.patch.object(ms.subprocess, "run", side_effect=subprocess.TimeoutExpired("python3", 10)):
+             mock.patch.object(ms.subprocess, "run", side_effect=subprocess.TimeoutExpired("python3", 30)):
             ms.apple_python.cache_clear()
-            self.assertIsNone(ms.apple_python("macos"))
+            self.assertEqual(ms.apple_python("macos"), "/usr/bin/python3")
         ms.apple_python.cache_clear()
         self.assertEqual(runs[0][:3], ["/usr/bin/python3", "-I", "-c"])
 

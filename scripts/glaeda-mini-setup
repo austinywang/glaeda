@@ -258,6 +258,11 @@ def pick_python() -> str | None:
     return None
 
 
+APPLE_PYTHON_PROBES = 3  # attempts before a failing /usr/bin/python3 counts as broken
+APPLE_PYTHON_PROBE_TIMEOUT = 30.0
+APPLE_PYTHON_PROBE_PAUSE = 5.0
+
+
 @functools.lru_cache(maxsize=None)
 def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
     """/usr/bin/python3 once it is real (Command Line Tools or an Xcode), else None.
@@ -265,8 +270,15 @@ def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
     macOS Local Network Privacy refuses LAN connections from a LaunchAgent whose program is not Apple's,
     children included (2026-09-25: a Homebrew python3 agent and its /usr/bin/ssh got "No route to host").
     The seed prefetch agent streams seeds from the trusted seeder over the LAN, so it runs Apple's python3.
-    It must also run: a broken xcode-select or an unaccepted Xcode licence makes /usr/bin/python3 fail,
-    and then the agent keeps the other interpreter (losing only the LAN step, not the prefetch).
+    It must also run: a broken xcode-select or an unaccepted Xcode licence makes /usr/bin/python3 exit
+    non-zero at once, and then the agent keeps the other interpreter (losing only the LAN step, not the
+    prefetch).
+
+    Only a probe that keeps exiting non-zero counts as broken. OTA runs setup from a Background agent
+    beside a compile, and on 2026-09-28 one failed probe there moved cmuxs-mac-mini-3's seed prefetch
+    and LAN broker to Homebrew python3, so every LAN fetch got "No route to host" until the next release.
+    So a slow probe (a timeout) is Apple's python3 under load, not a broken one, and a non-zero exit is
+    asked again before it counts.
     """
     if platform_name == "linux":
         return None
@@ -274,12 +286,19 @@ def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
         Path("/Applications").glob("Xcode*.app")
     )):
         return None
-    try:
-        probe = subprocess.run(["/usr/bin/python3", "-I", "-c", "pass"], stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return "/usr/bin/python3" if probe.returncode == 0 else None
+    for attempt in range(APPLE_PYTHON_PROBES):
+        if attempt:
+            time.sleep(APPLE_PYTHON_PROBE_PAUSE)
+        try:
+            probe = subprocess.run(["/usr/bin/python3", "-I", "-c", "pass"], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=APPLE_PYTHON_PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return "/usr/bin/python3"
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return "/usr/bin/python3"
+    return None
 
 
 _ENROLL: Any = None
