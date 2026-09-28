@@ -48,6 +48,20 @@ of this script whose runner files differ from that release's and are older than 
 plan says which copy to run instead, and the release's plan labels are compared with this copy's.
 --allow-stale overrides. The register step lists every label drift it sees: the receipt's or GitHub's
 registered labels against what this version would register.
+
+    glaeda-cmux-runner --refresh-hooks [--apply]      plan, then install, this copy's hook files only
+
+--refresh-hooks brings the two files every runner install copies unchanged into its glaeda-hooks/
+(glaeda-cmux-runner-hook and glaeda_reservation.py) to this copy's bytes, in each runner directory a
+receipt under ~/.local/state/glaeda/cmux-runner owns. It is how glaeda-update rolls a hook fix out
+(docs/GLAEDA_OTA.md), and runs only from a release's copy: it replaces a file only when its bytes are a
+version the release descends from (hook-history.json), so it never downgrades. It writes each file
+atomically with the mode --apply gives it and touches nothing else: no registration, labels, generated
+wrappers, LaunchAgent or receipt. A runner with a job running is left for the next run; a runner whose
+wrappers call the hook with arguments the staged new hook rejects (--parse-only, from glaeda-hooks/, with
+the wrapper's own interpreter) is refused, since a rejected job-started fails jobs. It shares one lock
+with --apply and --uninstall. The running listener gate re-execs the new hook itself (Gate.reload) and
+keeps its runner.
 """
 
 from __future__ import annotations
@@ -57,6 +71,7 @@ import importlib.machinery
 import importlib.util
 import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -70,7 +85,9 @@ import shutil
 import signal
 import socket
 import subprocess
+import stat
 import sys
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -79,8 +96,10 @@ from typing import Any
 SCHEMA = "glaeda-cmux-runner/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parent
-HOOK_SOURCE = SCRIPT_DIR / "glaeda-cmux-runner-hook"
-RESERVATION_SOURCE = SCRIPT_DIR / "glaeda_reservation.py"  # the hook reads reservation markers with it
+HOOK_NAME = "glaeda-cmux-runner-hook"
+RESERVATION_NAME = "glaeda_reservation.py"  # the hook reads reservation markers with it
+HOOK_SOURCE = SCRIPT_DIR / HOOK_NAME
+RESERVATION_SOURCE = SCRIPT_DIR / RESERVATION_NAME
 LABEL = "com.teamleaderleo.glaeda.cmux-runner"
 DEFAULT_REPO = "manaflow-ai/cmux"
 BASE_LABELS = ("self-hosted", "macOS", "ARM64")
@@ -195,12 +214,19 @@ def which(name: str, extra: tuple[str, ...] = ()) -> str | None:
     return None
 
 
-def write_atomic(path: Path, data: bytes, mode: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stage = path.with_name(f".{path.name}.cmux-runner.tmp")
-    stage.write_bytes(data)
-    os.chmod(stage, mode)
-    os.replace(stage, path)
+def write_atomic(path: Path, data: bytes, mode: int, make_parent: bool = True) -> None:
+    """Write and sync a unique stage beside path, then rename it over path: a reader, or a crash, sees the old
+    file or the whole new one. --refresh-hooks passes make_parent=False: it never recreates a removed runner."""
+    if make_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    stage = stage_file(path, data, mode)
+    try:
+        os.replace(stage, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(stage)
+        raise
+    sync_dir(path.parent)
 
 
 RUNNER_LABEL_PREFIX = "glaeda-runner-"
@@ -554,23 +580,33 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
     }
 
 
+def hook_sources() -> dict[str, tuple[bytes, int]]:
+    """The files every install copies unchanged from this copy into glaeda-hooks/, with their modes: what
+    --apply writes there beside the generated wrappers, and all that --refresh-hooks writes."""
+    return {HOOK_NAME: (HOOK_SOURCE.read_bytes(), 0o755),
+            RESERVATION_NAME: (RESERVATION_SOURCE.read_bytes(), 0o644)}
+
+
 def desired_files(ctx: Context) -> dict[Path, tuple[bytes, int]]:
-    files = {ctx.hook_dir / "glaeda-cmux-runner-hook": (HOOK_SOURCE.read_bytes(), 0o755),
-             ctx.hook_dir / "glaeda_reservation.py": (RESERVATION_SOURCE.read_bytes(), 0o644)}
+    files = {ctx.hook_dir / name: source for name, source in hook_sources().items()}
     for name, data in hook_wrappers(ctx).items():
         files[ctx.hook_dir / name] = (data, 0o755)
     files[ctx.plist_path] = (plistlib.dumps(agent_plist(ctx), sort_keys=True), 0o644)
     return files
 
 
-def owned_dir(ctx: Context, receipt: dict[str, Any] | None) -> bool:
+def owns_runner_dir(runner_dir: Path, receipt: dict[str, Any] | None) -> bool:
     """The runner directory is ours only if the receipt says so and the marker still matches."""
-    if not receipt or not receipt.get("runnerDirOwned") or receipt.get("runnerDir") != os.fspath(ctx.runner_dir):
+    if not receipt or not receipt.get("runnerDirOwned") or receipt.get("runnerDir") != os.fspath(runner_dir):
         return False
     try:
-        return (ctx.runner_dir / MARKER).read_text().strip() == receipt.get("installId")
+        return (runner_dir / MARKER).read_text().strip() == receipt.get("installId")
     except OSError:
         return False
+
+
+def owned_dir(ctx: Context, receipt: dict[str, Any] | None) -> bool:
+    return owns_runner_dir(ctx.runner_dir, receipt)
 
 
 def launchctl_loaded(ctx: Context) -> bool | None:
@@ -971,9 +1007,13 @@ LOCAL_REGISTRATION = (".runner", ".credentials", ".credentials_rsaparams", ".run
                       ".credentials_migrated")
 
 
+def worker_running(runner_dir: Path) -> bool:
+    """A Runner.Worker from this install means a job is running right now. A pgrep that cannot tell counts as busy."""
+    return run(["/usr/bin/pgrep", "-f", os.fspath(runner_dir / "bin/Runner.Worker")])[0] != 1
+
+
 def runner_busy(ctx: Context) -> bool:
-    """A Runner.Worker from this install means a job is running right now."""
-    return run(["/usr/bin/pgrep", "-f", os.fspath(ctx.runner_dir / "bin/Runner.Worker")])[0] == 0
+    return worker_running(ctx.runner_dir)
 
 
 def relabel(ctx: Context, act: dict[str, Any]) -> None:
@@ -1219,6 +1259,218 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             act["applied"] = True
 
 
+# ---------------------------------------------------------------- hook refresh (glaeda-update)
+
+REFRESH_SCHEMA = "glaeda-cmux-runner-refresh-hooks/v1"
+HOOK_CALLERS = ("job-started.sh", "job-completed.sh", "listen.sh", "glaeda-canonical-root")  # hook_wrappers
+SHELL_ENDS = {"&", "&&", "||", "|", ";", ";;"}
+# Shell words in glaeda-canonical-root's calls: a sample value for $root, nothing for the caller's "$@".
+SHELL_SAMPLES = {"$root": "1", "$@": None}
+# glaeda_release.HOOK_HISTORY at the release root, two levels above this copy (generations/<tag>/glaeda/scripts)
+HOOK_HISTORY = SCRIPT_DIR.parent.parent / "hook-history.json"
+RUNNER_LOCK = "runner.lock"
+STAGE_SUFFIX = ".cmux-runner.tmp"
+
+
+@contextlib.contextmanager
+def runner_lock(home: Path, wait: bool):
+    """One lock for every --apply, --uninstall and --refresh-hooks on this Mac, so a refresh never checks the
+    wrappers of one install and writes over the hook of the next. Yields False when wait is off and it is held."""
+    state = home / ".local/state/glaeda/cmux-runner"
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(state / RUNNER_LOCK, "a") as file:
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def hook_history() -> dict[str, set[str]] | None:
+    """{file: SHA-256s of every version of it this release descends from}, or None beside no release."""
+    try:
+        doc = json.loads(HOOK_HISTORY.read_text())
+        return {name: {str(digest) for digest in doc[name]} for name in (HOOK_NAME, RESERVATION_NAME)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def hook_calls(hook_dir: Path) -> list[tuple[str, list[str]]]:
+    """(wrapper, [interpreter, hook, arguments...]) for each line of the installed wrappers that runs the hook.
+    $root takes a sample value and "$@" is dropped; a line with any other shell word is left out."""
+    hook = os.fspath(hook_dir / HOOK_NAME)
+    calls = []
+    for name in HOOK_CALLERS:
+        try:
+            text = (hook_dir / name).read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            try:
+                words = shlex.split(line, comments=True)
+            except ValueError:
+                continue
+            if hook not in words or words.index(hook) == 0:
+                continue
+            at = words.index(hook)
+            args = []
+            for word in words[at + 1:]:
+                if word in SHELL_ENDS:
+                    break
+                if word in SHELL_SAMPLES:
+                    if SHELL_SAMPLES[word] is not None:
+                        args.append(SHELL_SAMPLES[word])
+                    continue
+                args.append(word)
+            if not any("$" in arg for arg in args):
+                calls.append((name, [words[at - 1], hook, *args]))
+    return calls
+
+
+def new_hook_accepts(calls: list[tuple[str, list[str]]], staged: Path) -> str | None:
+    """None when the staged hook, run from the hook directory, parses every installed call's arguments under that
+    call's own interpreter; else the first wrapper it rejects and why. A job-started it rejects fails every job."""
+    for wrapper, (python, _, *args) in calls:
+        if not os.path.isabs(python) or not os.access(python, os.X_OK):
+            return f"{wrapper} runs the hook with {python[:120]!r}, not an executable absolute path"
+        code, out = run([python, os.fspath(staged), *args, "--parse-only"], timeout=60)
+        if code != 0:
+            return f"the new hook rejects {wrapper}'s arguments (exit {code}: {out[-200:]})"
+    return None
+
+
+def stage_file(path: Path, data: bytes, mode: int) -> Path:
+    """data, synced, in a unique stage beside path (its directory must exist); the caller renames or removes it."""
+    fd, stage = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=STAGE_SUFFIX)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(stage, mode)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(stage)
+        raise
+    return Path(stage)
+
+
+def sync_dir(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[str, tuple[bytes, int]],
+                     history: dict[str, set[str]]) -> dict[str, Any]:
+    """Plan (and with apply, make) one runner install's hook files match this copy's. Caller holds runner_lock."""
+    entry: dict[str, Any] = {"runnerDir": os.fspath(runner_dir)}
+    if not isinstance(receipt, dict) or not runner_dir.is_absolute() or not owns_runner_dir(runner_dir, receipt):
+        return {**entry, "state": "skipped", "note": "not a runner directory this command owns (receipt or marker)"}
+    hook_dir = runner_dir / HOOK_DIR
+    if hook_dir.is_symlink() or not hook_dir.is_dir():
+        return {**entry, "state": "skipped", "note": f"no {HOOK_DIR} directory; --apply installs it"}
+    if apply:  # stages a killed refresh or --apply left; under the lock none is live
+        for leftover in hook_dir.glob(f".*{STAGE_SUFFIX}"):
+            # an older copy's --apply takes no lock and stages to a fixed .<name>.cmux-runner.tmp: never its
+            if (hook_dir / leftover.name[1:-len(STAGE_SUFFIX)]).exists():  # .job-started.sh.cmux-runner.tmp
+                continue
+            if leftover.is_file() and not leftover.is_symlink():
+                leftover.unlink()
+    stale = []
+    for name, (data, mode) in sources.items():
+        target = hook_dir / name
+        try:
+            st = os.lstat(target)
+        except FileNotFoundError:
+            return {**entry, "state": "skipped", "note": f"{name} is not installed; --apply installs it"}
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return {**entry, "state": "skipped", "note": f"{name} is not a regular file owned by this user"}
+        current = target.read_bytes()
+        if current == data:
+            if (st.st_mode & 0o777) != mode:
+                stale.append(name)
+            continue
+        if hashlib.sha256(current).hexdigest() not in history[name]:
+            # a newer hook (a relabel from main, an --apply from a newer copy) or a local edit: never downgrade it
+            return {**entry, "state": "kept", "note": f"the installed {name} is not a version this release "
+                                                      "descends from; --apply owns it"}
+        stale.append(name)
+    if not stale:
+        return {**entry, "state": "unchanged"}
+    entry["files"] = stale
+    # A job's hooks run from these files: job-started under one version, job-completed under the next. The
+    # gate takes a swap mid-job (it re-execs in place and adopts its runner), but the job hooks are only ever
+    # swapped between jobs. A job that starts after the last look runs one whole file or the other.
+    if worker_running(runner_dir):
+        return {**entry, "state": "deferred", "note": "the runner has a job; a later run installs it"}
+    calls = hook_calls(hook_dir)
+    if not any(wrapper == "job-started.sh" for wrapper, _ in calls):
+        return {**entry, "state": "blocked", "note": "no job-started.sh call to check the new hook against; "
+                                                     "re-run glaeda-cmux-runner --apply"}
+    if not apply:  # a plan writes nothing: it checks this copy's hook where it is
+        why = new_hook_accepts(calls, HOOK_SOURCE)
+        if why:
+            return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
+        return {**entry, "state": "update"}
+    try:
+        staged = stage_file(hook_dir / HOOK_NAME, *sources[HOOK_NAME])
+    except OSError as error:  # a full disk: this runner waits, the others still refresh
+        return {**entry, "state": "deferred", "note": f"cannot stage the new hook ({type(error).__name__}: {error})"[:300]}
+    try:
+        why = new_hook_accepts(calls, staged)
+        if why:
+            return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
+        if worker_running(runner_dir):  # a job took the runner during the checks
+            return {**entry, "state": "deferred", "note": "the runner has a job; a later run installs it"}
+        # the module first: the hook, which the gate watches and reloads, lands only beside the module it reads
+        try:
+            if RESERVATION_NAME in stale:
+                write_atomic(hook_dir / RESERVATION_NAME, *sources[RESERVATION_NAME], make_parent=False)
+            if HOOK_NAME in stale:
+                os.replace(staged, hook_dir / HOOK_NAME)
+                sync_dir(hook_dir)
+        except OSError as error:
+            return {**entry, "state": "deferred", "note": f"cannot install ({type(error).__name__}: {error})"[:300]}
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            staged.unlink()
+    return {**entry, "state": "updated"}
+
+
+def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
+    """--refresh-hooks: every receipt's runner install (the first one and each --instance K)."""
+    doc: dict[str, Any] = {"schema": REFRESH_SCHEMA, "apply": apply, "source": os.fspath(SCRIPT_DIR), "runners": []}
+    state = home / ".local/state/glaeda/cmux-runner"
+    receipts = [state / "receipt.json", *sorted(state.glob("instance-*/receipt.json"))]
+    if not any(path.is_file() for path in receipts):
+        return doc
+    history = hook_history()
+    if history is None:
+        return {**doc, "error": f"no {HOOK_HISTORY.name} beside this copy: only a release's copy refreshes hooks"}
+    sources = hook_sources()
+    doc["hookSha256"] = sha256_bytes(sources[HOOK_NAME][0])
+    with runner_lock(home, wait=False) as held:
+        if not held:
+            return {**doc, "error": "an --apply or --uninstall holds the runner lock; a later run refreshes"}
+        for path in receipts:
+            try:
+                receipt = json.loads(path.read_text())
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                doc["runners"].append({"receipt": os.fspath(path), "state": "skipped", "note": "unreadable receipt"})
+                continue
+            runner_dir = Path(str(receipt.get("runnerDir") or "")) if isinstance(receipt, dict) else Path()
+            doc["runners"].append({"receipt": os.fspath(path),
+                                   **refresh_hook_dir(runner_dir, receipt, apply, sources, history)})
+    return doc
+
+
 # ---------------------------------------------------------------- output
 
 
@@ -1344,12 +1596,29 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
     p.add_argument("--allow-stale", action="store_true",
                    help="apply from a copy older than the installed OTA release (default: that blocks)")
+    p.add_argument("--refresh-hooks", action="store_true",
+                   help="only bring every owned runner's glaeda-cmux-runner-hook and glaeda_reservation.py to "
+                        "this copy's (plan; with --apply, install): glaeda-update's hook rollout")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser().parse_args(argv)
+    if args.refresh_hooks:  # file writes only, under this user's home: no launchd, GitHub or Darwin tool
+        if args.uninstall:
+            print("glaeda-cmux-runner: --refresh-hooks and --uninstall are exclusive", file=sys.stderr)
+            return 2
+        doc = refresh_hooks(Path.home(), args.apply)
+        failed = bool(doc.get("error")) or any(r["state"] == "blocked" for r in doc["runners"])
+        if args.output == "json":
+            print(json.dumps(doc, sort_keys=True))
+        else:
+            if doc.get("error"):
+                print(f"refused   {doc['error']}")
+            for r in doc["runners"]:
+                print(f"{r['state']:<9} {r.get('runnerDir') or r.get('receipt')}  {r.get('note') or ''}".rstrip())
+        return 1 if failed else 0
     if DARWIN_REQUIRED and platform.system() != "Darwin":
         print("glaeda-cmux-runner: macOS only", file=sys.stderr)
         return 2
@@ -1418,6 +1687,12 @@ def main(argv: list[str] | None = None) -> int:
         del token
     if ctx.gh and run([ctx.gh, "auth", "status"])[0] != 0:
         ctx.gh, ctx.gh_state = None, "installed, not logged in"  # a logged-out gh is no gh
+    # Every --apply and --uninstall holds the runner lock from its plan to its receipt (runner_lock).
+    with runner_lock(ctx.home, wait=True) if args.apply else contextlib.nullcontext():
+        return install_or_uninstall(ctx, args, raw_argv)
+
+
+def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[str]) -> int:
     prior = load_receipt(ctx)
     if args.uninstall and prior:
         # Uninstall acts only on what the receipt recorded; flags cannot point it elsewhere.

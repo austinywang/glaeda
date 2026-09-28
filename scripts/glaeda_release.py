@@ -67,6 +67,34 @@ def sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+# The release's source commit and its ancestors, newest first, one per line. glaeda-update reads it to tell a
+# runner copy an operator staged from an ancestor of this release (older: refresh it) from a newer one (keep it).
+# The build checks out full history for it (release.yml); a shallow checkout lists only the source.
+ANCESTRY = "ancestry.txt"
+ANCESTRY_MAX = 5000
+# {file: SHA-256 of every version of it in the source's history} for the files glaeda-cmux-runner --refresh-hooks
+# installs. A runner hook with one of these digests is one this release descends from, so replacing it is never
+# a downgrade; any other hook (installed from a newer main, or edited) is left to --apply.
+HOOK_HISTORY = "hook-history.json"
+HOOK_FILES = ("glaeda-cmux-runner-hook", "glaeda_reservation.py")
+HOOK_HISTORY_MAX = 1000
+
+
+def hook_history(root: Path, source: str) -> bytes:
+    history = {}
+    for name in HOOK_FILES:
+        path = f"scripts/{name}"
+        commits = subprocess.run(["git", "-C", str(root), "rev-list", f"--max-count={HOOK_HISTORY_MAX}", source,
+                                  "--", path], check=True, capture_output=True, text=True).stdout.split()
+        digests = set()
+        for commit in [source, *commits]:
+            blob = subprocess.run(["git", "-C", str(root), "show", f"{commit}:{path}"], capture_output=True)
+            if blob.returncode == 0:  # a commit that deleted or renamed it has no version
+                digests.add(sha256(blob.stdout))
+        history[name] = sorted(digests)
+    return canonical(history)
+
+
 def hygiene_asset(target: str) -> str:
     return f"glaeda-hygiene-{target}.tar.gz"
 
@@ -86,9 +114,11 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes, mode: int) -> None:
 
 
 def hygiene_archive(root: Path, source: str, reclaim: Path) -> bytes:
-    """The committed tree at `source` under glaeda/, plus the reclaim binary, as a stable tar.gz."""
+    """The committed tree at `source` under glaeda/, plus the reclaim binary and ANCESTRY, as a stable tar.gz."""
     tree = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", "--prefix=glaeda/", source],
                           check=True, capture_output=True).stdout
+    ancestry = subprocess.run(["git", "-C", str(root), "rev-list", f"--max-count={ANCESTRY_MAX}", source],
+                              check=True, capture_output=True).stdout
     out = io.BytesIO()
     with tarfile.open(fileobj=io.BytesIO(tree)) as src, \
             gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz, \
@@ -102,6 +132,8 @@ def hygiene_archive(root: Path, source: str, reclaim: Path) -> bytes:
                 tar.addfile(info)
             # symlinks and anything else are left out; extraction refuses them anyway
         _add(tar, "bin/glaeda-worktree-reclaim", reclaim.read_bytes(), 0o755)
+        _add(tar, ANCESTRY, ancestry, 0o644)
+        _add(tar, HOOK_HISTORY, hook_history(root, source), 0o644)
     return out.getvalue()
 
 

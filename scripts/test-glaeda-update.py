@@ -65,15 +65,25 @@ class Server:
         self.rings: dict[str, dict] = {}
         self.source = gu.REPOSITORY  # the repository publish() puts releases in
 
-    def publish(self, source: str, health_code: int = 0, archive: bytes | None = None) -> dict:
+    def publish(self, source: str, health_code: int = 0, archive: bytes | None = None,
+                runner_files: dict[str, bytes] | None = None, ancestry: list[str] | None = None,
+                hook_history: dict[str, list[bytes]] | None = None) -> dict:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
-        runner = {f"glaeda/scripts/{name}": (f"{name} at {source}".encode(), 0o755 if "." not in name else 0o644)
+        runner = {f"glaeda/scripts/{name}": ((runner_files or {}).get(name, f"{name} at {source}".encode()),
+                                             0o755 if "." not in name else 0o644)
                   for name in gu.RUNNER_FILES}
+        extra = {"ancestry.txt": ("".join(c + "\n" for c in ancestry).encode(), 0o644)} if ancestry else {}
+        if runner_files:  # the release's own hook versions, plus the older ones the test names
+            history = {name: sorted({gr.sha256(runner[f"glaeda/scripts/{name}"][0])}
+                                    | {gr.sha256(v) for v in (hook_history or {}).get(name, [])})
+                       for name in gr.HOOK_FILES}
+            extra["hook-history.json"] = (gr.canonical(history), 0o644)
         archive = archive or tar_gz({
             "glaeda/scripts/glaeda-mini-setup": (FAKE_SETUP.encode(), 0o755),
             "glaeda/scripts/health-code": (str(health_code).encode(), 0o644),
             "bin/glaeda-worktree-reclaim": (b"binary", 0o755),
             **runner,
+            **extra,
         })
         name = gr.hygiene_asset(TARGET)
         release_raw = gr.canonical(gr.release_manifest(source, tag, {name: archive}))
@@ -158,6 +168,81 @@ class UpdateTest(unittest.TestCase):
         newer = self.server.publish(SOURCES[1])
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {newer['tag']}")
+
+    def runner_mini(self) -> tuple[Path, Path, Path]:
+        """A mini as glaeda-cmux-runner --apply left it: an owned runner whose hooks came from the staged copy."""
+        home = self.root / "home"
+        runner = home / "actions-runner-glaeda"
+        hooks = runner / "glaeda-hooks"
+        hooks.mkdir(parents=True)
+        (runner / ".glaeda-cmux-runner").write_text("install-1\n")
+        state = home / ".local/state/glaeda/cmux-runner"
+        state.mkdir(parents=True)
+        (state / "receipt.json").write_text(json.dumps({"runnerDir": str(runner), "runnerDirOwned": True,
+                                                        "installId": "install-1"}))
+        hook = hooks / "glaeda-cmux-runner-hook"
+        (hooks / "job-started.sh").write_text(f"#!/bin/bash\nexec {sys.executable} {hook} job-started "
+                                              "--allowed-repo manaflow-ai/cmux\n")
+        (hooks / "job-started.sh").chmod(0o755)
+        staged = home / "glaeda-runner/scripts"
+        staged.mkdir(parents=True)
+        for name, data in self.runner_files("an older release").items():
+            (staged / name).write_bytes(data)
+            target = hooks / name
+            if name in ("glaeda-cmux-runner-hook", "glaeda_reservation.py"):
+                target.write_bytes(data)
+                target.chmod(0o755 if name == "glaeda-cmux-runner-hook" else 0o644)
+        return home, staged, hook
+
+    def runner_files(self, which: str) -> dict[str, bytes]:
+        """The real runner scripts, with a hook that says which release it came from."""
+        files = {name: (ROOT / "scripts" / name).read_bytes() for name in gu.RUNNER_FILES}
+        files["glaeda-cmux-runner-hook"] += f"\n# {which}\n".encode()
+        return files
+
+    def older(self) -> dict[str, list[bytes]]:
+        """The hook versions runner_mini installed, as history a release descends from."""
+        files = self.runner_files("an older release")
+        return {name: [files[name]] for name in gr.HOOK_FILES}
+
+    def test_an_update_installs_the_releases_runner_hook(self) -> None:
+        home, staged, hook = self.runner_mini()
+        wrapper = (hook.parent / "job-started.sh").read_bytes()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the fixed release"),
+                                    hook_history=self.older())
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertEqual(gu.runner_steps(self.state, staged, home),
+                         {"runnerScripts": f"refreshed to {entry['tag']}", "runnerHooks": f"{entry['tag']}: 1 updated"})
+        self.assertEqual(hook.read_bytes(), self.runner_files("the fixed release")["glaeda-cmux-runner-hook"])
+        self.assertEqual(os.stat(hook).st_mode & 0o777, 0o755)
+        self.assertEqual((hook.parent / "job-started.sh").read_bytes(), wrapper, "wrappers are --apply's")
+        self.assertEqual(gu.runner_steps(self.state, staged, home)["runnerHooks"], f"{entry['tag']}: 1 unchanged")
+
+    def test_a_hook_newer_than_the_release_is_never_downgraded(self) -> None:
+        home, staged, hook = self.runner_mini()
+        newer = self.runner_files("main, after the release")["glaeda-cmux-runner-hook"]
+        hook.write_bytes(newer)  # fleet runner relabel --apply from a temporary copy of main
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the release"),
+                                    hook_history=self.older())
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertEqual(gu.runner_steps(self.state, staged, home)["runnerHooks"],
+                         f"{entry['tag']}: 1 kept (the installed glaeda-cmux-runner-hook is not a version this "
+                         "release descends from; --apply owns it)")
+        self.assertEqual(hook.read_bytes(), newer)
+
+    def test_a_same_day_operator_copy_the_release_descends_from_is_refreshed(self) -> None:
+        home, staged, hook = self.runner_mini()
+        (staged / gu.SOURCE_STAMP).write_text(json.dumps({"by": "glaeda-cmux-runner-fleet", "date": "2026-09-25",
+                                                          "source": "d" * 40}))
+        self.server.publish(SOURCES[0], runner_files=self.runner_files("the release"), ancestry=[SOURCES[0]])
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertIn("kept", gu.refresh_runner_scripts(self.state, staged))
+        newer = self.server.publish(SOURCES[1], runner_files=self.runner_files("the next release"),
+                                    ancestry=[SOURCES[1], "d" * 40], hook_history=self.older())
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertEqual(gu.runner_steps(self.state, staged, home),
+                         {"runnerScripts": f"refreshed to {newer['tag']}", "runnerHooks": f"{newer['tag']}: 1 updated"})
+        self.assertEqual(hook.read_bytes(), self.runner_files("the next release")["glaeda-cmux-runner-hook"])
 
     def test_unhealthy_release_rolls_back_and_is_quarantined(self) -> None:
         good = self.server.publish(SOURCES[0])
@@ -412,6 +497,10 @@ class ReleaseTest(unittest.TestCase):
                 setup = tar.getmember("glaeda/scripts/glaeda-mini-setup")
                 self.assertTrue(setup.mode & 0o111)
                 self.assertEqual(tar.extractfile("bin/glaeda-worktree-reclaim").read(), b"\x7fELF")
+                self.assertEqual(tar.extractfile(gr.ANCESTRY).read().decode().split()[0], head)
+                history = json.loads(tar.extractfile(gr.HOOK_HISTORY).read())
+                hook_now = gr.sha256((ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes())
+                self.assertIn(hook_now, history["glaeda-cmux-runner-hook"])  # the tree is committed in CI
             self.assertIn("glaeda/scripts/glaeda-update", names)
             self.assertIn("glaeda/ops/systemd/glaeda-update.timer", names)
             # glaeda-update's own extraction accepts it

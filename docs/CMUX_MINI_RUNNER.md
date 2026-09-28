@@ -387,7 +387,25 @@ note names the release's own copy to run, and the release's plan labels are show
 `label drift (release ...)`. `--allow-stale` overrides. `glaeda-cmux-runner-fleet`
 writes the stamp when it stages; `glaeda-update` refreshes an older staged copy from the
 installed release every hour, and keeps a copy an operator staged on the release's day
-or later. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
+or later unless the release descends from the stamp's commit.
+
+**Hook fixes roll out without `--apply`.** Every hour `glaeda-update` also runs the
+installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
+a receipt owns, it writes `glaeda-hooks/glaeda-cmux-runner-hook` and
+`glaeda_reservation.py` atomically and synced (0755 and 0644, the module first) and nothing
+else, so no registration token or org-admin access is needed. It replaces only a file whose
+bytes are a version the release descends from (the release's `hook-history.json`); a hook
+installed from a newer main, or edited, is `kept`. A runner with a `Runner.Worker` (or
+where pgrep cannot tell) is `deferred` to the next run, checked again right before the
+swap. The new hook is staged in `glaeda-hooks/` and must `--parse-only` every hook call in
+the installed wrappers (job-started, job-completed, listen, take-root, take-gui) under the
+wrapper's own interpreter, or the runner is `blocked`, since a rejected job-started would
+fail every job. `--apply`, `--uninstall` and `--refresh-hooks` share one lock
+(`~/.local/state/glaeda/cmux-runner/runner.lock`); a refresh that finds it held waits for
+the next hour. The listener
+gate notices the new file and re-execs it, adopting its running `run.sh` ("the hook
+changed; reloading the gate"). Wrapper, label or LaunchAgent changes still need
+`--apply`. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
 `origin/main` in a temporary directory and does the whole relabel.
 
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
