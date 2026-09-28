@@ -155,11 +155,13 @@ jobs:
               Path("scripts/owned_linux_task.py"),
               Path("scripts/owned_linux_admission.py"),
               Path("scripts/owned_linux_jit_task.py"),
+              Path("scripts/repository_agent_work.py"),
               Path("scripts/external_execution_request.py"),
               Path("scripts/trusted_agent_dispatch.py"),
               Path("scripts/owned-admission-control"),
               Path("scripts/test-owned-linux-admission.py"),
               Path("scripts/test-owned-linux-jit-task.py"),
+              Path("scripts/test-repository-agent-work.py"),
               Path("scripts/test-external-execution-request.py"),
               Path("scripts/test-trusted-agent-dispatch.py"),
               Path("scripts/cmux_fleet.py"),
@@ -273,6 +275,7 @@ jobs:
           python3 scripts/test-verify-focused.py
           python3 scripts/test-owned-linux-admission.py
           python3 scripts/test-owned-linux-jit-task.py
+          python3 scripts/test-repository-agent-work.py
           python3 scripts/test-external-execution-request.py
           python3 scripts/test-trusted-agent-dispatch.py
           python3 scripts/test-provider-neutral-request.py

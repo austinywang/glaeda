@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "fixture_class": "historical_exact_revision_trial",
+  "fixtures": [
+    {
+      "name": "review-cmux-workload-profiles-pr-13411",
+      "work_ref": "github:manaflow-ai/cmux#13411",
+      "task_contract": "Review CMUX PR #13411 workload/profile corpus for source-identity safety, semantic-result integrity, benchmark comparability, and repository-owned command ownership. Report only actionable findings against the exact candidate.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "review",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "0905ea78b636d16742d7c352be21852d7f032303",
+            "tree": "1957841a2a8597fda569e36a9183cd4458d9a329"
+          },
+          "base": {
+            "commit": "aa4cc90348b96c2d087e6c5e9dee4b6756891bc4",
+            "tree": "4bd2ee368f504e598cf965cc9b337e7b62405fc7"
+          }
+        },
+        "task_contract_sha256": "sha256:c7b23d12f22705f9774f03ce83df477622317b36f99df8b6c32b11812ca276c1",
+        "scope": {
+          "class": "changed_paths"
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "read_only"
+        },
+        "verification": []
+      }
+    },
+    {
+      "name": "review-cmux-fleet-acceptance-pr-13399",
+      "work_ref": "github:manaflow-ai/cmux#13399",
+      "task_contract": "Review CMUX fleet enrollment and machine-acceptance change #13399 for recovery durability, role/profile ownership, path safety, and standalone operator runbook correctness.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "review",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "040915c5c783a731c6ad15318353757d02495df7",
+            "tree": "b9b7af6a6cc06ee8c044f87b7ccaf42db76da8e0"
+          },
+          "base": {
+            "commit": "c4e20955ac506a4acd3cd52cf1b06b6b61c9399d",
+            "tree": "249f81758c0982432444c0e6a2b00d2bec8ef6b9"
+          }
+        },
+        "task_contract_sha256": "sha256:28e64229f2a050675fcdd9960ff6bd742945153bf7a8d9a66e83fd3c62940556",
+        "scope": {
+          "class": "changed_paths"
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "read_only"
+        },
+        "verification": []
+      }
+    },
+    {
+      "name": "review-cmux-persistent-compile-pr-13383",
+      "work_ref": "github:manaflow-ai/cmux#13383",
+      "task_contract": "Review persistent Mac compile-admission pilot #13383 for source/toolchain exactness, cache-state disclosure, hosted fallback, and benchmark comparability.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "review",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "033eb4178a6e2120fd44b0ca6bec438fac62cbaa",
+            "tree": "aa2c95dcf76f5b0e289c77a2da67d7980bcec81e"
+          },
+          "base": {
+            "commit": "6c684314790fc8c3a773a9e0afb496a6339c1bcb",
+            "tree": "d893bb1a331451124e7d771f7a8eb99f022ecc0f"
+          }
+        },
+        "task_contract_sha256": "sha256:226a8161611946651c5746bdc2edd5727238b525a32c73984bb686d1b3e3be56",
+        "scope": {
+          "class": "changed_paths"
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "read_only"
+        },
+        "verification": []
+      }
+    },
+    {
+      "name": "repair-cmux-workload-git-environment",
+      "work_ref": "github:manaflow-ai/cmux#13411:review-git-env",
+      "task_contract": "Repair the accepted review finding on the CMUX workload runner source identity: sanitize inherited Git environment variables for every Git identity and cleanliness operation without changing profile semantics.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "repair",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "73993b150e338644dc016c0015f000cb1ddb077b",
+            "tree": "516140b5f672a1c3044bdcba1a2eff6713837c50"
+          }
+        },
+        "task_contract_sha256": "sha256:ff16c75aabbd3984d4ae9d179c637298850baf07532d8ac01377aa76cfb0a11c",
+        "scope": {
+          "class": "bounded_paths",
+          "paths": [
+            "scripts/ci/cmux_workload_profile.py",
+            "tests/test_ci_workload_profiles.py"
+          ]
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "task_private_patch",
+          "max_changed_paths": 2,
+          "max_patch_bytes": 65536,
+          "allow_new_files": false,
+          "allow_deletes": false
+        },
+        "verification": [
+          {
+            "id": "cmux.ci.guard",
+            "generation": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "repair-cmux-fleet-recovery-runbook",
+      "work_ref": "github:manaflow-ai/cmux#13399:review-recovery-vars",
+      "task_contract": "Repair the accepted fleet-enrollment runbook finding: make recovery and rollback commands reconstruct durable paths in a fresh shell without changing machine lifecycle semantics.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "repair",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "26eecf3537119c5a108141f9da0a25a0f7fab65d",
+            "tree": "44ebca12be5264a84d46d0b919837d2a0957c28e"
+          }
+        },
+        "task_contract_sha256": "sha256:0901a90d1a09f6fa5d75f6d29cfb23daaeb51be0f69eedd1081f5e0cba7c3128",
+        "scope": {
+          "class": "bounded_paths",
+          "paths": [
+            "docs/fleet-enrollment.md"
+          ]
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "task_private_patch",
+          "max_changed_paths": 1,
+          "max_patch_bytes": 32768,
+          "allow_new_files": false,
+          "allow_deletes": false
+        },
+        "verification": [
+          {
+            "id": "cmux.ci.guard",
+            "generation": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "repair-cmux-benchmark-state-contract",
+      "work_ref": "github:manaflow-ai/cmux#13411:review-benchmark-state",
+      "task_contract": "Repair the accepted benchmark-state finding in the CMUX workload profile registry so every advertised warm state corresponds to state the repository entrypoint actually preserves.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "repair",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "73993b150e338644dc016c0015f000cb1ddb077b",
+            "tree": "516140b5f672a1c3044bdcba1a2eff6713837c50"
+          }
+        },
+        "task_contract_sha256": "sha256:20bf228ab6982112922008151f20bd9a362436af6f96128a1545ec71b89763d2",
+        "scope": {
+          "class": "bounded_paths",
+          "paths": [
+            "docs/workload-profiles.md",
+            "scripts/ci/cmux-workload-profiles.json",
+            "tests/test_ci_workload_profiles.py"
+          ]
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "task_private_patch",
+          "max_changed_paths": 3,
+          "max_patch_bytes": 65536,
+          "allow_new_files": false,
+          "allow_deletes": false
+        },
+        "verification": [
+          {
+            "id": "cmux.ci.guard",
+            "generation": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "research-cmux-warm-dev-slot-invalidation",
+      "work_ref": "github:manaflow-ai/cmux#13091",
+      "task_contract": "Research which CMUX source and input changes invalidate resident-hot tagged developer builds and propose a generated fixture matrix for small source, project graph, settings/config, and no-op changes. Separate measured evidence from inferred invalidation.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "research",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "aa4cc90348b96c2d087e6c5e9dee4b6756891bc4",
+            "tree": "4bd2ee368f504e598cf965cc9b337e7b62405fc7"
+          }
+        },
+        "task_contract_sha256": "sha256:1967bdbb83746952b0f8b06110f6ee555051288f7b2869b8c7da0a9f899cb727",
+        "scope": {
+          "class": "whole_repository"
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "read_only"
+        },
+        "verification": []
+      }
+    },
+    {
+      "name": "research-cmux-compile-admission-benchmark",
+      "work_ref": "github:manaflow-ai/cmux#13198",
+      "task_contract": "Research a controlled benchmark plan for hosted versus persistent Mac compile admission using cmux.macos.compile-admission@1, including cold, dependency-warm, and compiler-warm classification, toolchain controls, and artifact-validation equivalence.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "research",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "aa4cc90348b96c2d087e6c5e9dee4b6756891bc4",
+            "tree": "4bd2ee368f504e598cf965cc9b337e7b62405fc7"
+          }
+        },
+        "task_contract_sha256": "sha256:88092e7a42f8fd01bceb238de9cb78de34ef6a11c22ce3bd7b9691f83fc0a1fc",
+        "scope": {
+          "class": "whole_repository"
+        },
+        "network_class": "public_web",
+        "mutation": {
+          "class": "read_only"
+        },
+        "verification": []
+      }
+    },
+    {
+      "name": "research-cmux-app-host-acceptance-fixture",
+      "work_ref": "github:manaflow-ai/cmux#6134",
+      "task_contract": "Research which CMUX app-host shard or generated fixture best serves machine acceptance and fleet benchmarking, using the current shard selector, timing evidence, crash tolerance, and compile-product reuse semantics.",
+      "request": {
+        "document_type": "glaeda-repository-agent-work-request",
+        "schema_version": 1,
+        "operation": "research",
+        "source": {
+          "repository": "manaflow-ai/cmux",
+          "head": {
+            "commit": "aa4cc90348b96c2d087e6c5e9dee4b6756891bc4",
+            "tree": "4bd2ee368f504e598cf965cc9b337e7b62405fc7"
+          }
+        },
+        "task_contract_sha256": "sha256:d73780baba2a38ce814b9b10e42183ec419f77a0602795705240b0ec03478ae6",
+        "scope": {
+          "class": "whole_repository"
+        },
+        "network_class": "repository_only",
+        "mutation": {
+          "class": "read_only"
+        },
+        "verification": []
+      }
+    }
+  ]
+}
