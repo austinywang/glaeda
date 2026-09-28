@@ -45,12 +45,14 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    the run already fetched, so a network blip cannot fail a good release.
 
    On a runner mini, each run (not only one that installs a release) then brings
-   `~/glaeda-runner/scripts` to the installed release when it is older and, while that copy is the
-   release's, the runners' `glaeda-hooks/glaeda-cmux-runner-hook` and `glaeda_reservation.py` too
-   (`glaeda-cmux-runner --refresh-hooks`, docs/CMUX_MINI_RUNNER.md 2c). Runners with a job wait for
-   the next run; the listener gates re-exec the new hook themselves. The hygiene archive's
-   `ancestry.txt` tells a copy an operator staged from an ancestor of the release (refreshed) from a
-   newer one (kept).
+   `~/glaeda-runner/scripts` to the installed release when it is older, and the runners'
+   `glaeda-hooks/glaeda-cmux-runner-hook` and `glaeda_reservation.py` too when theirs are versions the
+   release descends from (`glaeda-cmux-runner --refresh-hooks`, docs/CMUX_MINI_RUNNER.md 2c). Runners
+   with a job wait for the next run; the listener gates re-exec the new hook themselves. The hygiene
+   archive carries `ancestry.txt` (the source's ancestors: a copy an operator staged from one is
+   refreshed, a newer one kept) and `hook-history.json` (the SHA-256 of every version of those two
+   files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is
+   gated by CI, the six-hour soak and these checks, not by a canary status.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit.
 5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,

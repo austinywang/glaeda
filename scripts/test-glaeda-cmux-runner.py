@@ -3697,31 +3697,57 @@ class RunnerTest(unittest.TestCase):
 
     # ------------------------------------------------------------ hook refresh (glaeda-update's rollout)
 
-    def installed_with_an_older_hook(self) -> Path:
-        self.invoke("--apply", "--labels", "cmux-extra")
+    OLDER_HOOK = HOOK.read_text() + "\n# an older hook\n"
+
+    def hook_history(self, *hooks: str) -> None:
+        """A release's hook-history.json beside this copy, naming these hook versions (and today's module)."""
+        path = self.state / "hook-history.json"
+        path.write_text(json.dumps({
+            cr.HOOK_NAME: [hashlib.sha256(h.encode()).hexdigest() for h in hooks],
+            cr.RESERVATION_NAME: [hashlib.sha256((ROOT / "scripts" / cr.RESERVATION_NAME).read_bytes()).hexdigest()]}))
+        patch = mock.patch.object(cr, "HOOK_HISTORY", path)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def installed_with_an_older_hook(self, *apply_args: str) -> Path:
+        self.hook_history(self.OLDER_HOOK)
+        self.invoke("--apply", "--labels", "cmux-extra", *apply_args)
         hooks = self.home / "actions-runner-glaeda" / cr.HOOK_DIR
-        (hooks / cr.HOOK_NAME).write_text(HOOK.read_text() + "\n# an older hook\n")
+        (hooks / cr.HOOK_NAME).write_text(self.OLDER_HOOK)
         return hooks
 
     def test_refresh_hooks_installs_only_the_hook_files(self) -> None:
+        self.hook_history(self.OLDER_HOOK)
         self.invoke("--apply", "--labels", "cmux-extra")
         hooks = self.home / "actions-runner-glaeda" / cr.HOOK_DIR
         as_applied, calls = self.tree(), len(self.log())
-        (hooks / cr.HOOK_NAME).write_text(HOOK.read_text() + "\n# an older hook\n")
+        (hooks / cr.HOOK_NAME).write_text(self.OLDER_HOOK)
         (hooks / cr.RESERVATION_NAME).chmod(0o600)
         plan = self.invoke("--refresh-hooks")
         self.assertEqual([(r["state"], sorted(r["files"])) for r in plan["runners"]],
                          [("update", sorted([cr.HOOK_NAME, cr.RESERVATION_NAME]))])
-        self.assertNotEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes(), "a plan writes nothing")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK, "a plan writes nothing")
         done = self.invoke("--refresh-hooks", "--apply")
         self.assertEqual([r["state"] for r in done["runners"]], ["updated"])
         self.assertEqual(done["hookSha256"], cr.sha256_bytes(HOOK.read_bytes()))
-        # the hook and module are this copy's again; wrappers, plist and receipt are as --apply left them
-        self.assertEqual(self.tree(), as_applied)
+        # the hook and module are this copy's again; wrappers, plist, receipt are as --apply left them
+        self.assertEqual({k: v for k, v in self.tree().items() if not k.endswith("runner.lock")},
+                         {k: v for k, v in as_applied.items() if not k.endswith("runner.lock")})
         self.assertEqual(os.stat(hooks / cr.HOOK_NAME).st_mode & 0o777, 0o755)
         self.assertEqual(os.stat(hooks / cr.RESERVATION_NAME).st_mode & 0o777, 0o644)
         self.assertEqual(len(self.log()), calls, "no gh, launchctl or config.sh")
         self.assertEqual([r["state"] for r in self.invoke("--refresh-hooks", "--apply")["runners"]], ["unchanged"])
+
+    def test_refresh_hooks_never_downgrades_a_hook_it_does_not_know(self) -> None:
+        hooks = self.installed_with_an_older_hook()
+        newer = HOOK.read_text() + "\n# from main, newer than this release\n"
+        (hooks / cr.HOOK_NAME).write_text(newer)
+        kept = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(kept["state"], "kept")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), newer)
+        # a copy with no release history beside it (a checkout) refuses outright
+        with mock.patch.object(cr, "HOOK_HISTORY", self.state / "absent.json"):
+            self.assertIn("error", self.invoke("--refresh-hooks", "--apply", expect=1))
 
     def test_refresh_hooks_waits_for_a_job_and_refuses_what_it_cannot_prove(self) -> None:
         hooks = self.installed_with_an_older_hook()
@@ -3729,6 +3755,15 @@ class RunnerTest(unittest.TestCase):
         with mock.patch.object(cr, "worker_running", return_value=True):
             self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older, "never swapped under a running job")
+        # a job that starts during the checks: still deferred, nothing written
+        with mock.patch.object(cr, "worker_running", side_effect=[False, True]):
+            self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older)
+        with mock.patch.object(cr, "run", return_value=(127, "")):  # pgrep cannot tell: busy
+            self.assertTrue(cr.worker_running(self.home / "actions-runner-glaeda"))
+        # an --apply holds the lock: a later run refreshes
+        with cr.runner_lock(self.home, wait=True):
+            self.assertIn("lock", self.invoke("--refresh-hooks", "--apply", expect=1)["error"])
         # a wrapper passing a flag the new hook does not know: a swap would fail every job-started
         started = hooks / "job-started.sh"
         wrapper = started.read_text()
@@ -3752,12 +3787,25 @@ class RunnerTest(unittest.TestCase):
         (hooks / cr.HOOK_NAME).unlink()
         (hooks / cr.HOOK_NAME).write_bytes(older)
         (hooks / cr.HOOK_NAME).chmod(0o755)
+        (hooks / f".{cr.HOOK_NAME}.abc{cr.STAGE_SUFFIX}").write_text("a killed refresh's stage")
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
         self.assertEqual([p.name for p in hooks.iterdir() if p.name.endswith(".tmp")], [], "no stage left behind")
 
+    def test_refresh_hooks_checks_the_canonical_root_calls_too(self) -> None:
+        hooks = self.installed_with_an_older_hook("--capacity-units", "4")
+        calls = dict((w, argv) for w, argv in cr.hook_calls(hooks) if w == "glaeda-canonical-root")
+        self.assertTrue(calls, "take-root and take-gui are checked")
+        takes = [argv[2] for w, argv in cr.hook_calls(hooks) if w == "glaeda-canonical-root"]
+        self.assertEqual(sorted(takes), ["take-gui", "take-root"])
+        root = hooks / "glaeda-canonical-root"
+        root.write_text(root.read_text().replace("take-root --root", "take-root --flag-from-a-newer-hook --root"))
+        blocked = self.invoke("--refresh-hooks", "--apply", expect=1)["runners"][0]
+        self.assertIn("rejects glaeda-canonical-root", blocked["note"])
+
     def test_refresh_hooks_reads_every_instance_receipt_and_nothing_else(self) -> None:
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"], [], "no runner here: nothing")
+        self.hook_history("# older\n")
         self.invoke("--apply", "--labels", "cmux-extra")
         self.invoke("--apply", "--labels", "cmux-extra", "--instance", "2")
         for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
