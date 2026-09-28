@@ -1376,6 +1376,9 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
         return {**entry, "state": "skipped", "note": f"no {HOOK_DIR} directory; --apply installs it"}
     if apply:  # stages a killed refresh or --apply left; under the lock none is live
         for leftover in hook_dir.glob(f".*{STAGE_SUFFIX}"):
+            # an older copy's --apply takes no lock and stages to a fixed .<name>.cmux-runner.tmp: never its
+            if (hook_dir / leftover.name[1:-len(STAGE_SUFFIX)]).exists():  # .job-started.sh.cmux-runner.tmp
+                continue
             if leftover.is_file() and not leftover.is_symlink():
                 leftover.unlink()
     stale = []
@@ -1409,21 +1412,30 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
     if not any(wrapper == "job-started.sh" for wrapper, _ in calls):
         return {**entry, "state": "blocked", "note": "no job-started.sh call to check the new hook against; "
                                                      "re-run glaeda-cmux-runner --apply"}
-    staged = stage_file(hook_dir / HOOK_NAME, *sources[HOOK_NAME])
+    if not apply:  # a plan writes nothing: it checks this copy's hook where it is
+        why = new_hook_accepts(calls, HOOK_SOURCE)
+        if why:
+            return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
+        return {**entry, "state": "update"}
+    try:
+        staged = stage_file(hook_dir / HOOK_NAME, *sources[HOOK_NAME])
+    except OSError as error:  # a full disk: this runner waits, the others still refresh
+        return {**entry, "state": "deferred", "note": f"cannot stage the new hook ({type(error).__name__}: {error})"[:300]}
     try:
         why = new_hook_accepts(calls, staged)
         if why:
             return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
-        if not apply:
-            return {**entry, "state": "update"}
         if worker_running(runner_dir):  # a job took the runner during the checks
             return {**entry, "state": "deferred", "note": "the runner has a job; a later run installs it"}
         # the module first: the hook, which the gate watches and reloads, lands only beside the module it reads
-        if RESERVATION_NAME in stale:
-            write_atomic(hook_dir / RESERVATION_NAME, *sources[RESERVATION_NAME], make_parent=False)
-        if HOOK_NAME in stale:
-            os.replace(staged, hook_dir / HOOK_NAME)
-            sync_dir(hook_dir)
+        try:
+            if RESERVATION_NAME in stale:
+                write_atomic(hook_dir / RESERVATION_NAME, *sources[RESERVATION_NAME], make_parent=False)
+            if HOOK_NAME in stale:
+                os.replace(staged, hook_dir / HOOK_NAME)
+                sync_dir(hook_dir)
+        except OSError as error:
+            return {**entry, "state": "deferred", "note": f"cannot install ({type(error).__name__}: {error})"[:300]}
     finally:
         with contextlib.suppress(FileNotFoundError):
             staged.unlink()

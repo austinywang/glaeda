@@ -3788,9 +3788,12 @@ class RunnerTest(unittest.TestCase):
         (hooks / cr.HOOK_NAME).write_bytes(older)
         (hooks / cr.HOOK_NAME).chmod(0o755)
         (hooks / f".{cr.HOOK_NAME}.abc{cr.STAGE_SUFFIX}").write_text("a killed refresh's stage")
+        live = hooks / f".job-started.sh{cr.STAGE_SUFFIX}"  # an older copy's lockless --apply, mid-write
+        live.write_text("an older --apply's stage")
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
-        self.assertEqual([p.name for p in hooks.iterdir() if p.name.endswith(".tmp")], [], "no stage left behind")
+        self.assertEqual([p.name for p in hooks.iterdir() if p.name.endswith(".tmp")], [live.name],
+                         "its own stages are gone; an older --apply's fixed stage is not its to remove")
 
     def test_refresh_hooks_checks_the_canonical_root_calls_too(self) -> None:
         hooks = self.installed_with_an_older_hook("--capacity-units", "4")
