@@ -45,21 +45,52 @@ PRESSURE_KINDS = ("cpu", "memory", "io")
 SHA256_PREFIX = "sha256:"
 HOT_STATE_SCHEMA_VERSION = 1
 HOT_STATE_PRODUCER = "glaeda-hot-run-python-state-v1"
+HOT_STATE_MANIFEST_SCHEMA_VERSION = 2
+HOT_STATE_MANIFEST_PRODUCER = "glaeda-hot-run-python-state-v2"
+HOT_STATE_MANIFEST_LEGACY_SCHEMA_VERSION = 1
+HOT_STATE_MANIFEST_LEGACY_PRODUCER = "glaeda-hot-run-python-state-v1"
+HOT_STATE_NAMESPACE_LEASE_PROTOCOL = "full_execution_shared_namespace_v1"
 HOT_STATE_MANIFEST = "producer-manifest.json"
 HOT_STATE_MANIFEST_STAGING_PREFIX = ".producer-manifest.json.creating-"
 HOT_STATE_NAMESPACE_LOCK = ".namespace-lock"
+HOT_STATE_VALUE_LOCK = ".value-lock-v2"
 HOT_STATE_CREATING_PREFIX = ".creating-v1-"
 HOT_STATE_RETIRED_PREFIX = ".retired-v1-"
 HOT_STATE_RETIREMENT_RECORD_PREFIX = ".retirement-v1-"
 HOT_STATE_RETIREMENT_RECORD_SUFFIX = ".json"
 HOT_STATE_VALUE_CATALOG = ".value-catalog-v1.json"
 HOT_STATE_VALUE_CATALOG_STAGING = ".value-catalog-v1.json.creating"
-HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION = 1
-HOT_STATE_VALUE_CATALOG_PRODUCER = "glaeda-hot-run-value-catalog-v1"
+HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION = 2
+HOT_STATE_VALUE_CATALOG_PRODUCER = "glaeda-hot-run-value-catalog-v2"
+HOT_STATE_VALUE_CATALOG_V1_SCHEMA_VERSION = 1
+HOT_STATE_VALUE_CATALOG_V1_PRODUCER = "glaeda-hot-run-value-catalog-v1"
+HOT_STATE_VALUE_CATALOG_V1_MAX_STATES = 256
+HOT_STATE_VALUE_RECORDS = ".value-records-v2"
+HOT_STATE_VALUE_RECORD_SCHEMA_VERSION = 1
+HOT_STATE_VALUE_RECORD_PRODUCER = "glaeda-hot-run-value-record-v1"
+HOT_STATE_VALUE_RECORD_SUFFIX = ".json"
+HOT_STATE_VALUE_RECORD_STAGING_SUFFIX = ".creating"
+HOT_STATE_VALUE_TICKETS = ".value-tickets-v2"
+HOT_STATE_VALUE_TICKET_SCHEMA_VERSION = 1
+HOT_STATE_VALUE_TICKET_PRODUCER = "glaeda-hot-run-value-ticket-v1"
+HOT_STATE_VALUE_TICKET_SUFFIX = ".json"
+HOT_STATE_RECONCILE_CATALOG = ".reconcile-v1.json"
+HOT_STATE_RECONCILE_CATALOG_STAGING = ".reconcile-v1.json.creating"
+HOT_STATE_RECONCILE_SCHEMA_VERSION = 1
+HOT_STATE_RECONCILE_PRODUCER = "glaeda-hot-run-reconcile-v1"
+HOT_STATE_RECONCILE_TICKETS = ".reconcile-tickets-v1"
+HOT_STATE_RECONCILE_TICKET_SCHEMA_VERSION = 1
+HOT_STATE_RECONCILE_TICKET_PRODUCER = "glaeda-hot-run-reconcile-ticket-v1"
+HOT_STATE_RECONCILE_TICKET_SUFFIX = ".json"
+HOT_STATE_RECONCILE_TICKETS_PER_PASS = 32
+HOT_STATE_VALUE_TICKETS_PER_PASS = 32
 MAX_HOT_STATE_MANIFEST_BYTES = 32 * 1024
-MAX_HOT_STATE_VALUE_CATALOG_BYTES = 256 * 1024
-MAX_HOT_STATE_NAMESPACE_ENTRIES = 256
-MAX_HOT_STATE_RUNTIME_ENTRIES = 64
+MAX_HOT_STATE_VALUE_CATALOG_BYTES = 32 * 1024
+MAX_HOT_STATE_VALUE_CATALOG_V1_BYTES = 256 * 1024
+MAX_HOT_STATE_VALUE_RECORD_BYTES = 8 * 1024
+MAX_HOT_STATE_VALUE_TICKET_BYTES = 4 * 1024
+MAX_HOT_STATE_RECONCILE_CATALOG_BYTES = 4 * 1024
+MAX_HOT_STATE_RECONCILE_TICKET_BYTES = 4 * 1024
 MAX_HOT_STATE_CREATING_ENTRIES = 2
 MAX_HOT_STATE_DELETE_ENTRIES = 2048
 MAX_HOT_STATE_DELETE_DEPTH = 128
@@ -177,14 +208,6 @@ class PinnedWorktreeState:
 @dataclass
 class DeleteBudget:
     remaining_entries: int
-
-
-@dataclass(frozen=True)
-class RetirementLock:
-    path: Path
-    descriptor: int
-    device: int
-    inode: int
 
 
 def nonnegative_finite(raw: str) -> float:
@@ -819,16 +842,29 @@ def producer_manifest_document(
         ),
     )
     return {
-        "schema_version": HOT_STATE_SCHEMA_VERSION,
-        "producer": HOT_STATE_PRODUCER,
+        "schema_version": HOT_STATE_MANIFEST_SCHEMA_VERSION,
+        "producer": HOT_STATE_MANIFEST_PRODUCER,
         "state_identity": state_base.name,
         "reconstructible": True,
+        "namespace_lease_protocol": HOT_STATE_NAMESPACE_LEASE_PROTOCOL,
         "cache_views": [
             {"path": os.fspath(spec.path), "mode": spec.mode}
             for spec in cache_specs
         ],
         "generation_objects": list(objects),
     }
+
+
+def manifest_generation_contract_equal(
+    expected: dict[str, object],
+    observed: dict[str, object],
+) -> bool:
+    return (
+        expected.get("state_identity") == observed.get("state_identity")
+        and expected.get("reconstructible") == observed.get("reconstructible")
+        and expected.get("cache_views") == observed.get("cache_views")
+        and expected.get("generation_objects") == observed.get("generation_objects")
+    )
 
 
 def canonical_manifest_bytes(document: dict[str, object]) -> bytes:
@@ -843,19 +879,34 @@ def canonical_manifest_bytes(document: dict[str, object]) -> bytes:
 def validate_manifest_document(
     document: object, expected_state_identity: str
 ) -> dict[str, object]:
-    if not isinstance(document, dict) or set(document) != {
+    if not isinstance(document, dict):
+        raise RuntimeError("hot-state producer manifest has an unsupported shape")
+    legacy_keys = {
         "schema_version",
         "producer",
         "state_identity",
         "reconstructible",
         "cache_views",
         "generation_objects",
-    }:
-        raise RuntimeError("hot-state producer manifest has an unsupported shape")
+    }
+    current_keys = legacy_keys | {"namespace_lease_protocol"}
+    legacy = (
+        set(document) == legacy_keys
+        and document.get("schema_version")
+        == HOT_STATE_MANIFEST_LEGACY_SCHEMA_VERSION
+        and document.get("producer") == HOT_STATE_MANIFEST_LEGACY_PRODUCER
+    )
+    current = (
+        set(document) == current_keys
+        and document.get("schema_version") == HOT_STATE_MANIFEST_SCHEMA_VERSION
+        and document.get("producer") == HOT_STATE_MANIFEST_PRODUCER
+        and document.get("namespace_lease_protocol")
+        == HOT_STATE_NAMESPACE_LEASE_PROTOCOL
+    )
+    if not legacy and not current:
+        raise RuntimeError("hot-state producer manifest identity is not accepted")
     if (
-        document["schema_version"] != HOT_STATE_SCHEMA_VERSION
-        or document["producer"] != HOT_STATE_PRODUCER
-        or document["state_identity"] != expected_state_identity
+        document["state_identity"] != expected_state_identity
         or not state_identity_name(expected_state_identity)
         or document["reconstructible"] is not True
     ):
@@ -933,6 +984,17 @@ def validate_manifest_document(
             ):
                 raise RuntimeError("hot-state producer manifest generation is invalid")
     return document
+
+
+def manifest_has_full_execution_namespace_lease(
+    document: dict[str, object],
+) -> bool:
+    return (
+        document.get("schema_version") == HOT_STATE_MANIFEST_SCHEMA_VERSION
+        and document.get("producer") == HOT_STATE_MANIFEST_PRODUCER
+        and document.get("namespace_lease_protocol")
+        == HOT_STATE_NAMESPACE_LEASE_PROTOCOL
+    )
 
 
 def recompute_manifest_state_identity(document: dict[str, object]) -> str:
@@ -1136,12 +1198,16 @@ def publish_implicit_state_base(
                 "implicit hot-state generation is not an owner-private directory"
             )
         try:
-            _, observed = read_producer_manifest(state_base, state_base.name)
+            observed_manifest, observed = read_producer_manifest(
+                state_base, state_base.name
+            )
         except FileNotFoundError:
             raise RuntimeError(
                 "implicit hot-state generation collides with manifestless state"
             )
-        if observed != encoded:
+        if observed != encoded and not manifest_generation_contract_equal(
+            expected_manifest, observed_manifest
+        ):
             raise RuntimeError("hot-state producer manifest conflicts with this generation")
         return "reused"
 
@@ -1151,6 +1217,12 @@ def publish_implicit_state_base(
             f"{HOT_STATE_CREATING_PREFIX}{state_base.name}-"
             f"{os.getpid()}-{time.time_ns()}-{attempt}"
         )
+        enqueue_hot_state_reconcile_ticket(
+            namespace_root,
+            "creating",
+            state_base.name,
+            staging.name,
+        )
         try:
             staging.mkdir(mode=0o700)
             break
@@ -1158,8 +1230,15 @@ def publish_implicit_state_base(
             continue
     else:
         raise RuntimeError("could not allocate a hot-state publication stage")
-    # A failed publication leaves this exact producer-owned stage as bounded recovery debt.
+    # Tickets are published before mutation so a crash leaves either a
+    # harmless stale ticket or exact recovery debt.
     write_producer_manifest(staging, encoded)
+    enqueue_hot_state_reconcile_ticket(
+        namespace_root,
+        "state",
+        state_base.name,
+        state_base.name,
+    )
     rename_noreplace(staging, state_base)
     fsync_directory(namespace_root)
     return "created"
@@ -1237,111 +1316,6 @@ def manifest_generation_reachable(document: dict[str, object]) -> bool | None:
         if details.st_dev != item["device"] or details.st_ino != item["inode"]:
             return False
     return True
-
-
-def acquire_retirement_locks(state: Path) -> list[RetirementLock] | None:
-    lock_paths: list[Path] = []
-    direct_lock = state / "lock"
-    try:
-        direct_lock.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return None
-    else:
-        lock_paths.append(direct_lock)
-    try:
-        entries = scan_directory_bounded(state, MAX_HOT_STATE_RUNTIME_ENTRIES)
-    except OSError:
-        return None
-    if entries is None:
-        return None
-    for entry in entries:
-        if not entry.name.startswith("runtime-"):
-            continue
-        identity = entry.name.removeprefix("runtime-")
-        try:
-            details = entry.stat(follow_symlinks=False)
-        except OSError:
-            return None
-        if (
-            not state_identity_name(identity)
-            or not stat.S_ISDIR(details.st_mode)
-            or stat.S_ISLNK(details.st_mode)
-            or details.st_uid != os.getuid()
-            or stat.S_IMODE(details.st_mode) != 0o700
-        ):
-            return None
-        runtime_lock = state / entry.name / "lock"
-        try:
-            runtime_lock.lstat()
-        except OSError:
-            return None
-        lock_paths.append(runtime_lock)
-
-    locks: list[RetirementLock] = []
-    acquired_all = False
-    pending_descriptor: int | None = None
-    try:
-        for path in lock_paths:
-            try:
-                pending_descriptor = os.open(
-                    path, os.O_CLOEXEC | os.O_NOFOLLOW | os.O_RDWR
-                )
-                details = os.fstat(pending_descriptor)
-                if (
-                    not stat.S_ISREG(details.st_mode)
-                    or details.st_uid != os.getuid()
-                    or details.st_nlink != 1
-                    or stat.S_IMODE(details.st_mode) != 0o600
-                ):
-                    return None
-                fcntl.flock(
-                    pending_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
-                )
-            except OSError:
-                return None
-            locks.append(
-                RetirementLock(
-                    path,
-                    pending_descriptor,
-                    details.st_dev,
-                    details.st_ino,
-                )
-            )
-            pending_descriptor = None
-        acquired_all = True
-        return locks
-    finally:
-        if pending_descriptor is not None:
-            os.close(pending_descriptor)
-        if not acquired_all:
-            for lock in reversed(locks):
-                os.close(lock.descriptor)
-
-
-def retirement_locks_unchanged(locks: list[RetirementLock]) -> bool:
-    for lock in locks:
-        try:
-            details = lock.path.stat(follow_symlinks=False)
-        except OSError:
-            return False
-        if (
-            details.st_dev != lock.device
-            or details.st_ino != lock.inode
-            or not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.getuid()
-            or details.st_nlink != 1
-            or stat.S_IMODE(details.st_mode) != 0o600
-        ):
-            return False
-    return True
-
-
-def close_retirement_locks(locks: list[RetirementLock] | None) -> None:
-    if locks is not None:
-        for lock in reversed(locks):
-            os.close(lock.descriptor)
 
 
 def delete_directory_contents_bounded(
@@ -1534,8 +1508,45 @@ def empty_hot_state_value_catalog() -> dict[str, object]:
         "retire_start_used_percent": HOT_STATE_RETIRE_START_USED_PERCENT,
         "retire_stop_used_percent": HOT_STATE_RETIRE_STOP_USED_PERCENT,
         "next_use_sequence": 0,
-        "states": {},
+        "next_value_ticket_sequence": 0,
+        "value_cursor_ticket_sequence": 0,
     }
+
+
+def validate_hot_state_value_catalog_v1(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "pressure_active",
+        "retire_start_used_percent",
+        "retire_stop_used_percent",
+        "next_use_sequence",
+        "states",
+    }:
+        raise RuntimeError("hot-state v1 value catalog has an unsupported shape")
+    sequence = document["next_use_sequence"]
+    states = document["states"]
+    if (
+        document["schema_version"] != HOT_STATE_VALUE_CATALOG_V1_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_VALUE_CATALOG_V1_PRODUCER
+        or not isinstance(document["pressure_active"], bool)
+        or document["retire_start_used_percent"] != HOT_STATE_RETIRE_START_USED_PERCENT
+        or document["retire_stop_used_percent"] != HOT_STATE_RETIRE_STOP_USED_PERCENT
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 0
+        or not isinstance(states, dict)
+        or len(states) > HOT_STATE_VALUE_CATALOG_V1_MAX_STATES
+    ):
+        raise RuntimeError("hot-state v1 value catalog identity is not accepted")
+    for state_identity, record in states.items():
+        validate_hot_state_value_record_fields(
+            state_identity,
+            record,
+            sequence,
+            value_ticket_required=False,
+        )
+    return document
 
 
 def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
@@ -1546,33 +1557,41 @@ def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
         "retire_start_used_percent",
         "retire_stop_used_percent",
         "next_use_sequence",
-        "states",
+        "next_value_ticket_sequence",
+        "value_cursor_ticket_sequence",
     }:
         raise RuntimeError("hot-state value catalog has an unsupported shape")
     sequence = document["next_use_sequence"]
-    states = document["states"]
-    start_percent = document["retire_start_used_percent"]
-    stop_percent = document["retire_stop_used_percent"]
+    next_ticket = document["next_value_ticket_sequence"]
+    cursor = document["value_cursor_ticket_sequence"]
     if (
-        isinstance(document["schema_version"], bool)
-        or not isinstance(document["schema_version"], int)
-        or document["schema_version"] != HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION
+        document["schema_version"] != HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION
         or document["producer"] != HOT_STATE_VALUE_CATALOG_PRODUCER
         or not isinstance(document["pressure_active"], bool)
-        or isinstance(start_percent, bool)
-        or not isinstance(start_percent, int)
-        or start_percent != HOT_STATE_RETIRE_START_USED_PERCENT
-        or isinstance(stop_percent, bool)
-        or not isinstance(stop_percent, int)
-        or stop_percent != HOT_STATE_RETIRE_STOP_USED_PERCENT
+        or document["retire_start_used_percent"] != HOT_STATE_RETIRE_START_USED_PERCENT
+        or document["retire_stop_used_percent"] != HOT_STATE_RETIRE_STOP_USED_PERCENT
         or isinstance(sequence, bool)
         or not isinstance(sequence, int)
         or sequence < 0
-        or sequence > (1 << 63) - 1
-        or not isinstance(states, dict)
-        or len(states) > MAX_HOT_STATE_NAMESPACE_ENTRIES
+        or isinstance(next_ticket, bool)
+        or not isinstance(next_ticket, int)
+        or next_ticket < 0
+        or isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or cursor < 0
+        or cursor > next_ticket
     ):
         raise RuntimeError("hot-state value catalog identity is not accepted")
+    return document
+
+
+def validate_hot_state_value_record_fields(
+    state_identity: object,
+    record: object,
+    maximum_sequence: int | None = None,
+    *,
+    value_ticket_required: bool = True,
+) -> dict[str, object]:
     record_keys = {
         "manifest_device",
         "manifest_inode",
@@ -1583,54 +1602,104 @@ def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
         "reconstruction_elapsed_ns",
         "reuse_elapsed_ns",
     }
-    integer_keys = record_keys - {
+    if value_ticket_required:
+        record_keys.add("value_ticket_sequence")
+    if (
+        not isinstance(state_identity, str)
+        or not state_identity_name(state_identity)
+        or not isinstance(record, dict)
+        or set(record) != record_keys
+    ):
+        raise RuntimeError("hot-state value record is invalid")
+    integer_keys = [
+        "manifest_device",
+        "manifest_inode",
+        "manifest_creation_witness_ns",
+        "last_successful_use_sequence",
+        "successful_use_count",
+    ]
+    if value_ticket_required:
+        integer_keys.append("value_ticket_sequence")
+    for key in integer_keys:
+        value = record[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("hot-state value record is invalid")
+    if (
+        record["last_successful_use_sequence"] == 0
+        or record["successful_use_count"] == 0
+        or (
+            value_ticket_required
+            and record["value_ticket_sequence"] == 0
+        )
+        or (
+            maximum_sequence is not None
+            and record["last_successful_use_sequence"] > maximum_sequence
+        )
+    ):
+        raise RuntimeError("hot-state value record sequence is invalid")
+    value_identity = record["value_identity"]
+    if value_identity is not None and (
+        not isinstance(value_identity, str)
+        or not state_identity_name(value_identity)
+    ):
+        raise RuntimeError("hot-state value record value identity is invalid")
+    for key in ("reconstruction_elapsed_ns", "reuse_elapsed_ns"):
+        value = record[key]
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+        ):
+            raise RuntimeError("hot-state value record timing is invalid")
+    if value_identity is None and (
+        record["reconstruction_elapsed_ns"] is not None
+        or record["reuse_elapsed_ns"] is not None
+    ):
+        raise RuntimeError("hot-state value record timing is unbound")
+    return record
+
+
+def hot_state_value_record_document(
+    state_identity: str, record: dict[str, object]
+) -> dict[str, object]:
+    validate_hot_state_value_record_fields(state_identity, record)
+    return {
+        "schema_version": HOT_STATE_VALUE_RECORD_SCHEMA_VERSION,
+        "producer": HOT_STATE_VALUE_RECORD_PRODUCER,
+        "state_identity": state_identity,
+        **record,
+    }
+
+
+def validate_hot_state_value_record(document: object) -> dict[str, object]:
+    if not isinstance(document, dict):
+        raise RuntimeError("hot-state value record has an unsupported shape")
+    expected_keys = {
+        "schema_version",
+        "producer",
+        "state_identity",
+        "manifest_device",
+        "manifest_inode",
+        "manifest_creation_witness_ns",
+        "last_successful_use_sequence",
+        "successful_use_count",
         "value_identity",
         "reconstruction_elapsed_ns",
         "reuse_elapsed_ns",
+        "value_ticket_sequence",
     }
-    for state_identity, record in states.items():
-        if (
-            not isinstance(state_identity, str)
-            or not state_identity_name(state_identity)
-            or not isinstance(record, dict)
-            or set(record) != record_keys
-        ):
-            raise RuntimeError("hot-state value catalog record is invalid")
-        for key in integer_keys:
-            value = record[key]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-                or value > (1 << 63) - 1
-            ):
-                raise RuntimeError("hot-state value catalog record is invalid")
-        if (
-            record["last_successful_use_sequence"] == 0
-            or record["last_successful_use_sequence"] > sequence
-            or record["successful_use_count"] == 0
-        ):
-            raise RuntimeError("hot-state value catalog sequence is invalid")
-        value_identity = record["value_identity"]
-        if value_identity is not None and (
-            not isinstance(value_identity, str)
-            or not state_identity_name(value_identity)
-        ):
-            raise RuntimeError("hot-state value catalog value identity is invalid")
-        for key in ("reconstruction_elapsed_ns", "reuse_elapsed_ns"):
-            value = record[key]
-            if value is not None and (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value <= 0
-                or value > (1 << 63) - 1
-            ):
-                raise RuntimeError("hot-state value catalog timing is invalid")
-        if value_identity is None and (
-            record["reconstruction_elapsed_ns"] is not None
-            or record["reuse_elapsed_ns"] is not None
-        ):
-            raise RuntimeError("hot-state value catalog timing is unbound")
+    if set(document) != expected_keys:
+        raise RuntimeError("hot-state value record has an unsupported shape")
+    if (
+        document["schema_version"] != HOT_STATE_VALUE_RECORD_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_VALUE_RECORD_PRODUCER
+    ):
+        raise RuntimeError("hot-state value record identity is not accepted")
+    state_identity = document["state_identity"]
+    record = {key: value for key, value in document.items() if key not in {
+        "schema_version", "producer", "state_identity"
+    }}
+    validate_hot_state_value_record_fields(state_identity, record)
     return document
 
 
@@ -1640,8 +1709,315 @@ def canonical_hot_state_value_catalog_bytes(document: dict[str, object]) -> byte
         json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
     if len(encoded) > MAX_HOT_STATE_VALUE_CATALOG_BYTES:
-        raise RuntimeError("hot-state value catalog exceeds its size bound")
+        raise RuntimeError("hot-state value catalog exceeds its byte budget")
     return encoded
+
+
+def canonical_hot_state_value_record_bytes(document: dict[str, object]) -> bytes:
+    validate_hot_state_value_record(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_VALUE_RECORD_BYTES:
+        raise RuntimeError("hot-state value record exceeds its byte budget")
+    return encoded
+
+
+def hot_state_value_records_root(namespace_root: Path) -> Path:
+    return namespace_root / HOT_STATE_VALUE_RECORDS
+
+
+def validate_hot_state_value_records_root(
+    namespace_root: Path, *, create: bool
+) -> Path | None:
+    root = hot_state_value_records_root(namespace_root)
+    if create:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+        or details.st_dev != namespace_details.st_dev
+    ):
+        raise RuntimeError("hot-state value-record root is not owner-private")
+    return root
+
+
+def ensure_hot_state_value_records_root(namespace_root: Path) -> Path:
+    root = validate_hot_state_value_records_root(namespace_root, create=True)
+    assert root is not None
+    return root
+
+
+def read_hot_state_value_record(
+    namespace_root: Path, state_identity: str
+) -> dict[str, object] | None:
+    root = validate_hot_state_value_records_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return None
+    if not state_identity_name(state_identity):
+        raise RuntimeError("hot-state value record state identity is invalid")
+    path = root / (state_identity + HOT_STATE_VALUE_RECORD_SUFFIX)
+    try:
+        document, encoded = read_private_json(
+            path, "hot-state value record", MAX_HOT_STATE_VALUE_RECORD_BYTES
+        )
+    except FileNotFoundError:
+        return None
+    record = validate_hot_state_value_record(document)
+    if record["state_identity"] != state_identity:
+        raise RuntimeError("hot-state value record filename conflicts with identity")
+    if canonical_hot_state_value_record_bytes(record) != encoded:
+        raise RuntimeError("hot-state value record is not canonical")
+    return record
+
+
+def write_hot_state_value_record(
+    namespace_root: Path,
+    state_identity: str,
+    record_fields: dict[str, object],
+) -> None:
+    root = ensure_hot_state_value_records_root(namespace_root)
+    document = hot_state_value_record_document(state_identity, record_fields)
+    encoded = canonical_hot_state_value_record_bytes(document)
+    final = root / (state_identity + HOT_STATE_VALUE_RECORD_SUFFIX)
+    staging = root / (
+        "." + state_identity + HOT_STATE_VALUE_RECORD_SUFFIX
+        + HOT_STATE_VALUE_RECORD_STAGING_SUFFIX
+    )
+    try:
+        details = staging.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_nlink != 1
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_size > MAX_HOT_STATE_VALUE_RECORD_BYTES
+        ):
+            raise RuntimeError("hot-state value record stage is not recoverable")
+        staging.unlink()
+        fsync_directory(root)
+    descriptor = os.open(
+        staging,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state value record write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(staging, final)
+    fsync_directory(root)
+
+
+def remove_hot_state_value_record(
+    namespace_root: Path, state_identity: str
+) -> bool:
+    root = validate_hot_state_value_records_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return False
+    if not state_identity_name(state_identity):
+        raise RuntimeError("hot-state value record state identity is invalid")
+    path = root / (state_identity + HOT_STATE_VALUE_RECORD_SUFFIX)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    fsync_directory(root)
+    return True
+
+
+def hot_state_value_tickets_root(namespace_root: Path) -> Path:
+    return namespace_root / HOT_STATE_VALUE_TICKETS
+
+
+def validate_hot_state_value_tickets_root(
+    namespace_root: Path, *, create: bool
+) -> Path | None:
+    root = hot_state_value_tickets_root(namespace_root)
+    if create:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+        or details.st_dev != namespace_details.st_dev
+    ):
+        raise RuntimeError("hot-state value-ticket root is not owner-private")
+    return root
+
+
+def value_ticket_name(ticket_sequence: int) -> str:
+    if ticket_sequence <= 0:
+        raise RuntimeError("hot-state value ticket sequence is invalid")
+    return f"{ticket_sequence:020d}{HOT_STATE_VALUE_TICKET_SUFFIX}"
+
+
+def value_ticket_document(
+    ticket_sequence: int,
+    state_identity: str,
+    last_successful_use_sequence: int,
+) -> dict[str, object]:
+    if (
+        ticket_sequence <= 0
+        or last_successful_use_sequence <= 0
+        or not state_identity_name(state_identity)
+    ):
+        raise RuntimeError("hot-state value ticket is invalid")
+    return {
+        "schema_version": HOT_STATE_VALUE_TICKET_SCHEMA_VERSION,
+        "producer": HOT_STATE_VALUE_TICKET_PRODUCER,
+        "ticket_sequence": ticket_sequence,
+        "state_identity": state_identity,
+        "last_successful_use_sequence": last_successful_use_sequence,
+    }
+
+
+def validate_hot_state_value_ticket(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "ticket_sequence",
+        "state_identity",
+        "last_successful_use_sequence",
+    }:
+        raise RuntimeError("hot-state value ticket has an unsupported shape")
+    if (
+        document["schema_version"] != HOT_STATE_VALUE_TICKET_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_VALUE_TICKET_PRODUCER
+        or isinstance(document["ticket_sequence"], bool)
+        or not isinstance(document["ticket_sequence"], int)
+        or document["ticket_sequence"] <= 0
+        or not isinstance(document["state_identity"], str)
+        or not state_identity_name(document["state_identity"])
+        or isinstance(document["last_successful_use_sequence"], bool)
+        or not isinstance(document["last_successful_use_sequence"], int)
+        or document["last_successful_use_sequence"] <= 0
+    ):
+        raise RuntimeError("hot-state value ticket identity is invalid")
+    return document
+
+
+def canonical_hot_state_value_ticket_bytes(
+    document: dict[str, object],
+) -> bytes:
+    validate_hot_state_value_ticket(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_VALUE_TICKET_BYTES:
+        raise RuntimeError("hot-state value ticket exceeds its byte budget")
+    return encoded
+
+
+def read_hot_state_value_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> dict[str, object] | None:
+    root = validate_hot_state_value_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return None
+    path = root / value_ticket_name(ticket_sequence)
+    try:
+        document, encoded = read_private_json(
+            path, "hot-state value ticket", MAX_HOT_STATE_VALUE_TICKET_BYTES
+        )
+    except FileNotFoundError:
+        return None
+    ticket = validate_hot_state_value_ticket(document)
+    if ticket["ticket_sequence"] != ticket_sequence:
+        raise RuntimeError("hot-state value ticket filename conflicts with identity")
+    if canonical_hot_state_value_ticket_bytes(ticket) != encoded:
+        raise RuntimeError("hot-state value ticket is not canonical")
+    return ticket
+
+
+def write_hot_state_value_ticket(
+    namespace_root: Path,
+    ticket_sequence: int,
+    state_identity: str,
+    last_successful_use_sequence: int,
+) -> None:
+    root = validate_hot_state_value_tickets_root(
+        namespace_root, create=True
+    )
+    assert root is not None
+    document = value_ticket_document(
+        ticket_sequence,
+        state_identity,
+        last_successful_use_sequence,
+    )
+    encoded = canonical_hot_state_value_ticket_bytes(document)
+    path = root / value_ticket_name(ticket_sequence)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state value ticket write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    fsync_directory(root)
+
+
+def remove_hot_state_value_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> bool:
+    root = validate_hot_state_value_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return False
+    path = root / value_ticket_name(ticket_sequence)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    fsync_directory(root)
+    return True
 
 
 def remove_stale_hot_state_value_catalog_stage(namespace_root: Path) -> bool:
@@ -1655,28 +2031,12 @@ def remove_stale_hot_state_value_catalog_stage(namespace_root: Path) -> bool:
         or details.st_uid != os.getuid()
         or details.st_nlink != 1
         or stat.S_IMODE(details.st_mode) != 0o600
-        or details.st_size > MAX_HOT_STATE_VALUE_CATALOG_BYTES
+        or details.st_size > MAX_HOT_STATE_VALUE_CATALOG_V1_BYTES
     ):
         raise RuntimeError("hot-state value catalog stage is not recoverable")
     staging.unlink()
     fsync_directory(namespace_root)
     return True
-
-
-def read_hot_state_value_catalog(namespace_root: Path) -> dict[str, object]:
-    path = namespace_root / HOT_STATE_VALUE_CATALOG
-    try:
-        document, encoded = read_private_json(
-            path,
-            "hot-state value catalog",
-            MAX_HOT_STATE_VALUE_CATALOG_BYTES,
-        )
-    except FileNotFoundError:
-        return empty_hot_state_value_catalog()
-    catalog = validate_hot_state_value_catalog(document)
-    if canonical_hot_state_value_catalog_bytes(catalog) != encoded:
-        raise RuntimeError("hot-state value catalog is not canonical")
-    return catalog
 
 
 def write_hot_state_value_catalog(
@@ -1704,6 +2064,99 @@ def write_hot_state_value_catalog(
     fsync_directory(namespace_root)
 
 
+def migrate_hot_state_value_catalog_v1(
+    namespace_root: Path, catalog: dict[str, object]
+) -> dict[str, object]:
+    validated = validate_hot_state_value_catalog_v1(catalog)
+    sequence = validated["next_use_sequence"]
+    states = validated["states"]
+    assert isinstance(sequence, int)
+    assert isinstance(states, dict)
+    ensure_hot_state_value_records_root(namespace_root)
+    validate_hot_state_value_tickets_root(namespace_root, create=True)
+
+    ordered = sorted(
+        states.items(),
+        key=lambda item: (
+            int(item[1]["last_successful_use_sequence"]),
+            item[0],
+        ),
+    )
+    for ticket_sequence, (state_identity, legacy_fields) in enumerate(
+        ordered, start=1
+    ):
+        assert isinstance(state_identity, str)
+        assert isinstance(legacy_fields, dict)
+        fields = {
+            **legacy_fields,
+            "value_ticket_sequence": ticket_sequence,
+        }
+        expected_ticket = value_ticket_document(
+            ticket_sequence,
+            state_identity,
+            int(legacy_fields["last_successful_use_sequence"]),
+        )
+        observed_ticket = read_hot_state_value_ticket(
+            namespace_root, ticket_sequence
+        )
+        if observed_ticket is None:
+            write_hot_state_value_ticket(
+                namespace_root,
+                ticket_sequence,
+                state_identity,
+                int(legacy_fields["last_successful_use_sequence"]),
+            )
+        elif canonical_hot_state_value_ticket_bytes(observed_ticket) != (
+            canonical_hot_state_value_ticket_bytes(expected_ticket)
+        ):
+            raise RuntimeError("hot-state v1 migration conflicts with value ticket")
+
+        existing = read_hot_state_value_record(namespace_root, state_identity)
+        expected = hot_state_value_record_document(state_identity, fields)
+        if existing is None:
+            write_hot_state_value_record(namespace_root, state_identity, fields)
+        elif canonical_hot_state_value_record_bytes(existing) != (
+            canonical_hot_state_value_record_bytes(expected)
+        ):
+            raise RuntimeError("hot-state v1 migration conflicts with value record")
+
+    migrated = {
+        "schema_version": HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION,
+        "producer": HOT_STATE_VALUE_CATALOG_PRODUCER,
+        "pressure_active": validated["pressure_active"],
+        "retire_start_used_percent": HOT_STATE_RETIRE_START_USED_PERCENT,
+        "retire_stop_used_percent": HOT_STATE_RETIRE_STOP_USED_PERCENT,
+        "next_use_sequence": sequence,
+        "next_value_ticket_sequence": len(ordered),
+        "value_cursor_ticket_sequence": 0,
+    }
+    write_hot_state_value_catalog(namespace_root, migrated)
+    return migrated
+
+
+def read_hot_state_value_catalog(namespace_root: Path) -> dict[str, object]:
+    path = namespace_root / HOT_STATE_VALUE_CATALOG
+    try:
+        document, encoded = read_private_json(
+            path,
+            "hot-state value catalog",
+            MAX_HOT_STATE_VALUE_CATALOG_V1_BYTES,
+        )
+    except FileNotFoundError:
+        return empty_hot_state_value_catalog()
+    if document.get("schema_version") == HOT_STATE_VALUE_CATALOG_V1_SCHEMA_VERSION:
+        legacy = validate_hot_state_value_catalog_v1(document)
+        legacy_encoded = (
+            json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if legacy_encoded != encoded:
+            raise RuntimeError("hot-state v1 value catalog is not canonical")
+        return migrate_hot_state_value_catalog_v1(namespace_root, legacy)
+    catalog = validate_hot_state_value_catalog(document)
+    if canonical_hot_state_value_catalog_bytes(catalog) != encoded:
+        raise RuntimeError("hot-state value catalog is not canonical")
+    return catalog
+
 def hot_state_value_identity(
     comparison_key: str,
     runtime_contract: RuntimeContract | None,
@@ -1730,7 +2183,7 @@ def hot_state_value_identity(
 def elapsed_nanoseconds(seconds: float) -> int:
     if not math.isfinite(seconds) or seconds < 0:
         raise RuntimeError("hot-state successful-use duration is invalid")
-    return max(1, min(round(seconds * 1_000_000_000), (1 << 63) - 1))
+    return max(1, round(seconds * 1_000_000_000))
 
 
 def record_successful_hot_state_use(
@@ -1741,13 +2194,22 @@ def record_successful_hot_state_use(
     runtime_contract: RuntimeContract | None,
     resource_profile: str | None,
     observation: ExecutionObservation,
+    namespace_lease_fd: int | None = None,
 ) -> str:
-    namespace_lock = open_private_lock(
-        namespace_root / HOT_STATE_NAMESPACE_LOCK,
-        "hot-state namespace lock",
-    )
+    owned_namespace_lease: int | None = None
+    value_lock: int | None = None
     try:
-        fcntl.flock(namespace_lock, fcntl.LOCK_EX)
+        if namespace_lease_fd is None:
+            owned_namespace_lease = open_private_lock(
+                namespace_root / HOT_STATE_NAMESPACE_LOCK,
+                "hot-state namespace lock",
+            )
+            fcntl.flock(owned_namespace_lease, fcntl.LOCK_SH)
+        value_lock = open_private_lock(
+            namespace_root / HOT_STATE_VALUE_LOCK,
+            "hot-state value writer lock",
+        )
+        fcntl.flock(value_lock, fcntl.LOCK_EX)
         namespace_details = namespace_root.stat(follow_symlinks=False)
         state_details = state_base.stat(follow_symlinks=False)
         if (
@@ -1770,28 +2232,26 @@ def record_successful_hot_state_use(
         remove_stale_hot_state_value_catalog_stage(namespace_root)
         catalog = read_hot_state_value_catalog(namespace_root)
         sequence = catalog["next_use_sequence"]
-        states = catalog["states"]
+        next_ticket_sequence = catalog["next_value_ticket_sequence"]
         assert isinstance(sequence, int)
-        assert isinstance(states, dict)
-        if sequence >= (1 << 63) - 1:
-            return "sequence_exhausted"
-        if (
-            state_base.name not in states
-            and len(states) >= MAX_HOT_STATE_NAMESPACE_ENTRIES
-        ):
-            retained_states: dict[str, object] = {}
-            for state_identity, record in states.items():
-                try:
-                    (namespace_root / state_identity).lstat()
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    pass
-                retained_states[state_identity] = record
-            states = retained_states
-            if len(states) >= MAX_HOT_STATE_NAMESPACE_ENTRIES:
-                return "catalog_bound_exceeded"
-        prior = states.get(state_base.name)
+        assert isinstance(next_ticket_sequence, int)
+        try:
+            prior_document = read_hot_state_value_record(
+                namespace_root, state_base.name
+            )
+        except RuntimeError:
+            # This successful use has already rebound the exact live state to
+            # its current producer manifest. Corrupt value metadata has no
+            # authority of its own and can be replaced from that fresh fact.
+            ensure_hot_state_value_records_root(namespace_root)
+            remove_hot_state_value_record(namespace_root, state_base.name)
+            prior_document = None
+        prior = None
+        if prior_document is not None:
+            prior = {
+                key: value for key, value in prior_document.items()
+                if key not in {"schema_version", "producer", "state_identity"}
+            }
         same_manifest = isinstance(prior, dict) and (
             prior["manifest_device"] == manifest_identity.device
             and prior["manifest_inode"] == manifest_identity.inode
@@ -1799,8 +2259,14 @@ def record_successful_hot_state_use(
             == manifest_identity.creation_witness_ns
         )
         next_sequence = sequence + 1
+        new_ticket_sequence = next_ticket_sequence + 1
+        old_ticket_sequence = (
+            int(prior["value_ticket_sequence"])
+            if isinstance(prior, dict)
+            else None
+        )
         successful_use_count = (
-            min(prior["successful_use_count"] + 1, (1 << 63) - 1)
+            prior["successful_use_count"] + 1
             if same_manifest
             else 1
         )
@@ -1829,27 +2295,53 @@ def record_successful_hot_state_use(
                 value_identity = observed_value_identity
                 reconstruction_elapsed_ns = None
                 reuse_elapsed_ns = total_elapsed_ns
-        updated_states = dict(states)
-        updated_states[state_base.name] = {
-            "manifest_device": manifest_identity.device,
-            "manifest_inode": manifest_identity.inode,
-            "manifest_creation_witness_ns": manifest_identity.creation_witness_ns,
-            "last_successful_use_sequence": next_sequence,
-            "successful_use_count": successful_use_count,
-            "value_identity": value_identity,
-            "reconstruction_elapsed_ns": reconstruction_elapsed_ns,
-            "reuse_elapsed_ns": reuse_elapsed_ns,
-        }
+
+        # Advance the tiny catalog first. A crash before ticket/record
+        # publication leaves only harmless sequence gaps. A ticket published
+        # before its record is stale until the record points at it.
         updated_catalog = {
             **catalog,
             "next_use_sequence": next_sequence,
-            "states": updated_states,
+            "next_value_ticket_sequence": new_ticket_sequence,
         }
         write_hot_state_value_catalog(namespace_root, updated_catalog)
+        write_hot_state_value_ticket(
+            namespace_root,
+            new_ticket_sequence,
+            state_base.name,
+            next_sequence,
+        )
+        write_hot_state_value_record(
+            namespace_root,
+            state_base.name,
+            {
+                "manifest_device": manifest_identity.device,
+                "manifest_inode": manifest_identity.inode,
+                "manifest_creation_witness_ns": manifest_identity.creation_witness_ns,
+                "last_successful_use_sequence": next_sequence,
+                "successful_use_count": successful_use_count,
+                "value_identity": value_identity,
+                "reconstruction_elapsed_ns": reconstruction_elapsed_ns,
+                "reuse_elapsed_ns": reuse_elapsed_ns,
+                "value_ticket_sequence": new_ticket_sequence,
+            },
+        )
+        if (
+            old_ticket_sequence is not None
+            and old_ticket_sequence != new_ticket_sequence
+        ):
+            try:
+                remove_hot_state_value_ticket(
+                    namespace_root, old_ticket_sequence
+                )
+            except (OSError, RuntimeError):
+                pass
         return "recorded"
     finally:
-        os.close(namespace_lock)
-
+        if value_lock is not None:
+            os.close(value_lock)
+        if owned_namespace_lease is not None:
+            os.close(owned_namespace_lease)
 
 def hot_state_filesystem_used_percent(namespace_root: Path) -> tuple[int, int]:
     details = os.statvfs(namespace_root)
@@ -1858,6 +2350,48 @@ def hot_state_filesystem_used_percent(namespace_root: Path) -> tuple[int, int]:
     if blocks <= 0 or available < 0 or available > blocks:
         raise RuntimeError("hot-state filesystem capacity is unavailable")
     return blocks - available, blocks
+
+
+def requeue_hot_state_value_ticket(
+    namespace_root: Path,
+    catalog: dict[str, object],
+    record: dict[str, object],
+    old_ticket_sequence: int,
+) -> dict[str, object]:
+    state_identity = record["state_identity"]
+    last_use = record["last_successful_use_sequence"]
+    assert isinstance(state_identity, str)
+    assert isinstance(last_use, int)
+    next_ticket = int(catalog["next_value_ticket_sequence"]) + 1
+    updated_catalog = {
+        **catalog,
+        "next_value_ticket_sequence": next_ticket,
+    }
+    write_hot_state_value_catalog(namespace_root, updated_catalog)
+    write_hot_state_value_ticket(
+        namespace_root,
+        next_ticket,
+        state_identity,
+        last_use,
+    )
+    fields = {
+        key: value
+        for key, value in record.items()
+        if key not in {"schema_version", "producer", "state_identity"}
+    }
+    fields["value_ticket_sequence"] = next_ticket
+    write_hot_state_value_record(
+        namespace_root,
+        state_identity,
+        fields,
+    )
+    try:
+        remove_hot_state_value_ticket(
+            namespace_root, old_ticket_sequence
+        )
+    except (OSError, RuntimeError):
+        pass
+    return updated_catalog
 
 
 def retire_one_low_value_state(
@@ -1886,27 +2420,75 @@ def retire_one_low_value_state(
             else "ordinary_free_space"
         )
 
-    states = catalog["states"]
-    assert isinstance(states, dict)
-    candidates: list[tuple[int, str, dict[str, object]]] = []
-    for state_identity, untyped_record in states.items():
-        assert isinstance(state_identity, str)
-        assert isinstance(untyped_record, dict)
-        if state_identity == current_state_identity:
-            continue
-        sequence = untyped_record["last_successful_use_sequence"]
-        assert isinstance(sequence, int)
-        candidates.append((sequence, state_identity, untyped_record))
-    candidates.sort(key=lambda item: (item[0], item[1]))
-
+    cursor = int(catalog["value_cursor_ticket_sequence"])
+    initial_next_ticket = int(catalog["next_value_ticket_sequence"])
     namespace_details = namespace_root.stat(follow_symlinks=False)
-    for _, state_identity, record in candidates:
+    processed = 0
+    retired = False
+
+    while (
+        processed < HOT_STATE_VALUE_TICKETS_PER_PASS
+        and cursor < initial_next_ticket
+    ):
+        ticket_sequence = cursor + 1
+        cursor = ticket_sequence
+        processed += 1
+        try:
+            ticket = read_hot_state_value_ticket(
+                namespace_root, ticket_sequence
+            )
+        except (OSError, RuntimeError):
+            ticket = None
+        if ticket is None:
+            continue
+
+        state_identity = ticket["state_identity"]
+        assert isinstance(state_identity, str)
+        try:
+            record = read_hot_state_value_record(
+                namespace_root, state_identity
+            )
+        except (OSError, RuntimeError):
+            record = None
+        if (
+            record is None
+            or record["value_ticket_sequence"] != ticket_sequence
+            or record["last_successful_use_sequence"]
+            != ticket["last_successful_use_sequence"]
+        ):
+            try:
+                remove_hot_state_value_ticket(
+                    namespace_root, ticket_sequence
+                )
+            except (OSError, RuntimeError):
+                pass
+            continue
+
+        if state_identity == current_state_identity:
+            catalog = {
+                **catalog,
+                "value_cursor_ticket_sequence": cursor,
+            }
+            write_hot_state_value_catalog(namespace_root, catalog)
+            catalog = requeue_hot_state_value_ticket(
+                namespace_root,
+                catalog,
+                record,
+                ticket_sequence,
+            )
+            continue
+
         state = namespace_root / state_identity
         state_descriptor: int | None = None
-        locks: list[RetirementLock] | None = None
         renamed = False
         try:
-            details = state.stat(follow_symlinks=False)
+            try:
+                details = state.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                remove_generation_value_metadata(
+                    namespace_root, state_identity
+                )
+                continue
             if (
                 not stat.S_ISDIR(details.st_mode)
                 or stat.S_ISLNK(details.st_mode)
@@ -1914,10 +2496,16 @@ def retire_one_low_value_state(
                 or stat.S_IMODE(details.st_mode) != 0o700
                 or details.st_dev != namespace_details.st_dev
             ):
+                remove_generation_value_metadata(
+                    namespace_root, state_identity
+                )
                 continue
             state_descriptor = os.open(
                 state,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
             )
             pinned_state = os.fstat(state_descriptor)
             manifest, encoded_before, manifest_identity = (
@@ -1925,6 +2513,14 @@ def retire_one_low_value_state(
                     state_descriptor, state_identity
                 )
             )
+            if not manifest_has_full_execution_namespace_lease(manifest):
+                try:
+                    remove_hot_state_value_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                continue
             if (
                 manifest_generation_reachable(manifest) is not True
                 or record["manifest_device"] != manifest_identity.device
@@ -1932,10 +2528,19 @@ def retire_one_low_value_state(
                 or record["manifest_creation_witness_ns"]
                 != manifest_identity.creation_witness_ns
             ):
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
                 continue
-            locks = acquire_retirement_locks(state)
-            if not locks:
-                continue
+
             manifest_after, encoded_after, identity_after = (
                 read_producer_manifest_with_identity(
                     state_descriptor, state_identity
@@ -1946,41 +2551,90 @@ def retire_one_low_value_state(
                 encoded_after != encoded_before
                 or identity_after != manifest_identity
                 or manifest_generation_reachable(manifest_after) is not True
-                or not retirement_locks_unchanged(locks)
+                or not manifest_has_full_execution_namespace_lease(
+                    manifest_after
+                )
                 or named_state.st_dev != pinned_state.st_dev
                 or named_state.st_ino != pinned_state.st_ino
             ):
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
                 continue
+
             retired_name = f"{HOT_STATE_RETIRED_PREFIX}{state_identity}"
+            enqueue_hot_state_reconcile_ticket(
+                namespace_root,
+                "retired",
+                state_identity,
+                retired_name,
+            )
             try:
                 rename_noreplace(state, namespace_root / retired_name)
             except (FileExistsError, OSError):
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
                 continue
             renamed = True
             fsync_directory(namespace_root)
-            close_retirement_locks(locks)
-            locks = None
-            updated_states = dict(states)
-            del updated_states[state_identity]
             try:
-                write_hot_state_value_catalog(
-                    namespace_root,
-                    {**catalog, "states": updated_states},
+                remove_generation_value_metadata(
+                    namespace_root, state_identity
                 )
             except (OSError, RuntimeError):
                 return "retired_low_value_catalog_deferred"
             delete_retired_state_bounded(
                 namespace_root, retired_name, state_identity
             )
-            return "retired_low_value"
+            retired = True
+            break
         except (OSError, RuntimeError):
             if renamed:
                 return "retired_low_value_recovery_deferred"
-            continue
+            try:
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
+            except (OSError, RuntimeError):
+                pass
         finally:
-            close_retirement_locks(locks)
             if state_descriptor is not None:
                 os.close(state_descriptor)
+
+    catalog = {
+        **catalog,
+        "value_cursor_ticket_sequence": cursor,
+    }
+    write_hot_state_value_catalog(namespace_root, catalog)
+    if retired:
+        return "retired_low_value"
+    if cursor < initial_next_ticket:
+        return "pressure_scan_deferred"
     return "pressure_no_eligible_state"
 
 
@@ -2179,6 +2833,359 @@ def delete_unpublished_stage_bounded(
         os.close(root_descriptor)
 
 
+def empty_hot_state_reconcile_catalog() -> dict[str, object]:
+    return {
+        "schema_version": HOT_STATE_RECONCILE_SCHEMA_VERSION,
+        "producer": HOT_STATE_RECONCILE_PRODUCER,
+        "next_ticket_sequence": 0,
+        "cursor_ticket_sequence": 0,
+    }
+
+
+def validate_hot_state_reconcile_catalog(
+    document: object,
+) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "next_ticket_sequence",
+        "cursor_ticket_sequence",
+    }:
+        raise RuntimeError("hot-state reconcile catalog has an unsupported shape")
+    next_ticket = document["next_ticket_sequence"]
+    cursor = document["cursor_ticket_sequence"]
+    if (
+        document["schema_version"] != HOT_STATE_RECONCILE_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_RECONCILE_PRODUCER
+        or isinstance(next_ticket, bool)
+        or not isinstance(next_ticket, int)
+        or next_ticket < 0
+        or isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or cursor < 0
+        or cursor > next_ticket
+    ):
+        raise RuntimeError("hot-state reconcile catalog identity is invalid")
+    return document
+
+
+def canonical_hot_state_reconcile_catalog_bytes(
+    document: dict[str, object],
+) -> bytes:
+    validate_hot_state_reconcile_catalog(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_RECONCILE_CATALOG_BYTES:
+        raise RuntimeError("hot-state reconcile catalog exceeds its byte budget")
+    return encoded
+
+
+def read_hot_state_reconcile_catalog(
+    namespace_root: Path,
+) -> dict[str, object]:
+    path = namespace_root / HOT_STATE_RECONCILE_CATALOG
+    try:
+        document, encoded = read_private_json(
+            path,
+            "hot-state reconcile catalog",
+            MAX_HOT_STATE_RECONCILE_CATALOG_BYTES,
+        )
+    except FileNotFoundError:
+        return empty_hot_state_reconcile_catalog()
+    catalog = validate_hot_state_reconcile_catalog(document)
+    if canonical_hot_state_reconcile_catalog_bytes(catalog) != encoded:
+        raise RuntimeError("hot-state reconcile catalog is not canonical")
+    return catalog
+
+
+def write_hot_state_reconcile_catalog(
+    namespace_root: Path, document: dict[str, object]
+) -> None:
+    encoded = canonical_hot_state_reconcile_catalog_bytes(document)
+    staging = namespace_root / HOT_STATE_RECONCILE_CATALOG_STAGING
+    try:
+        details = staging.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_nlink != 1
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_size > MAX_HOT_STATE_RECONCILE_CATALOG_BYTES
+        ):
+            raise RuntimeError("hot-state reconcile catalog stage is not recoverable")
+        staging.unlink()
+        fsync_directory(namespace_root)
+    descriptor = os.open(
+        staging,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state reconcile catalog write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(staging, namespace_root / HOT_STATE_RECONCILE_CATALOG)
+    fsync_directory(namespace_root)
+
+
+def validate_hot_state_reconcile_tickets_root(
+    namespace_root: Path, *, create: bool
+) -> Path | None:
+    root = namespace_root / HOT_STATE_RECONCILE_TICKETS
+    if create:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+        or details.st_dev != namespace_details.st_dev
+    ):
+        raise RuntimeError("hot-state reconcile-ticket root is not owner-private")
+    return root
+
+
+def reconcile_ticket_name(ticket_sequence: int) -> str:
+    if ticket_sequence <= 0:
+        raise RuntimeError("hot-state reconcile ticket sequence is invalid")
+    return f"{ticket_sequence:020d}{HOT_STATE_RECONCILE_TICKET_SUFFIX}"
+
+
+def reconcile_ticket_document(
+    ticket_sequence: int,
+    kind: str,
+    state_identity: str,
+    name: str,
+) -> dict[str, object]:
+    if (
+        ticket_sequence <= 0
+        or kind not in {"state", "creating", "retired"}
+        or not state_identity_name(state_identity)
+        or not isinstance(name, str)
+        or "/" in name
+        or name in {"", ".", ".."}
+    ):
+        raise RuntimeError("hot-state reconcile ticket is invalid")
+    if kind == "state" and name != state_identity:
+        raise RuntimeError("hot-state state ticket name is invalid")
+    if kind == "creating" and not name.startswith(
+        f"{HOT_STATE_CREATING_PREFIX}{state_identity}-"
+    ):
+        raise RuntimeError("hot-state creating ticket name is invalid")
+    if kind == "retired" and name != f"{HOT_STATE_RETIRED_PREFIX}{state_identity}":
+        raise RuntimeError("hot-state retired ticket name is invalid")
+    return {
+        "schema_version": HOT_STATE_RECONCILE_TICKET_SCHEMA_VERSION,
+        "producer": HOT_STATE_RECONCILE_TICKET_PRODUCER,
+        "ticket_sequence": ticket_sequence,
+        "kind": kind,
+        "state_identity": state_identity,
+        "name": name,
+    }
+
+
+def validate_hot_state_reconcile_ticket(
+    document: object,
+) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "ticket_sequence",
+        "kind",
+        "state_identity",
+        "name",
+    }:
+        raise RuntimeError("hot-state reconcile ticket has an unsupported shape")
+    if (
+        document["schema_version"] != HOT_STATE_RECONCILE_TICKET_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_RECONCILE_TICKET_PRODUCER
+        or isinstance(document["ticket_sequence"], bool)
+        or not isinstance(document["ticket_sequence"], int)
+    ):
+        raise RuntimeError("hot-state reconcile ticket identity is invalid")
+    expected = reconcile_ticket_document(
+        document["ticket_sequence"],
+        document["kind"],
+        document["state_identity"],
+        document["name"],
+    )
+    if document != expected:
+        raise RuntimeError("hot-state reconcile ticket is not canonical")
+    return document
+
+
+def canonical_hot_state_reconcile_ticket_bytes(
+    document: dict[str, object],
+) -> bytes:
+    validate_hot_state_reconcile_ticket(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_RECONCILE_TICKET_BYTES:
+        raise RuntimeError("hot-state reconcile ticket exceeds its byte budget")
+    return encoded
+
+
+def read_hot_state_reconcile_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> dict[str, object] | None:
+    root = validate_hot_state_reconcile_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return None
+    path = root / reconcile_ticket_name(ticket_sequence)
+    try:
+        document, encoded = read_private_json(
+            path,
+            "hot-state reconcile ticket",
+            MAX_HOT_STATE_RECONCILE_TICKET_BYTES,
+        )
+    except FileNotFoundError:
+        return None
+    ticket = validate_hot_state_reconcile_ticket(document)
+    if ticket["ticket_sequence"] != ticket_sequence:
+        raise RuntimeError("hot-state reconcile ticket filename conflicts with identity")
+    if canonical_hot_state_reconcile_ticket_bytes(ticket) != encoded:
+        raise RuntimeError("hot-state reconcile ticket is not canonical")
+    return ticket
+
+
+def write_hot_state_reconcile_ticket(
+    namespace_root: Path,
+    ticket_sequence: int,
+    kind: str,
+    state_identity: str,
+    name: str,
+) -> None:
+    root = validate_hot_state_reconcile_tickets_root(
+        namespace_root, create=True
+    )
+    assert root is not None
+    document = reconcile_ticket_document(
+        ticket_sequence, kind, state_identity, name
+    )
+    encoded = canonical_hot_state_reconcile_ticket_bytes(document)
+    path = root / reconcile_ticket_name(ticket_sequence)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state reconcile ticket write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    fsync_directory(root)
+
+
+def remove_hot_state_reconcile_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> bool:
+    root = validate_hot_state_reconcile_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return False
+    path = root / reconcile_ticket_name(ticket_sequence)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    fsync_directory(root)
+    return True
+
+
+def enqueue_hot_state_reconcile_ticket(
+    namespace_root: Path,
+    kind: str,
+    state_identity: str,
+    name: str,
+) -> int:
+    catalog = read_hot_state_reconcile_catalog(namespace_root)
+    ticket_sequence = int(catalog["next_ticket_sequence"]) + 1
+    updated = {
+        **catalog,
+        "next_ticket_sequence": ticket_sequence,
+    }
+    write_hot_state_reconcile_catalog(namespace_root, updated)
+    write_hot_state_reconcile_ticket(
+        namespace_root,
+        ticket_sequence,
+        kind,
+        state_identity,
+        name,
+    )
+    return ticket_sequence
+
+
+def requeue_hot_state_reconcile_ticket(
+    namespace_root: Path,
+    ticket: dict[str, object],
+) -> None:
+    enqueue_hot_state_reconcile_ticket(
+        namespace_root,
+        str(ticket["kind"]),
+        str(ticket["state_identity"]),
+        str(ticket["name"]),
+    )
+    try:
+        remove_hot_state_reconcile_ticket(
+            namespace_root, int(ticket["ticket_sequence"])
+        )
+    except (OSError, RuntimeError):
+        pass
+
+
+def remove_generation_value_metadata(
+    namespace_root: Path, state_identity: str
+) -> None:
+    try:
+        record = read_hot_state_value_record(
+            namespace_root, state_identity
+        )
+    except (OSError, RuntimeError):
+        record = None
+    if record is not None:
+        try:
+            remove_hot_state_value_ticket(
+                namespace_root,
+                int(record["value_ticket_sequence"]),
+            )
+        except (OSError, RuntimeError):
+            pass
+    try:
+        remove_hot_state_value_record(namespace_root, state_identity)
+    except (OSError, RuntimeError):
+        pass
+
+
 def collect_one_unreachable_state(
     namespace_root: Path, current_state_identity: str
 ) -> str:
@@ -2190,73 +3197,129 @@ def collect_one_unreachable_state(
             or stat.S_IMODE(namespace_details.st_mode) != 0o700
         ):
             return "unavailable"
-        entries = scan_directory_bounded(
-            namespace_root, MAX_HOT_STATE_NAMESPACE_ENTRIES
-        )
-    except OSError:
+        catalog = read_hot_state_reconcile_catalog(namespace_root)
+    except (OSError, RuntimeError):
         return "unavailable"
-    if entries is None:
-        return "namespace_bound_exceeded"
 
-    for entry in entries:
-        if not (
-            entry.name.startswith(HOT_STATE_RETIREMENT_RECORD_PREFIX)
-            and entry.name.endswith(HOT_STATE_RETIREMENT_RECORD_SUFFIX)
-        ):
-            continue
+    cursor = int(catalog["cursor_ticket_sequence"])
+    initial_next_ticket = int(catalog["next_ticket_sequence"])
+    processed = 0
+    outcome = "nothing_eligible"
+
+    while (
+        processed < HOT_STATE_RECONCILE_TICKETS_PER_PASS
+        and cursor < initial_next_ticket
+    ):
+        ticket_sequence = cursor + 1
+        cursor = ticket_sequence
+        processed += 1
         try:
-            record, _ = read_private_json(
-                namespace_root / entry.name,
-                "hot-state retirement record",
+            ticket = read_hot_state_reconcile_ticket(
+                namespace_root, ticket_sequence
             )
-            validate_retirement_record(record)
-            state_identity = record["state_identity"]
-            retired_name = record["retired_name"]
-            assert isinstance(state_identity, str)
-            assert isinstance(retired_name, str)
-            if entry.name != retirement_record_name(
-                retired_name, state_identity
-            ):
-                continue
-            delete_retired_state_bounded(
-                namespace_root, retired_name, state_identity
-            )
-            return "retirement_record_recovery"
         except (OSError, RuntimeError):
+            ticket = None
+        if ticket is None:
             continue
 
-    for entry in entries:
-        if not entry.name.startswith(HOT_STATE_CREATING_PREFIX):
-            continue
-        suffix = entry.name.removeprefix(HOT_STATE_CREATING_PREFIX)
-        state_identity, separator, _ = suffix.partition("-")
-        if separator and state_identity_name(state_identity):
+        kind = ticket["kind"]
+        state_identity = ticket["state_identity"]
+        name = ticket["name"]
+        assert isinstance(kind, str)
+        assert isinstance(state_identity, str)
+        assert isinstance(name, str)
+
+        if kind == "creating":
+            stage = namespace_root / name
+            if not stage.exists():
+                try:
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                continue
             if delete_unpublished_stage_bounded(
-                namespace_root, entry.name, state_identity
+                namespace_root, name, state_identity
             ):
-                return "creating_recovery"
-            return "creating_recovery_deferred"
+                try:
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                outcome = "creating_recovery"
+                break
+            requeue_hot_state_reconcile_ticket(namespace_root, ticket)
+            outcome = "creating_recovery_deferred"
+            break
 
-    for entry in entries:
-        if not entry.name.startswith(HOT_STATE_RETIRED_PREFIX):
-            continue
-        state_identity = entry.name.removeprefix(HOT_STATE_RETIRED_PREFIX)
-        if state_identity_name(state_identity):
+        if kind == "retired":
+            retired_path = namespace_root / name
+            retirement_record = namespace_root / retirement_record_name(
+                name, state_identity
+            )
             try:
-                delete_retired_state_bounded(
-                    namespace_root, entry.name, state_identity
+                retired_exists = retired_path.lstat() is not None
+            except FileNotFoundError:
+                retired_exists = False
+            try:
+                record_exists = retirement_record.lstat() is not None
+            except FileNotFoundError:
+                record_exists = False
+            if not retired_exists and not record_exists:
+                try:
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                continue
+            complete = delete_retired_state_bounded(
+                namespace_root, name, state_identity
+            )
+            if complete:
+                remove_generation_value_metadata(
+                    namespace_root, state_identity
                 )
-            except RuntimeError:
-                return "retired_recovery_deferred"
-            return "retired_recovery"
+                try:
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                outcome = "retired_recovery"
+            else:
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                outcome = "retired_recovery_deferred"
+            break
 
-    for entry in entries:
-        if entry.name == current_state_identity or not state_identity_name(entry.name):
+        if state_identity == current_state_identity:
+            requeue_hot_state_reconcile_ticket(namespace_root, ticket)
             continue
-        state = namespace_root / entry.name
+
+        state = namespace_root / state_identity
         state_descriptor: int | None = None
         try:
-            details = entry.stat(follow_symlinks=False)
+            details = state.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            remove_generation_value_metadata(
+                namespace_root, state_identity
+            )
+            try:
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
+            except (OSError, RuntimeError):
+                pass
+            continue
+        except OSError:
+            requeue_hot_state_reconcile_ticket(namespace_root, ticket)
+            continue
+
+        try:
             if (
                 not stat.S_ISDIR(details.st_mode)
                 or stat.S_ISLNK(details.st_mode)
@@ -2264,10 +3327,16 @@ def collect_one_unreachable_state(
                 or stat.S_IMODE(details.st_mode) != 0o700
                 or details.st_dev != namespace_details.st_dev
             ):
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
                 continue
             state_descriptor = os.open(
                 state,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
             )
             pinned_state = os.fstat(state_descriptor)
             if (
@@ -2276,51 +3345,106 @@ def collect_one_unreachable_state(
                 or pinned_state.st_uid != os.getuid()
                 or stat.S_IMODE(pinned_state.st_mode) != 0o700
             ):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
                 continue
             manifest, encoded_before = read_producer_manifest(
-                state_descriptor, entry.name
+                state_descriptor, state_identity
             )
-            if manifest_generation_reachable(manifest) is not False:
+            if not manifest_has_full_execution_namespace_lease(manifest):
+                # Legacy state remains usable but never receives deletion
+                # authority from the new namespace-lease protocol.
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
                 continue
-            locks = acquire_retirement_locks(state)
-            if locks is None:
+            reachable = manifest_generation_reachable(manifest)
+            if reachable is not False:
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
                 continue
+
             try:
-                try:
-                    manifest_after, encoded_after = read_producer_manifest(
-                        state_descriptor, entry.name
-                    )
-                except (OSError, RuntimeError):
-                    continue
-                try:
-                    named_state = state.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if (
-                    encoded_after != encoded_before
-                    or manifest_generation_reachable(manifest_after) is not False
-                    or not retirement_locks_unchanged(locks)
-                    or named_state.st_dev != pinned_state.st_dev
-                    or named_state.st_ino != pinned_state.st_ino
-                ):
-                    continue
-                retired_name = f"{HOT_STATE_RETIRED_PREFIX}{entry.name}"
-                try:
-                    rename_noreplace(state, namespace_root / retired_name)
-                except FileExistsError:
-                    continue
-                except OSError:
-                    continue
-                fsync_directory(namespace_root)
-            finally:
-                close_retirement_locks(locks)
-            delete_retired_state_bounded(namespace_root, retired_name, entry.name)
-            return "retired_unreachable"
+                manifest_after, encoded_after = read_producer_manifest(
+                    state_descriptor, state_identity
+                )
+                named_state = state.stat(follow_symlinks=False)
+            except (OSError, RuntimeError):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+            if (
+                encoded_after != encoded_before
+                or not manifest_has_full_execution_namespace_lease(
+                    manifest_after
+                )
+                or manifest_generation_reachable(manifest_after) is not False
+                or named_state.st_dev != pinned_state.st_dev
+                or named_state.st_ino != pinned_state.st_ino
+            ):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+
+            retired_name = f"{HOT_STATE_RETIRED_PREFIX}{state_identity}"
+            enqueue_hot_state_reconcile_ticket(
+                namespace_root,
+                "retired",
+                state_identity,
+                retired_name,
+            )
+            try:
+                rename_noreplace(
+                    state, namespace_root / retired_name
+                )
+            except (FileExistsError, OSError):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+            fsync_directory(namespace_root)
+            try:
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
+            except (OSError, RuntimeError):
+                pass
+            remove_generation_value_metadata(
+                namespace_root, state_identity
+            )
+            delete_retired_state_bounded(
+                namespace_root, retired_name, state_identity
+            )
+            outcome = "retired_unreachable"
+            break
         except (OSError, RuntimeError):
-            continue
+            try:
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+            except (OSError, RuntimeError):
+                pass
         finally:
             if state_descriptor is not None:
                 os.close(state_descriptor)
+
+    try:
+        latest = read_hot_state_reconcile_catalog(namespace_root)
+        write_hot_state_reconcile_catalog(
+            namespace_root,
+            {**latest, "cursor_ticket_sequence": cursor},
+        )
+    except (OSError, RuntimeError):
+        return "unavailable"
+
+    if outcome != "nothing_eligible":
+        return outcome
+    if cursor < initial_next_ticket:
+        return "reconcile_scan_deferred"
     return "nothing_eligible"
 
 
@@ -3313,11 +4437,6 @@ def run(
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("this task's hot state is already in use") from error
-        if namespace_lock_fd is not None:
-            fcntl.flock(namespace_lock_fd, fcntl.LOCK_UN)
-            os.close(namespace_lock_fd)
-            namespace_lock_fd = None
-
         private_copy_candidates: list[tuple[CacheSpec, Path, Path]] = []
         for spec in cache_specs:
             resident_cache = resident / spec.path
@@ -3544,6 +4663,7 @@ def run(
                     runtime_contract,
                     resource_profile,
                     execution_observations[0],
+                    namespace_lock_fd,
                 )
             except (OSError, RuntimeError):
                 use_disposition = "record_unavailable"
@@ -3552,6 +4672,10 @@ def run(
                     f"hot-run: lifecycle-success={use_disposition}",
                     file=sys.stderr,
                 )
+        if namespace_lock_fd is not None:
+            fcntl.flock(namespace_lock_fd, fcntl.LOCK_UN)
+            os.close(namespace_lock_fd)
+            namespace_lock_fd = None
         return exit_code
     finally:
         for descriptor in reversed(cache_source_fds):
