@@ -26,6 +26,8 @@ An item is never deleted while a process has its cwd inside it, a process comman
 line names it, it holds a git checkout, or it changed within the idle window.
 A tool's own cache named in TOOL_CACHES (the Go build cache, Bazel, Edge) is not
 searched for git: it is too large for the search to finish, and it holds no work.
+Only its top two levels are checked, where a person's clone of that name would sit.
+Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
 Every deletion is appended to a JSONL receipt.
 
 On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
@@ -58,10 +60,12 @@ build output or copies. Nested or unverifiable checkouts stay protected.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
 import platform
+import pwd
 import math
 import re
 import shutil
@@ -250,6 +254,19 @@ def darwin_user_tmp() -> Path | None:
     return path if path.is_dir() and path != Path("/private/tmp") else None
 
 
+def bazel_family(root: Path) -> Family:
+    # Bazel's output root on macOS (Linux keeps it under ~/.cache/bazel, a TOOL_CACHES name). One output
+    # base per workspace (an md5 name) and the unpacked install/: all rebuilt by bazel, and external/
+    # holds its repository fetches, so git inside is fetched, not work (as in DerivedData). A running
+    # bazel server holds its output base open and names it on its command line, so the in-use checks
+    # keep it; a `bazel run` binary writing into its runfiles is kept by its cwd while it runs.
+    # cache/ is the repository cache, not a rebuild: its downloads sit too deep for the idle check,
+    # no process names it, newer Bazel links output bases' external/ into it, and it is what an
+    # offline build or a vanished URL needs. install/ bases carry future mtimes, so they read recent.
+    return Family("bazel-output", root, True, "bazel rebuilds it", skip=("cache",), owner="bazel",
+                  rebuild_minutes=30, build_output=True)
+
+
 def default_families() -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
@@ -308,6 +325,11 @@ def default_families() -> list[Family]:
                        "report only: the dev-build worker's shared cache",
                        owner="cmux dev-build worker (hq controller)",
                        owner_job="system/ai.manaflow.cmux-build-worker"))
+    bazel_user = ""
+    with contextlib.suppress(KeyError):
+        bazel_user = pwd.getpwuid(uid).pw_name
+    if DARWIN and bazel_user:
+        fams.append(bazel_family(Path(f"/private/var/tmp/_bazel_{bazel_user}")))
     if DARWIN:  # the owned cmux minis
         fams += fleet_families()
         # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
@@ -505,11 +527,25 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
 DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
 
 
+def shallow_checkout(path: Path) -> bool:
+    """A .git or repository at `path` or one level down: where a person's clone named like a tool cache would sit."""
+    if os.path.lexists(path / ".git") or looks_like_repository(os.fspath(path)):
+        return True
+    try:
+        with os.scandir(path) as it:
+            return any(e.is_dir(follow_symlinks=False)
+                       and (os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path))
+                       for e in it)
+    except OSError:
+        return True  # unreadable: fail closed, as git_state does
+
+
 def derived_data(fam: Family, path: Path) -> bool:
     """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), a tool's own
-    cache the family names in git_free (TOOL_CACHES), and a tree remove() had already renamed aside
-    when it was interrupted, which is only ever reclaimed. None of these is searched for git."""
-    return bool(fam.build_output or path.name in fam.git_free
+    cache the family names in git_free (TOOL_CACHES) unless a clone sits at its top (shallow_checkout),
+    and a tree remove() had already renamed aside when it was interrupted, which is only ever reclaimed.
+    None of these is searched for git."""
+    return bool(fam.build_output or (path.name in fam.git_free and not shallow_checkout(path))
             or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
             or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
 

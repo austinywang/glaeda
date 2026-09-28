@@ -211,6 +211,48 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.process_evidence = lambda: ([str(go)], "")
         self.assertEqual(self.verdicts()["go-build"], "in-use")
 
+    def test_a_clone_at_the_top_of_a_tool_cache_name_is_still_kept(self) -> None:
+        # git_free skips the deep search, not the shallow one: a person's clone named like a tool cache
+        # (~/.cache/bazel, ~/Library/Caches/node-gyp/repo) is never deleted without a look.
+        self.fam = gd.Family("user-cache", self.root, True, "re-download", git_free=gd.TOOL_CACHES)
+        clone = make(self.root / "bazel")
+        (clone / ".git").mkdir()
+        nested = make(self.root / "node-gyp")
+        (nested / "repo/.git").mkdir(parents=True)
+        deep = make(self.root / "go-build")
+        (deep / "a/b/.git").mkdir(parents=True)
+        old = time.time() - 48 * 3600
+        for top in (clone, nested, deep):
+            for dirpath, dirs, files in os.walk(top):
+                for n in dirs + files:
+                    os.utime(os.path.join(dirpath, n), (old, old))
+            os.utime(top, (old, old))
+        self.assertEqual(self.verdicts(), {"bazel": "git-checkout", "node-gyp": "git-checkout",
+                                           "go-build": "reclaimable"})
+
+    def test_bazel_output_bases_go_and_the_repository_cache_stays(self) -> None:
+        # /private/var/tmp/_bazel_$USER on macOS: output bases (md5 names) and install/ are rebuilt by
+        # bazel, even with fetched clones inside; cache/ is the repository cache and is never a candidate.
+        self.fam = gd.bazel_family(self.root)
+        base = make(self.root / "0123456789abcdef0123456789abcdef")
+        (base / "external/rules_x/.git").mkdir(parents=True)
+        (base / "execroot/_main").mkdir(parents=True)
+        os.symlink(self.root.parent, base / "execroot/_main/outside")
+        (make(self.root / "cache") / "repos/v1").mkdir(parents=True)
+        old = time.time() - 48 * 3600
+        for top in (base, self.root / "cache"):
+            for dirpath, dirs, files in os.walk(top):
+                for n in dirs + files:
+                    os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+            os.utime(top, (old, old))
+        self.assertEqual(self.verdicts(), {base.name: "reclaimable"})
+        items = [i for i in gd.survey([self.fam], 24, 0) if i.verdict == "reclaimable"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.root.parent / f"{self.root.name}-r.jsonl", None, 24)
+        (self.root.parent / f"{self.root.name}-r.jsonl").unlink(missing_ok=True)
+        self.assertFalse(base.exists())
+        self.assertTrue((self.root / "cache/repos/v1").is_dir() and self.root.parent.is_dir())
+
     def test_cache_families_name_the_tool_caches(self) -> None:
         for fam in gd.default_families():
             if fam.id in ("user-cache", "library-caches"):
