@@ -4,6 +4,8 @@
     glaeda-disk                     report: biggest items, verdicts, reclaimable total
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
+    glaeda-disk --idle --apply      while no job runs, delete what sat idle past its family's age
+    glaeda-disk --pressure --idle --apply  pressure first; with no pressure, an hourly idle sweep
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
     glaeda-disk --pressure --apply waits while a GitHub Actions job runs, unless below --emergency
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
@@ -40,6 +42,13 @@ checkouts, other filesystems, the Chromium trees and the macOS privacy-protected
 never searched (HOME_NEVER).
 Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
 Every deletion is appended to a JSONL receipt.
+
+The idle sweep (--idle) reclaims whatever the free space, but only on an idle host: no GitHub Actions
+job, no build process, no dev-build worker job, no active reservation and the fleet host lock free,
+re-checked before every deletion. Its windows follow reuse (IDLE_SWEEP_HOURS and friends). It also
+reports Xcode copies no pin names and simulator runtimes, and deletes a runtime only when no device
+uses it, it is not its platform's newest, it went unused for RUNTIME_IDLE_DAYS and no simulator is
+booted (simctl runtime delete restarts CoreSimulatorService). Xcode copies are never deleted.
 
 On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
 tier, evicted LRU under pressure: parked pull request builds idle over an hour, seeds other than each
@@ -200,6 +209,237 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            min_idle_hours=KEPT_BUILD_IDLE_HOURS,
                            owner="cmux owned_build_state.py (keep)", rebuild_minutes=10))
     return fams
+
+
+# The idle sweep (--idle): windows from how often each family is read again, not from free space.
+# cmux restores a parked PR build only within PR_SLOT_HOURS (owned_build_state.py, 6 h) of its park, so an
+# older one is never read again. A job touches the seed it starts from, so a seed's mtime is its last use.
+# A busy root lands about four new ~9 GiB seeds an hour; one no job picked for a day (beyond the root's
+# newest SEED_KEEP, which stay) sits far behind every new base, and a fetch brings it back in 25 to 280 s.
+# A day, not less: cmux keeps up to 48 per root on a roomy disk so a PR on an older base starts close. DerivedData, caches and scratch get KEPT_BUILD_IDLE_HOURS, the
+# window a root's own kept build already has: two days covers a quiet day or a weekend's first job.
+IDLE_SWEEP_HOURS = KEPT_BUILD_IDLE_HOURS
+IDLE_PR_BUILD_HOURS = 6.0
+IDLE_SEED_HOURS = 24.0
+IDLE_SWEEP_EVERY_S = 3600  # the 15-minute agent sweeps at most hourly: an apply re-measures every candidate
+IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.last"
+FLEET_DIR = FLEET_CI.parent
+BUILD_PROCESS = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)")
+
+
+def idle_families(fams: list[Family]) -> list[Family]:
+    """The families as the idle sweep judges them: the hot tier gets its reuse windows."""
+    windows = {"cmux-pr-builds": IDLE_PR_BUILD_HOURS, "cmux-seeds": IDLE_SEED_HOURS}
+    return [replace(f, max_idle_hours=windows[f.id]) if f.id in windows else f for f in fams]
+
+
+def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
+    """Why this host is not idle, or "": a CI job or build process, a dev-build worker job, an active or
+    unreadable reservation, or the fleet host lock held (PR jobs hold it shared, fleet builds exclusive).
+    Anything unreadable counts as busy."""
+    fleet = FLEET_DIR if fleet is None else fleet
+    now = time.time() if now is None else now
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return "cannot list processes"
+    if ps.returncode != 0 or not ps.stdout.strip():
+        return "cannot list processes"
+    for line in ps.stdout.splitlines():
+        if CI_WORKER.search(line):
+            return f"a CI job is running ({line.strip()[:120]})"
+        if BUILD_PROCESS.search(line):  # the whole line: an Xcode path may hold a space
+            return f"a build is running ({line.strip()[:120]})"
+    try:
+        with os.scandir(fleet / "jobs") as it:
+            if any(not e.name.startswith(".") for e in it):
+                return f"a dev-build worker job is in {fleet / 'jobs'}"
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return f"cannot read {fleet / 'jobs'}"
+    try:
+        doc = json.loads((fleet / "reservation.json").read_text())
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return "the host reservation is unreadable"
+    else:
+        # glaeda_reservation's rule: another schema or a non-integer time is invalid, and invalid is active
+        until = doc.get("until") if isinstance(doc, dict) else None
+        if (not isinstance(doc, dict) or doc.get("schema") != "glaeda-reservation/v1"
+                or not isinstance(until, int) or isinstance(until, bool) or now < until):
+            return "the host is reserved"
+    try:
+        fd = os.open(fleet / "host.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return "the host lock is unreadable"
+    try:
+        # shared, as the runner hook's host_held probes: an exclusive probe could make a PR job's own
+        # one-shot exclusive take fail. PR jobs (shared holders) are caught by Runner.Worker above.
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return "a fleet build holds the host lock"
+    finally:
+        os.close(fd)
+    return ""
+
+
+def idle_due(stamp: Path | None = None, every_s: float = IDLE_SWEEP_EVERY_S) -> bool:
+    return not _fresh(IDLE_STAMP if stamp is None else stamp, every_s)
+
+
+# Xcode copies and simulator runtimes (idle sweep, macOS). An Xcode is an install, not a rebuild: it is only
+# reported, with the pins that name it. A runtime is a multi-GiB download; one goes only when nothing uses it.
+RUNTIME_IDLE_DAYS = 14.0  # simctl's lastUsedAt: an iOS lane touches its runtime on every run
+
+
+def _version_key(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"[0-9]+", v))
+
+
+def _iso_age_hours(text: object, now: float) -> float | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        import datetime
+        at = datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+    return (now - at) / 3600
+
+
+def runtime_items(runtimes: dict, devices: dict, now: float | None = None) -> list[Item]:
+    """Judge simulator runtimes (`simctl runtime list -j`) against devices (`simctl list devices -j`).
+    Reclaimable only when deletable, used by no device, not its platform's newest, unused for
+    RUNTIME_IDLE_DAYS, and no simulator is booted. Unknown fields keep it."""
+    now = time.time() if now is None else now
+    by_runtime = devices.get("devices") if isinstance(devices, dict) else None
+    if not isinstance(runtimes, dict) or not isinstance(by_runtime, dict):
+        return []
+    booted = any(isinstance(d, dict) and d.get("state") == "Booted"
+                 for devs in by_runtime.values() if isinstance(devs, list) for d in devs)
+    newest: dict[str, str] = {}
+    for r in runtimes.values():
+        if isinstance(r, dict):
+            plat, v = str(r.get("platformIdentifier", "")), str(r.get("version", ""))
+            if plat not in newest or _version_key(v) > _version_key(newest[plat]):
+                newest[plat] = v
+    items = []
+    for rid, r in sorted(runtimes.items()):
+        if not isinstance(r, dict):
+            continue
+        reasons = [f"{r.get('version', '?')} ({r.get('build', '?')}) {r.get('state', '?')}"]
+        keep = []
+        devs = by_runtime.get(r.get("runtimeIdentifier"), [])
+        if not r.get("runtimeIdentifier") or devs:
+            keep.append(f"{len(devs) if isinstance(devs, list) else '?'} simulator devices use it")
+        if newest.get(str(r.get("platformIdentifier", ""))) == str(r.get("version", "")):
+            keep.append("its platform's newest")
+        if r.get("deletable") is not True:
+            keep.append("simctl cannot delete it")
+        idle = _iso_age_hours(r.get("lastUsedAt"), now)
+        if idle is None:
+            keep.append("no last-use time")
+        if booted:
+            keep.append("a simulator is booted (deleting restarts CoreSimulatorService)")
+        size = r.get("sizeBytes")
+        verdict = ("kept" if keep else "recent" if idle is not None and idle < RUNTIME_IDLE_DAYS * 24
+                   else "reclaimable")
+        items.append(Item("simulator-runtimes", str(rid), size if isinstance(size, int) else 0,
+                          round(idle or 0.0, 1), verdict, reasons + keep))
+    return items
+
+
+def simctl_json(*args: str) -> dict | None:
+    try:
+        r = subprocess.run(["xcrun", "simctl", *args, "-j"], capture_output=True, text=True, timeout=120)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def simulator_runtimes() -> list[Item]:
+    if not DARWIN or not shutil.which("xcrun"):
+        return []
+    runtimes, devices = simctl_json("runtime", "list"), simctl_json("list", "devices")
+    return runtime_items(runtimes, devices) if runtimes is not None and devices is not None else []
+
+
+XCODE_PIN_RE = r"\s--toolchain-xcode[\s=]+(\S+)"
+
+
+def xcode_pins(home: Path = HOME) -> dict[str, str]:
+    """Xcode app paths something names -> what: xcode-select, and a runner hook's --toolchain-xcode."""
+    pins: dict[str, str] = {}
+    for hook in home.glob(RUNNER_HOOKS):
+        try:
+            for app in re.findall(XCODE_PIN_RE, hook.read_text()):
+                pins[os.path.realpath(app.strip("'\""))] = "a runner hook's --toolchain-xcode"
+        except (OSError, UnicodeDecodeError):
+            continue
+    try:
+        sel = subprocess.run(["xcode-select", "-p"], capture_output=True, text=True, timeout=10).stdout.strip()
+        if ".app/" in sel:
+            pins.setdefault(os.path.realpath(sel.split(".app/")[0] + ".app"), "xcode-select")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return pins
+
+
+def xcode_items(apps: Path = Path("/Applications"), pins: dict[str, str] | None = None) -> list[Item]:
+    """Every Xcode*.app, report-only, with the pin that names it or why nothing here removes it."""
+    pins = xcode_pins() if pins is None else pins
+    items = []
+    for app in sorted(apps.glob("Xcode*.app")):
+        if app.is_symlink():
+            continue
+        try:
+            import plistlib
+            version = plistlib.loads((app / "Contents/Info.plist").read_bytes()).get("CFBundleShortVersionString", "?")
+            owner = pwd.getpwuid(app.stat().st_uid).pw_name
+        except Exception:  # noqa: BLE001  (a report line, never a decision)
+            version, owner = "?", "?"
+        pin = pins.get(os.path.realpath(app))
+        why = [f"Xcode {version}, owned by {owner}",
+               f"pinned by {pin}" if pin else "no pin names it: remove it by hand if no workflow uses it"]
+        items.append(Item("xcode-apps", str(app), du_bytes(app), 0.0, "report-only", why))
+    return items
+
+
+def apply_runtimes(items: list[Item], receipt: Path, halt=None) -> int:
+    """Delete reclaimable runtimes after judging them again from a fresh simctl reading."""
+    released = 0
+    for i in items:
+        if i.verdict != "reclaimable":
+            continue
+        why = halt() if halt is not None else ""
+        fresh = {x.path: x for x in simulator_runtimes()}.get(i.path)
+        if why:
+            outcome = f"stopped:{why[:60]}"
+        elif fresh is None or fresh.verdict != "reclaimable":
+            outcome = "changed:in-use"
+        else:
+            try:
+                r = subprocess.run(["xcrun", "simctl", "runtime", "delete", i.path], capture_output=True,
+                                   text=True, timeout=900)
+                outcome = "reclaimed" if r.returncode == 0 else f"incomplete:exit {r.returncode}"
+            except (OSError, subprocess.SubprocessError) as e:
+                outcome = f"incomplete:{e.__class__.__name__}"
+            if outcome == "reclaimed":
+                released += i.bytes
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "rebuild": "xcodebuild -downloadPlatform or Xcode's Components settings", **asdict(i),
+               "sweep": "idle"}
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome:16s} {gib(i.bytes)}  simulator runtime {i.path}")
+        if why:
+            break
+    return released
 
 
 def seed_verdict(path: Path) -> str:
@@ -1929,9 +2169,10 @@ APPLY_LSOF_ITEMS, APPLY_LSOF_S = 8, 20.0  # apply re-takes lsof for discovered i
 
 
 def apply(items: list[Item], families: dict[str, Family], receipt: Path,
-          targets: dict[int, int] | None, idle_hours: float) -> int:
+          targets: dict[int, int] | None, idle_hours: float, halt=None) -> int:
     """Delete reclaimable items, largest first. With `targets` (filesystem device -> free bytes
-    to stop at), only items on those filesystems are touched, each until its own target."""
+    to stop at), only items on those filesystems are touched, each until its own target. With `halt`
+    (the idle sweep's host_busy), each deletion first asks it and the run stops once it names a reason."""
     receipt.parent.mkdir(parents=True, exist_ok=True)
     released = 0
     _NESTED_WALKS.clear()  # re-observe every checkout right before deleting
@@ -1957,6 +2198,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         # fresh re-observation right before the destructive step. cmux jobs clone their warm state with
         # `cp -cR SOURCE ...` at any moment and a clone leaves the source's times alone, so those families
         # re-read the command lines per item rather than trusting the ones from the start of a long run.
+        if halt is not None and (why := halt()):
+            print(f"stopped: {why}")
+            break
         if families[i.family].build_output and families[i.family].root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
         fresh_layout = ""
@@ -2013,7 +2257,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
-               "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i)}
+               "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i),
+               **({"sweep": "idle"} if halt is not None else {})}
         with receipt.open("a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"  {outcome:16s} {gib(i.bytes)}  {i.path.replace(str(HOME), '~')}")
@@ -2153,6 +2398,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
     ap.add_argument("--pressure", action="store_true",
                     help="only act when free space is below --low; stop at --target")
+    ap.add_argument("--idle", action="store_true",
+                    help="idle sweep: only while no job runs, delete what sat idle past its family's reuse "
+                         "window whatever the free space; with --pressure, only when there is no pressure, "
+                         "at most hourly")
     # Air Blue sat at 3-7% free for a day with the old 15%/25%: act earlier and free more per run
     ap.add_argument("--low", default="25%:60-200",
                     help="pressure threshold per filesystem: GiB free, N%% of its size, or "
@@ -2227,11 +2476,23 @@ def main(argv: list[str] | None = None) -> int:
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
-    if a.pressure:
-        if not under:
-            for fs in fss.values():
-                print(f"no pressure: {gib(fs.free).strip()} free >= {gib(fs.low).strip()} on {fs.mount}")
+    sweep = a.idle and not (a.pressure and under)
+    if a.pressure and not under:
+        for fs in fss.values():
+            print(f"no pressure: {gib(fs.free).strip()} free >= {gib(fs.low).strip()} on {fs.mount}")
+        if not a.idle:
             return 0
+        if not idle_due():
+            print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
+            return 0
+    busy = host_busy() if sweep else ""
+    if sweep:
+        print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")
+        if busy and a.apply:
+            return 0
+        a.pressure = False  # the sweep reports and acts on every filesystem, without targets
+        fams = idle_families(fams)
+    if a.pressure:
         # only families on a filesystem under pressure are surveyed or touched
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
         if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
@@ -2246,7 +2507,7 @@ def main(argv: list[str] | None = None) -> int:
         except BlockingIOError:
             print("another eviction running; skipped")
             return 0
-    idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
+    idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
     if a.apply:
         # sizes decide what gets deleted under pressure, so never trust stale ones there
@@ -2276,8 +2537,11 @@ def main(argv: list[str] | None = None) -> int:
               f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
               " verdicts are live\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
+    # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
+    tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) if sweep and DARWIN else []
     if a.json:
         print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
+                          "tooling": [asdict(i) for i in tooling],
                           "filesystems": [asdict(fs) for fs in shown],
                           "owners": {f.id: {"owner": f.owner, "retired": owner_retired(f)}
                                      for f in fams if f.owner},
@@ -2285,10 +2549,19 @@ def main(argv: list[str] | None = None) -> int:
     else:
         report(items, shown, a.top, idle,
                {f.id: f.rebuild for f in fams if f.id == "cargo-target"}, {f.id: f for f in fams})
+        if tooling:
+            print("\nXcode copies and simulator runtimes")
+        for t in tooling:
+            print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
+        halt = host_busy if sweep else None
         apply(items, {f.id: f for f in fams}, a.receipt,
-              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle)
+              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
+        if sweep:
+            apply_runtimes(tooling, a.receipt, halt)
+            IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
+            IDLE_STAMP.touch()
     return 0
 
 

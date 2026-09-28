@@ -606,11 +606,12 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     return {
         LABEL_PREFIX + "disk-pressure": {
             "Label": LABEL_PREFIX + "disk-pressure",
-            "ProgramArguments": [python, disk, "--pressure", "--apply", "--top", "0"],
+            "ProgramArguments": [python, disk, "--pressure", "--idle", "--apply", "--top", "0"],
             "StartInterval": 900,
             "RunAtLoad": True,
             # Not ProcessType Background: under pressure this job must still finish its lsof and free
             # space while a build fills the disk. LowPriorityIO and Nice keep it behind the build.
+            # --idle: with no pressure, an hourly sweep of idle reproducible data while no job runs.
             "LowPriorityIO": True,
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),

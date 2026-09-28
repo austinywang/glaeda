@@ -1246,6 +1246,135 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(receipt.exists())
 
 
+    def test_idle_sweep_windows_follow_reuse(self) -> None:
+        ci = self.root / "ci"
+        (ci / "seeds").mkdir(parents=True)
+        (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
+        for name, age in (("p-a", 1), ("p-b", 2), ("p-c", 12), ("p-d", 30)):
+            make(ci / "seeds" / name, age_hours=age)
+        make(ci / "pr-builds/pr-1", age_hours=3)
+        make(ci / "pr-builds/pr-2", age_hours=7)
+        make(ci / "derived-data", age_hours=30)
+        fams = gd.idle_families(gd.fleet_families(ci))
+        got = {str(Path(i.path).relative_to(ci)): i.verdict for i in gd.survey(fams, gd.IDLE_SWEEP_HOURS, 0)}
+        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "recent",
+                               "seeds/p-d": "reclaimable", "pr-builds/pr-1": "recent",
+                               "pr-builds/pr-2": "reclaimable", "derived-data": "recent"})
+        # DerivedData and caches wait the full window
+        make(self.root / "dd/old", age_hours=50)
+        make(self.root / "dd/day", age_hours=30)
+        fam = gd.Family("xcode-derived-data", self.root / "dd", True, "rebuild")
+        got = {Path(i.path).name: i.verdict for i in gd.survey(gd.idle_families([fam]), gd.IDLE_SWEEP_HOURS, 0)}
+        self.assertEqual(got, {"old": "reclaimable", "day": "recent"})
+
+    def test_host_busy_sees_jobs_builds_locks_and_reservations(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        ps = lambda out: mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, out, ""))
+        with ps("/sbin/launchd\n/usr/bin/python3 x\n"):
+            self.assertEqual(gd.host_busy(fleet), "")
+            (fleet / "host.lock").touch()
+            self.assertEqual(gd.host_busy(fleet), "")
+            with (fleet / "host.lock").open() as held:
+                fcntl.flock(held, fcntl.LOCK_SH)  # a PR job holds it shared: Runner.Worker says busy
+                self.assertEqual(gd.host_busy(fleet), "")
+            with (fleet / "host.lock").open() as held:
+                fcntl.flock(held, fcntl.LOCK_EX)  # a fleet build
+                self.assertIn("host lock", gd.host_busy(fleet))
+            marker = {"schema": "glaeda-reservation/v1", "until": int(time.time()) + 60}
+            (fleet / "reservation.json").write_text(json.dumps(marker))
+            self.assertIn("reserved", gd.host_busy(fleet))
+            (fleet / "reservation.json").write_text(json.dumps({**marker, "until": int(time.time()) - 60}))
+            self.assertEqual(gd.host_busy(fleet), "")
+            (fleet / "reservation.json").write_text(json.dumps({"until": int(time.time()) - 60}))
+            self.assertIn("reserved", gd.host_busy(fleet))  # another schema is invalid, so active
+            (fleet / "reservation.json").write_text("{")
+            self.assertIn("unreadable", gd.host_busy(fleet))
+            (fleet / "reservation.json").unlink()
+            (fleet / "jobs").mkdir()
+            (fleet / "jobs/.DS_Store").touch()
+            self.assertEqual(gd.host_busy(fleet), "")
+            (fleet / "jobs/abc").mkdir()
+            self.assertIn("dev-build worker", gd.host_busy(fleet))
+            (fleet / "jobs/abc").rmdir()
+        with ps("/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
+            self.assertIn("CI job", gd.host_busy(fleet))
+        with ps("/Applications/Xcode 26.app/Contents/Developer/usr/bin/xcodebuild build\n"):
+            self.assertIn("build", gd.host_busy(fleet))
+        with ps(""):
+            self.assertIn("cannot list", gd.host_busy(fleet))
+
+    def test_idle_apply_stops_once_the_host_turns_busy(self) -> None:
+        for name in ("a", "b", "c"):
+            make(self.root / name)
+        items = gd.survey([self.fam], 24, 0)
+        calls = iter(["", "a CI job is running (x)"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.receipt(), None, 24, halt=lambda: next(calls))
+        self.assertEqual(sum((self.root / n).exists() for n in ("a", "b", "c")), 2)
+        recs = [json.loads(l) for l in self.receipt().read_text().splitlines()]
+        self.assertEqual([(r["outcome"], r["sweep"]) for r in recs], [("reclaimed", "idle")])
+
+    def test_idle_sweep_in_main(self) -> None:
+        make(self.root / "old", age_hours=50)
+        make(self.root / "day", age_hours=30)
+        stamp = self.root.parent / f"{self.root.name}-idle.last"
+        self.addCleanup(stamp.unlink, missing_ok=True)
+        args = ["--pressure", "--idle", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "1", "--target", "2",
+                "--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "free_bytes", return_value=(100 * gd.GIB, 400 * gd.GIB)), \
+                mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]):
+            with mock.patch.object(gd, "host_busy", return_value="a CI job is running (x)"), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                gd.main(args)
+            self.assertIn("host busy", out.getvalue())
+            self.assertTrue((self.root / "old").exists())
+            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()):
+                gd.main(args)
+            self.assertFalse((self.root / "old").exists())
+            self.assertTrue((self.root / "day").exists())
+            self.assertTrue(stamp.exists())
+            make(self.root / "old", age_hours=50)
+            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out:
+                gd.main(args)  # within the hour: no second sweep
+            self.assertIn("within", out.getvalue())
+            self.assertTrue((self.root / "old").exists())
+
+    def test_simulator_runtimes_go_only_when_nothing_uses_them(self) -> None:
+        now = time.time()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
+        new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400))
+
+        def rt(version, used, deletable=True):
+            return {"runtimeIdentifier": f"ios-{version}", "platformIdentifier": "iphonesimulator",
+                    "version": version, "deletable": deletable, "lastUsedAt": used, "sizeBytes": 8 * gd.GIB}
+        runtimes = {"A": rt("26.5", old), "B": rt("26.2", old), "C": rt("26.1", new), "D": rt("18.0", old),
+                    "E": rt("17.0", old, deletable=False)}
+        devices = {"devices": {"ios-18.0": [{"state": "Shutdown"}]}}
+        got = {i.path: i.verdict for i in gd.runtime_items(runtimes, devices, now)}
+        self.assertEqual(got, {"A": "kept", "B": "reclaimable", "C": "recent", "D": "kept", "E": "kept"})
+        devices["devices"]["ios-18.0"][0]["state"] = "Booted"
+        self.assertNotIn("reclaimable", {i.verdict for i in gd.runtime_items(runtimes, devices, now)})
+        self.assertEqual(gd.runtime_items({"A": rt("1", old)}, None, now), [])
+
+    def test_xcode_copies_are_report_only_with_their_pins(self) -> None:
+        apps = self.root / "Applications"
+        for name in ("Xcode.app", "Xcode_26.6.app"):
+            (apps / name / "Contents").mkdir(parents=True)
+        pins = {os.path.realpath(apps / "Xcode_26.6.app"): "a runner hook's --toolchain-xcode"}
+        items = {Path(i.path).name: i for i in gd.xcode_items(apps, pins)}
+        self.assertEqual({i.verdict for i in items.values()}, {"report-only"})
+        self.assertIn("no pin", items["Xcode.app"].reasons[1])
+        self.assertIn("runner hook", items["Xcode_26.6.app"].reasons[1])
+        home = self.root / "home"
+        (home / "actions-runner-glaeda/glaeda-hooks").mkdir(parents=True)
+        (home / "actions-runner-glaeda/glaeda-hooks/job-started.sh").write_text(
+            "exec x job-started --min-free-gib 50 --toolchain-xcode /Applications/Xcode_26.6.app --instance 0\n")
+        self.assertIn(os.path.realpath("/Applications/Xcode_26.6.app"), gd.xcode_pins(home))
+
+
 class LinuxLayoutTest(unittest.TestCase):
     """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
 
