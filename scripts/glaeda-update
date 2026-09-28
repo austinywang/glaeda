@@ -9,7 +9,12 @@ A LaunchAgent (macOS) or systemd user timer (Linux) runs `--apply` hourly; glaed
 it. Configuration is ~/.config/glaeda/update.json, written once by setup and never overwritten:
 
     {"ring": "canary" | "stable", "setupArgs": ["--hygiene-only"], "host": "air-blue",
-     "reportStatus": true}
+     "reportStatus": true, "source": "teamleaderleo/glaeda"}
+
+`source` is where releases and channel files are downloaded from: this repository, or its read-only
+mirror manaflow-ai/glaeda, which the Manaflow minis use (docs/GLAEDA_OTA.md, Fleet mirror). The mirror
+holds byte-identical copies, so every check below still names this repository: release.json must say
+teamleaderleo/glaeda and the attestation must come from its release.yml.
 
 What one run does, and what it refuses:
 
@@ -60,7 +65,8 @@ import urllib.request
 from pathlib import Path
 
 REPOSITORY = "teamleaderleo/glaeda"
-DOWNLOAD = f"https://github.com/{REPOSITORY}/releases/download/{{tag}}/{{name}}"
+# where a host may download releases from: the repository itself, or the fleet's mirror of it
+SOURCES = (REPOSITORY, "manaflow-ai/glaeda")
 CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
 CONTROL_SCHEMA = "glaeda-ota-control/v1"
 SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
@@ -128,7 +134,11 @@ def load_config(path: Path = CONFIG) -> dict:
             or any(a in ("--uninstall", "--reclaim-binary") for a in args):
         raise UpdateError(f"{path}: setupArgs must be setup flags")
     host = str(doc.get("host") or platform.node().split(".")[0].lower())
-    return {"ring": ring, "setupArgs": args, "host": host, "reportStatus": bool(doc.get("reportStatus", ring == "canary"))}
+    source = doc.get("source", REPOSITORY)
+    if source not in SOURCES:
+        raise UpdateError(f"{path}: source must be one of {', '.join(SOURCES)}")
+    return {"ring": ring, "setupArgs": args, "host": host, "source": source,
+            "reportStatus": bool(doc.get("reportStatus", ring == "canary"))}
 
 
 def load_state(state_dir: Path = STATE_DIR) -> dict:
@@ -154,8 +164,8 @@ def save_state(state: dict, state_dir: Path = STATE_DIR) -> None:
     os.replace(tmp, state_dir / "state.json")
 
 
-def channel_url(name: str) -> str:
-    return DOWNLOAD.format(tag="ota-channels", name=name)
+def release_url(tag: str, name: str, source: str = REPOSITORY) -> str:
+    return f"https://github.com/{source}/releases/download/{tag}/{name}"
 
 
 def resolve(control_raw: bytes, ring_raw: bytes | None, ring: str) -> dict | None:
@@ -173,10 +183,10 @@ def resolve(control_raw: bytes, ring_raw: bytes | None, ring: str) -> dict | Non
     return entry
 
 
-def fetch_channel(ring: str) -> tuple[bytes, bytes | None]:
-    control = fetch(channel_url("control.json"), MAX_META)
+def fetch_channel(ring: str, source: str = REPOSITORY) -> tuple[bytes, bytes | None]:
+    control = fetch(release_url("ota-channels", "control.json", source), MAX_META)
     try:
-        ring_raw = fetch(channel_url(f"{ring}.json"), MAX_META)
+        ring_raw = fetch(release_url("ota-channels", f"{ring}.json", source), MAX_META)
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
@@ -360,16 +370,16 @@ def prune(state_dir: Path, keep: set[str]) -> None:
             shutil.rmtree(child, ignore_errors=True)
 
 
-def download(state_dir: Path, entry: dict, target: str, ring: str) -> Path:
+def download(state_dir: Path, entry: dict, target: str, ring: str, source: str = REPOSITORY) -> Path:
     """Fetch and verify the release into its generation directory; reuse a complete one."""
     gen = generation(state_dir, entry["tag"])
     if (gen / ".complete").is_file():
         return gen
-    release_raw = fetch(DOWNLOAD.format(tag=entry["tag"], name="release.json"), MAX_META)
+    release_raw = fetch(release_url(entry["tag"], "release.json", source), MAX_META)
     release = check_release(release_raw, entry)
     name = f"glaeda-hygiene-{target}.tar.gz"
     meta = release.get("assets", {}).get(name)
-    raw = fetch(DOWNLOAD.format(tag=entry["tag"], name=name), MAX_ASSET)
+    raw = fetch(release_url(entry["tag"], name, source), MAX_ASSET)
     check_asset(raw, meta)
     partial = gen.with_name(gen.name + ".partial")
     shutil.rmtree(partial, ignore_errors=True)
@@ -432,9 +442,10 @@ def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SC
 def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
            channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN) -> dict:
     state = load_state(state_dir)
-    control_raw, ring_raw = channel if channel is not None else fetch_channel(config["ring"])
+    source = config.get("source", REPOSITORY)
+    control_raw, ring_raw = channel if channel is not None else fetch_channel(config["ring"], source)
     entry = resolve(control_raw, ring_raw, config["ring"])
-    out = {"ring": config["ring"], "current": state["current"]}
+    out = {"ring": config["ring"], "source": source, "current": state["current"]}
     if entry is None:
         return {**out, "result": "idle", "why": "paused or nothing on this ring"}
     out["target"] = entry["tag"]
@@ -445,7 +456,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
     if not apply:
         return {**out, "result": "plan", "why": f"would install {entry['tag']}"}
     try:
-        gen = download(state_dir, entry, local_target(), config["ring"])
+        gen = download(state_dir, entry, local_target(), config["ring"], source)
     except UpdateError as e:
         # The release failed verification (digest, attestation, archive): that is the release's fault
         # or a real attack, never a blip, so it counts against it. Network errors are not UpdateError

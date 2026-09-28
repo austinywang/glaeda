@@ -13,8 +13,9 @@ permissions:
 
 jobs:
   build:
-    # only main publishes; a dispatch on another ref must never reach a host
-    if: github.ref == 'refs/heads/main'
+    # only main of this repository publishes (the manaflow-ai/glaeda mirror copies, never builds);
+    # a dispatch on another ref must never reach a host
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
     strategy:
       fail-fast: true
       matrix:
@@ -54,7 +55,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
     # canary.json has this one writer; a newer push waiting here supersedes an older pending one
     concurrency:
       group: ota-canary

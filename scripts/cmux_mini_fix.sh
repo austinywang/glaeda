@@ -149,9 +149,13 @@ glaeda() {  # PYTHON
   local dir="$HOME/glaeda"
   if [ ! -f "$dir/scripts/cmux_fleet.py" ]; then
     [ ! -e "$dir" ] || refuse "$dir exists and is not a Glaeda checkout"
-    git clone --depth 1 --progress https://github.com/teamleaderleo/glaeda.git "$dir"
+    # the fleet's read-only mirror of teamleaderleo/glaeda (docs/GLAEDA_OTA.md, Fleet mirror)
+    git clone --depth 1 --progress https://github.com/manaflow-ai/glaeda.git "$dir"
   fi
-  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply
+  # an older checkout's setup predates --ota-source; glaeda-mirror.sh in hq sets it on such hosts later
+  local ota=()
+  grep -q -- '--ota-source' "$dir/scripts/glaeda-mini-setup" && ota=(--ota-source manaflow-ai/glaeda)
+  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply ${ota[@]+"${ota[@]}"}
 }
 
 # ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes --glaeda-ref, else the tip of main), so

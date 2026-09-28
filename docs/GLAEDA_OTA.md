@@ -68,11 +68,47 @@ eight.
 | --- | --- | --- |
 | Air Blue | canary | Leo's Mac; `gh` is authenticated, so it reports health |
 | Big Red | canary | always on; reports health when the Mac is asleep |
-| manaflow minis | stable | build hosts: take only what a canary has run for 6 hours |
+| manaflow minis | stable | build hosts: take only what a canary has run for 6 hours; download from the fleet mirror |
 
 Set a host's ring once with `glaeda-mini-setup --apply --ota-ring canary` (or `stable`). The
 first setup writes the config with `stable`, and later runs leave it alone unless `--ota-ring`
 names another ring.
+
+Set where a host downloads from with `--ota-source manaflow-ai/glaeda` (or `teamleaderleo/glaeda`,
+the default); it is kept in `update.json` as `source` the same way.
+
+## Fleet mirror
+
+The Manaflow minis install from [manaflow-ai/glaeda](https://github.com/manaflow-ai/glaeda), a
+read-only fork of this repository in the Manaflow organization, so the fleet does not depend on a
+personal repository. Nobody develops there; this repository stays the source of every change,
+release, attestation and promotion.
+
+- **What it holds.** `.github/workflows/mirror.yml`, which runs only in the fork, every 15 minutes
+  (and on dispatch) copies `main`, the newest 30 `r-*` releases plus the ones `canary.json` and
+  `stable.json` name, and the `ota-channels` files, byte for byte. `control.json` is copied first
+  and on its own, so a pause never waits on a release; a ring file is copied only once its release
+  is published in the fork. `release.yml`, `promote.yml` and `control.yml` run only in this
+  repository, and the mirror job disables every other workflow in the fork before it pushes.
+- **How it pushes.** `main` goes over SSH with a write deploy key of the fork (its secret
+  `MIRROR_DEPLOY_KEY`), because the job token cannot push commits that change workflow files.
+  Releases use the job token. No personal token is stored anywhere.
+- **What hosts check.** A host with `"source": "manaflow-ai/glaeda"` downloads channel files and
+  assets from the fork, and checks them exactly as before: release.json must name
+  `teamleaderleo/glaeda`, and the attestation (when `gh` is signed in) must come from this
+  repository's `release.yml`. The fork's admins can write what minis download, as they can already
+  change the minis themselves.
+- **Lag.** Up to 15 minutes behind this repository (longer when GitHub's cron lags). A pause
+  reaches the minis after the next mirror run; to hurry it, dispatch the mirror too:
+  `gh workflow run mirror.yml --repo manaflow-ai/glaeda`.
+- **Checkouts.** New minis clone the fork (`glaeda-mini-fleet`), and `~/glaeda` moves to the fork's
+  `main`. Hosts set up earlier are moved by cmuxterm-hq's `build-fleet/mini-ops/glaeda-mirror.sh`,
+  which sets their `origin` and `source`, one canary host first.
+  A `glaeda-mini-fleet --glaeda-ref` pin to a commit merged in the last few minutes fails to fetch
+  until the next mirror run.
+- **Takes effect** with the first `glaeda-update` that knows `source`: a host running an older
+  release (or rolled back to one) ignores the key and keeps downloading from this repository, which
+  still works.
 
 ## Operator controls
 
@@ -80,6 +116,7 @@ names another ring.
 gh workflow run control.yml --repo teamleaderleo/glaeda -f paused=true    # every host stops updating
 gh workflow run control.yml --repo teamleaderleo/glaeda -f paused=false   # resume
 gh workflow run promote.yml --repo teamleaderleo/glaeda                   # check promotion now
+gh workflow run mirror.yml --repo manaflow-ai/glaeda                      # copy to the fleet mirror now
 gh release download ota-channels --repo teamleaderleo/glaeda -p '*.json' -D /tmp/ota   # what each ring runs
 glaeda-update --status                     # on a host: ring, current, previous, quarantined
 tail ~/Library/Logs/glaeda-update.jsonl    # macOS; ~/.local/state/glaeda-update.jsonl on Linux

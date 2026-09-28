@@ -2058,7 +2058,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         f"at {head[:12] or '?'}, its glaeda-mini-enroll lacks {' '.join(lacking)}" if lacking else ""
     if glaeda_missing:
         put("glaeda", "fail", f"missing: {', '.join(glaeda_missing)}",
-            "git clone https://github.com/teamleaderleo/glaeda.git ~/glaeda; ~/glaeda/scripts/glaeda-mini-setup --apply",
+            f"git clone https://github.com/{FLEET_SOURCE}.git ~/glaeda; "
+            f"~/glaeda/scripts/glaeda-mini-setup --apply --ota-source {FLEET_SOURCE}",
             "self", {"kind": "glaeda"})
     elif behind and pf.get("glaeda_dirty"):
         put("glaeda", "fail", f"~/glaeda is {behind} and has {pf['glaeda_dirty']} local changes",
@@ -2622,6 +2623,9 @@ def ship_python(name: str, user: str, action: dict[str, Any], log: Any) -> tuple
 
 
 CANDIDATE_REPO = "teamleaderleo/glaeda"
+# The read-only mirror of this repository the minis clone and fetch ~/glaeda from (docs/GLAEDA_OTA.md, Fleet
+# mirror). It only ever holds this repository's commits, so its main is what every host can fetch.
+FLEET_SOURCE = "manaflow-ai/glaeda"
 CANDIDATE_ARTIFACT = "glaeda-candidate-aarch64-apple-darwin"
 CANDIDATE_WORKFLOW = "Fleet candidate bundles"
 CANDIDATE_TARGET = "aarch64-apple-darwin"
@@ -3474,15 +3478,15 @@ def adoption_mismatch(log_path: Path) -> list[str]:
     return []
 
 
-def glaeda_target(repo: str | None = None) -> str:
-    """The commit ~/glaeda moves to in this run: --glaeda-ref, else main's tip, resolved once and then reused."""
+def glaeda_target() -> str:
+    """The commit ~/glaeda moves to in this run: --glaeda-ref, else the tip of the fleet mirror's main (what
+    the hosts fetch from), resolved once and then reused."""
     if GLAEDA_REF:
         return GLAEDA_REF
-    repo = repo or operator_candidate().get("repo") or CANDIDATE_REPO
     with GLAEDA_MAIN_LOCK:
-        if repo not in GLAEDA_MAIN:
-            GLAEDA_MAIN[repo] = resolve_glaeda_main(repo)
-        return GLAEDA_MAIN[repo]
+        if FLEET_SOURCE not in GLAEDA_MAIN:
+            GLAEDA_MAIN[FLEET_SOURCE] = resolve_glaeda_main(FLEET_SOURCE)
+        return GLAEDA_MAIN[FLEET_SOURCE]
 
 
 def resolve_glaeda_main(repo: str) -> str:
@@ -3724,7 +3728,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
     glaeda_ref = None
     if stale:
         try:
-            glaeda_ref = glaeda_target(candidate.get("repo") or CANDIDATE_REPO)
+            glaeda_ref = glaeda_target()
         except Failure as error:
             for name in stale:
                 settle(name, "sync", f"blocked: {error}")
@@ -4142,7 +4146,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
     assert directory is not None
     for name in ready:
         rows[name]["log"] = os.fspath(directory / f"{name}.log")
-    glaeda_ref = glaeda_target(repo)
+    glaeda_ref = glaeda_target()
     manifest_lock = threading.Lock()
 
     def seed_task(klass: str, name: str) -> Any:

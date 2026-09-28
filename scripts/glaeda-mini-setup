@@ -42,7 +42,8 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
-    ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
+    ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
+                                               --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
                                   idle-warm,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
@@ -131,6 +132,8 @@ SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
+# where glaeda-update downloads releases: the repository, or the Manaflow fleet's read-only mirror of it
+OTA_SOURCES = ("teamleaderleo/glaeda", "manaflow-ai/glaeda")
 # with --hygiene-only, only these preflight failures block: the agents run python3, and on
 # Linux the timers need a systemd user manager
 HYGIENE_BLOCKING = frozenset({"python", "systemdUser"})
@@ -185,7 +188,8 @@ class Context:
     def __init__(self, home: Path, apply: bool, python: str | None, skip_launchctl: bool,
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
-                 platform_name: str | None = None, ota_ring: str | None = None) -> None:
+                 platform_name: str | None = None, ota_ring: str | None = None,
+                 ota_source: str | None = None) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -212,6 +216,7 @@ class Context:
         self.state = home / ".local/state/glaeda/mini-setup"
         self.receipt_path = self.state / "receipt.json"
         self.ota_ring = ota_ring
+        self.ota_source = ota_source
         self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
@@ -775,16 +780,17 @@ def is_update_agent(label: str) -> bool:
 
 def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
-    return {
+    config = {
         "ring": ctx.ota_ring or "stable",
         "setupArgs": ["--hygiene-only"] if ctx.hygiene_only else [],
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
+    return {**config, "source": ctx.ota_source} if ctx.ota_source else config
 
 
 def update_config_action(ctx: Context) -> dict[str, Any]:
-    """Written once. A later run changes it only when --ota-ring names a different ring."""
+    """Written once. A later run changes it only when --ota-ring or --ota-source names a different value."""
     path = ctx.update_config
     act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
     try:
@@ -795,9 +801,14 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
         return {**act, "state": "blocked", "note": "unreadable; fix or remove it"}
     if current is None:
         return {**act, "state": "create", "value": update_config(ctx)}
+    value = dict(current)
     if ctx.ota_ring and current.get("ring") != ctx.ota_ring:
-        value = {**current, "ring": ctx.ota_ring, "reportStatus": ctx.ota_ring == "canary"}
-        return {**act, "state": "update", "value": value, "previous": current.get("ring")}
+        value.update(ring=ctx.ota_ring, reportStatus=ctx.ota_ring == "canary")
+    if ctx.ota_source and current.get("source", OTA_SOURCES[0]) != ctx.ota_source:
+        value["source"] = ctx.ota_source
+    if value != current:
+        previous = {k: current.get(k) for k in ("ring", "source") if current.get(k) != value.get(k)}
+        return {**act, "state": "update", "value": value, "previous": previous}
     return {**act, "state": "unchanged", "value": current}
 
 
@@ -1449,6 +1460,9 @@ def parser() -> argparse.ArgumentParser:
                    help="write plists or units but do not load, enable or unload them")
     p.add_argument("--ota-ring", choices=OTA_RINGS,
                    help="release ring glaeda-update follows (default stable; set once in ~/.config/glaeda/update.json)")
+    p.add_argument("--ota-source", choices=OTA_SOURCES,
+                   help="repository glaeda-update downloads releases from (default teamleaderleo/glaeda; the Manaflow "
+                        "minis use the mirror manaflow-ai/glaeda)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
     return p
@@ -1481,7 +1495,8 @@ def main(argv: list[str] | None = None) -> int:
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
-                  args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring)
+                  args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
+                  ota_source=args.ota_source)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)

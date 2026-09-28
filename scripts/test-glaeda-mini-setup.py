@@ -710,6 +710,13 @@ class MiniSetupTest(unittest.TestCase):
         self.invoke("--hygiene-only", "--apply", "--ota-ring", "canary")
         config = json.loads(path.read_text())
         self.assertEqual((config["ring"], config["host"], config["reportStatus"]), ("canary", "renamed", True))
+        self.assertNotIn("source", config)
+        # --ota-source moves the host to the fleet mirror and keeps the rest; naming it again changes nothing
+        self.invoke("--hygiene-only", "--apply", "--ota-source", "manaflow-ai/glaeda")
+        config = json.loads(path.read_text())
+        self.assertEqual((config["source"], config["ring"], config["host"]), ("manaflow-ai/glaeda", "canary", "renamed"))
+        self.assertEqual(self.states(self.invoke("--hygiene-only", "--apply", "--ota-source", "manaflow-ai/glaeda")),
+                         {"unchanged"})
         # uninstall removes the updater it installed
         self.invoke("--uninstall", "--apply")
         self.assertFalse((self.home / ".local/bin/glaeda-update").exists())

@@ -63,6 +63,7 @@ class Server:
         self.files: dict[str, bytes] = {}
         self.paused = False
         self.rings: dict[str, dict] = {}
+        self.source = gu.REPOSITORY  # the repository publish() puts releases in
 
     def publish(self, source: str, health_code: int = 0, archive: bytes | None = None) -> dict:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
@@ -76,8 +77,8 @@ class Server:
         })
         name = gr.hygiene_asset(TARGET)
         release_raw = gr.canonical(gr.release_manifest(source, tag, {name: archive}))
-        self.files[gu.DOWNLOAD.format(tag=tag, name=name)] = archive
-        self.files[gu.DOWNLOAD.format(tag=tag, name="release.json")] = release_raw
+        self.files[gu.release_url(tag, name, self.source)] = archive
+        self.files[gu.release_url(tag, "release.json", self.source)] = release_raw
         entry = gr.channel_entry("canary", json.loads(release_raw), release_raw, "2026-09-25T00:00:00Z")
         self.rings["canary"] = entry
         self.rings["stable"] = {**entry, "ring": "stable"}
@@ -182,7 +183,7 @@ class UpdateTest(unittest.TestCase):
 
     def test_tampered_bytes_are_refused(self) -> None:
         entry = self.server.publish(SOURCES[0])
-        url = gu.DOWNLOAD.format(tag=entry["tag"], name=gr.hygiene_asset(TARGET))
+        url = gu.release_url(entry["tag"], gr.hygiene_asset(TARGET))
         self.server.files[url] += b"x"
         result = self.run_update()
         self.assertEqual((result["result"], result["detail"]), ("refused", "archive does not match release.json"))
@@ -282,9 +283,28 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.run_update()["result"], "idle")
         self.assertFalse(self.bin.exists())
 
+    def test_a_mirror_host_downloads_only_from_the_mirror_and_still_checks_the_repository(self) -> None:
+        self.server.source = "manaflow-ai/glaeda"
+        entry = self.server.publish(SOURCES[0])
+        self.config["source"] = "manaflow-ai/glaeda"
+        done = self.run_update()
+        self.assertEqual((done["result"], done["source"]), ("updated", "manaflow-ai/glaeda"), done)
+        self.assertEqual(gu.load_state(self.state)["current"], entry["tag"])
+        # the same bytes at this repository's URLs only: a host on the default source would not find them
+        self.config["source"] = gu.REPOSITORY
+        self.state = self.root / "state-default"
+        with self.assertRaises(KeyError):
+            self.run_update()
+
     def test_config_defaults_and_refusals(self) -> None:
         path = self.root / "update.json"
         self.assertEqual(gu.load_config(path)["ring"], "stable")
+        self.assertEqual(gu.load_config(path)["source"], gu.REPOSITORY)
+        path.write_text(json.dumps({"source": "manaflow-ai/glaeda"}))
+        self.assertEqual(gu.load_config(path)["source"], "manaflow-ai/glaeda")
+        path.write_text(json.dumps({"source": "someone/glaeda"}))
+        with self.assertRaises(gu.UpdateError):
+            gu.load_config(path)
         path.write_text(json.dumps({"ring": "canary", "host": "air-blue"}))
         config = gu.load_config(path)
         self.assertTrue(config["reportStatus"])
