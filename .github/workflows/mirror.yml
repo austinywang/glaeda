@@ -50,24 +50,38 @@ jobs:
               [ ! -f "$ring" ] || python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["tag"])' "$ring"
             done
           } | grep -E '^r-[0-9]{8}-[0-9a-f]{12}$' | sort -u > work/upstream.txt
-      - name: Mirror main
+      - name: Mirror main and the release tags
         env:
           DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
         run: |
           up=$(git ls-remote "https://github.com/$UPSTREAM.git" refs/heads/main | cut -f1)
           here=$(git ls-remote "https://github.com/$MIRROR.git" refs/heads/main | cut -f1)
           echo "upstream main ${up:0:12}, mirror main ${here:0:12}" >> "$GITHUB_STEP_SUMMARY"
-          [ "$up" != "$here" ] || exit 0
+          git init -q --bare work/main.git
+          git -C work/main.git fetch -q "https://github.com/$UPSTREAM.git" +refs/heads/main:refs/heads/main \
+            '+refs/tags/r-*:refs/tags/r-*'
+          refs=()
+          [ "$up" = "$here" ] || refs+=(+refs/heads/main:refs/heads/main)
+          git ls-remote --tags "https://github.com/$MIRROR.git" 'refs/tags/r-*' | cut -f2 > work/mirror-tags.txt
+          while read -r tag; do
+            grep -qx "refs/tags/$tag" work/mirror-tags.txt && continue
+            # a tag deleted upstream since the listing would fail the whole push, main included
+            if git -C work/main.git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              refs+=("refs/tags/$tag:refs/tags/$tag")
+            else
+              echo "upstream has no tag $tag" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < work/upstream.txt
+          [ ${#refs[@]} -gt 0 ] || exit 0
           # A deploy key of this repository, not the job token: the token cannot push commits that
-          # change workflow files.
+          # change workflow files, nor create a tag (or a release's tag) on a commit whose workflow
+          # files differ from main's.
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror
           chmod 600 ~/.ssh/mirror
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/mirror -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-          git init -q --bare work/main.git
-          git -C work/main.git fetch -q "https://github.com/$UPSTREAM.git" +refs/heads/main:refs/heads/main
-          git -C work/main.git push "git@github.com:$MIRROR.git" +refs/heads/main:refs/heads/main
+          git -C work/main.git push "git@github.com:$MIRROR.git" "${refs[@]}"
           rm -f ~/.ssh/mirror
       - name: Mirror control.json
         # the pause switch never waits on a release copy
@@ -97,7 +111,7 @@ jobs:
             rm -rf work/rel && mkdir work/rel
             if gh release download "$tag" -R "$UPSTREAM" -D work/rel \
               && source=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' work/rel/release.json) \
-              && gh release create "$tag" work/rel/* -R "$MIRROR" --draft --target "$source" --prerelease --latest=false \
+              && gh release create "$tag" work/rel/* -R "$MIRROR" --draft --verify-tag --prerelease --latest=false \
                    --title "$tag" --notes "Mirror of https://github.com/$UPSTREAM/releases/tag/$tag (glaeda $source)." \
               && gh release edit "$tag" -R "$MIRROR" --draft=false; then
               echo "copied $tag" >> "$GITHUB_STEP_SUMMARY"

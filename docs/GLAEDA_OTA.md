@@ -90,9 +90,10 @@ release, attestation and promotion.
   and on its own, so a pause never waits on a release; a ring file is copied only once its release
   is published in the fork. `release.yml`, `promote.yml` and `control.yml` run only in this
   repository, and the mirror job disables every other workflow in the fork before it pushes.
-- **How it pushes.** `main` goes over SSH with a write deploy key of the fork (its secret
-  `MIRROR_DEPLOY_KEY`), because the job token cannot push commits that change workflow files.
-  Releases use the job token. No personal token is stored anywhere.
+- **How it pushes.** `main` and the release tags go over SSH with a write deploy key of the fork
+  (its secret `MIRROR_DEPLOY_KEY`): the job token cannot push commits that change workflow files,
+  nor create a tag on a commit whose workflow files differ from `main`'s. Releases are then made
+  on those tags with the job token. No personal token is stored anywhere.
 - **What hosts check.** A host with `"source": "manaflow-ai/glaeda"` downloads channel files and
   assets from the fork, and checks them exactly as before: release.json must name
   `teamleaderleo/glaeda`, and the attestation (when `gh` is signed in) must come from this
