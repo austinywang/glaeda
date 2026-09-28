@@ -838,6 +838,9 @@ over the LAN, including sha256 on arrival, in 5.9 s (~110 MB/s).
   is not trusted at all. `glaeda-lan-fetch` hashes the bytes as they arrive, compares them with the digest
   GitHub recorded for the artifact (passed by cmux CI), and only then links the file to DEST. cmux then
   checks the digest again and runs its canonical restore validation.
+- **Lookup.** `glaeda-lan-fetch` asks every peer `product-has-v1` at once and transfers from the first
+  that answers `has`, trying a second one if that transfer fails. A slow or stalled peer then delays only
+  a miss (at most 10 s per lookup), never a hit, and the least-loaded holder tends to answer first.
 - **Local Network Privacy.** A CI step cannot reach the LAN itself. Every process with a non-Apple
   ancestor in its launchd job is refused (probes 2026-09-25: `/bin/bash` -> Homebrew python3 ->
   `/usr/bin/nc` got "No route to host"; `/bin/bash` -> `/usr/bin/python3` connected), and a runner job

@@ -46,6 +46,9 @@ if address not in peers or mode == "unreachable":
 if mode == "short" and request.startswith("product-v1"):
     sha = request.split()[1]
     os.write(1, f"glaeda-seed-serve 1 hit-product {sha} 1000\\n".encode() + b"x" * 10); sys.exit(0)
+if mode == "stalled" and request.startswith("product-has-v1"):
+    import time
+    time.sleep(60)
 if mode == "silent" and request.startswith("product-v1"):
     import time
     if os.environ.get("FAKE_PIDFILE"):
@@ -270,6 +273,21 @@ class LanFetchTest(unittest.TestCase):
         os.environ["FAKE_PEER_MODE_172_20_21_197"] = "unreachable"
         self.assertEqual(self.fetch(sha)[0], 3)
         self.assertEqual(self.leftovers(), [])
+
+    def test_a_stalled_peer_delays_a_miss_but_not_a_hit(self):
+        data = os.urandom(5000)
+        sha, _ = put_product(self.peers["172.20.21.198"], data)
+        os.environ["FAKE_PEER_MODE_172_20_21_197"] = "stalled"  # listed first, never answers its lookup
+        self.addCleanup(setattr, lf, "LOOKUP_TIMEOUT", lf.LOOKUP_TIMEOUT)
+        lf.LOOKUP_TIMEOUT = 3
+        started = time.monotonic()
+        code, record, dest = self.fetch(sha)
+        self.assertEqual((code, record["peer"]), (0, "cmux14"))
+        self.assertEqual(dest.read_bytes(), data)
+        self.assertLess(time.monotonic() - started, 2.5)
+        started = time.monotonic()
+        self.assertEqual(self.fetch("2" * 64, "other")[0], 3)
+        self.assertGreaterEqual(time.monotonic() - started, 3)
 
     def test_dest_is_never_replaced(self):
         sha, _ = put_product(self.peers["172.20.21.197"], b"x" * 100)

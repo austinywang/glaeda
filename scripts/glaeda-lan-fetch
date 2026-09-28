@@ -60,11 +60,11 @@ MAX_OBJECT_BYTES = 20 * 1024**3  # cmux peer_product_source.MAX_OBJECT_BYTES
 HEADER = b"glaeda-seed-serve 1 "
 HEADER_SCAN_BYTES = 4096
 CONNECT_TIMEOUT = 3
-LOOKUP_TIMEOUT = 6.0
+LOOKUP_TIMEOUT = 10.0  # only a miss waits this long: a hit starts at the first peer that has it
 TRANSFER_TIMEOUT = 180.0
 # One deadline for a whole request (lookups and every transfer attempt), under cmux's 200 s wait for us.
 REQUEST_DEADLINE = 150.0
-MAX_OFFERS = 2  # peers tried per request, in config order among those that have it
+MAX_OFFERS = 2  # peers tried per request, in the order their lookups answered
 BROKER_CONCURRENCY = 4  # fetches at a time
 BROKER_THREADS = 8  # connections at a time; more are answered busy at once
 MAX_BROKER_REQUEST = 4096
@@ -126,15 +126,31 @@ def header_of(stream) -> bytes:
     return b""
 
 
-def lookup(config: dict, peer: dict, sha: str, max_bytes: int, timeout: float) -> int | None:
-    """The size PEER announces for SHA, if it is at most MAX_BYTES; None for a miss, an error or a timeout."""
+def lookup(config: dict, peer: dict, sha: str, max_bytes: int, timeout: float,
+           stops: tuple[threading.Event, ...] = ()) -> int | None:
+    """The size PEER announces for SHA, if it is at most MAX_BYTES; None for a miss, an error, a timeout or
+    once any of STOPS is set."""
     if timeout <= 0:
         return None
     try:
-        out = subprocess.run(ssh_command(config, peer, f"product-has-v1 {sha}"), stdin=subprocess.DEVNULL,
-                             capture_output=True, timeout=min(LOOKUP_TIMEOUT, timeout)).stdout
-    except (OSError, subprocess.SubprocessError):
+        proc = subprocess.Popen(ssh_command(config, peer, f"product-has-v1 {sha}"), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
         return None
+    give_up = time.monotonic() + min(LOOKUP_TIMEOUT, timeout)
+    try:
+        while True:
+            if any(stop.is_set() for stop in stops) or time.monotonic() >= give_up:
+                return None
+            try:
+                out = proc.communicate(timeout=0.05)[0]  # reads as it waits, so a chatty peer cannot block
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
     for line in out.splitlines()[:64]:
         if line.startswith(HEADER):
             words = line[len(HEADER):].decode(errors="replace").split()
@@ -217,37 +233,50 @@ def fetch(sha: str, dest: Path, config: dict | None, max_bytes: int = MAX_OBJECT
         return EXIT_ERROR, {**record, "error": "DEST must be an absolute, absent path in an existing directory"}
     if config is None:
         return EXIT_MISS, {**record, "reason": "no mesh config"}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(config["peers"])) as pool:
-        sizes = list(pool.map(lambda peer: lookup(config, peer, sha, max_bytes, deadline - time.monotonic()),
-                              config["peers"]))
-    record["lookup_seconds"] = round(time.monotonic() - started, 3)
-    offers = [(peer, size) for peer, size in zip(config["peers"], sizes) if size][:MAX_OFFERS]
-    if not offers:
+    # Transfer from whichever peer says "has" first (the least loaded one, usually) instead of waiting for
+    # every lookup: a busy or stalled peer then delays only a miss, never a hit.
+    stop = threading.Event()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(config["peers"]))
+    try:
+        futures = {pool.submit(lookup, config, peer, sha, max_bytes, deadline - time.monotonic(), (stop, cancel)): peer
+                   for peer in config["peers"]}
+        pending, offers, errors, tried = set(futures), [], [], 0
+        while tried < MAX_OFFERS and (offers or pending):
+            if not offers:
+                done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                offers += [(futures[f], f.result()) for f in done if f.result()]
+                continue
+            peer, size = offers.pop(0)
+            tried += 1
+            record.setdefault("lookup_seconds", round(time.monotonic() - started, 3))
+            if cancel.is_set() or time.monotonic() >= deadline:
+                errors.append("cancelled" if cancel.is_set() else "deadline passed")
+                break
+            partial = dest.parent / f".{dest.name}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
+            try:
+                fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+                os.close(fd)
+            except OSError as error:
+                return EXIT_ERROR, {**record, "error": f"partial file: {type(error).__name__}"}
+            transfer_started = time.monotonic()
+            try:
+                why = transfer(config, peer, sha, size, partial, deadline, cancel)
+                if not why:
+                    os.link(partial, dest)  # no-replace: fails if DEST appeared meanwhile
+                    return EXIT_HIT, {**record, "peer": peer["name"], "bytes": size,
+                                      "transfer_seconds": round(time.monotonic() - transfer_started, 3),
+                                      "seconds": round(time.monotonic() - started, 3)}
+                errors.append(f"{peer['name']}: {why}")
+            except OSError as error:
+                errors.append(f"{peer['name']}: {type(error).__name__}")
+            finally:
+                partial.unlink(missing_ok=True)
+    finally:
+        stop.set()
+        pool.shutdown(wait=True)
+    if not tried:
+        record["lookup_seconds"] = round(time.monotonic() - started, 3)
         return EXIT_MISS, {**record, "reason": "no peer has it", "peers": len(config["peers"])}
-    errors = []
-    for peer, size in offers:
-        if cancel.is_set() or time.monotonic() >= deadline:
-            errors.append("cancelled" if cancel.is_set() else "deadline passed")
-            break
-        partial = dest.parent / f".{dest.name}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
-        try:
-            fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-            os.close(fd)
-        except OSError as error:
-            return EXIT_ERROR, {**record, "error": f"partial file: {type(error).__name__}"}
-        transfer_started = time.monotonic()
-        try:
-            why = transfer(config, peer, sha, size, partial, deadline, cancel)
-            if not why:
-                os.link(partial, dest)  # no-replace: fails if DEST appeared meanwhile
-                return EXIT_HIT, {**record, "peer": peer["name"], "bytes": size,
-                                  "transfer_seconds": round(time.monotonic() - transfer_started, 3),
-                                  "seconds": round(time.monotonic() - started, 3)}
-            errors.append(f"{peer['name']}: {why}")
-        except OSError as error:
-            errors.append(f"{peer['name']}: {type(error).__name__}")
-        finally:
-            partial.unlink(missing_ok=True)
     return EXIT_ERROR, {**record, "error": "; ".join(errors)[:400]}
 
 
