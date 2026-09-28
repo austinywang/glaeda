@@ -2596,6 +2596,26 @@ while True:
 """
 
 
+# The newest Runner_*.log on cmuxs-mac-mini-5 when the gate stopped its listener at 2026-09-28 13:53:03Z (trimmed to
+# the lines the gate reads): a job ended, the listener acknowledged the next runner request at 13:53:01, and the
+# gate's SIGINT cancelled its acquirejob POST. GitHub had the job on that runner and failed it 10 min later with
+# "The self-hosted runner lost communication with the server".
+MID_ACQUIRE_DIAG = """\
+[2026-09-28 13:51:52Z INFO Terminal] WRITE LINE: 2026-09-28 13:51:52Z: Listening for Jobs
+[2026-09-28 13:51:53Z INFO BrokerMessageListener] Acknowledging runner request '930d9f84-513b-5f03-96b5-0138d88db265'.
+[2026-09-28 13:51:54Z INFO JobDispatcher] Job request 0 for plan 7d33e0be-ef63-4567-9fe3-daa350b05775 job 930d9f84-513b-5f03-96b5-0138d88db265 received.
+[2026-09-28 13:51:55Z INFO ProcessInvokerWrapper]   File name: '/Users/cmux/actions-runner-glaeda-1/bin/Runner.Worker'
+[2026-09-28 13:52:59Z INFO JobDispatcher] Worker finished for job 930d9f84-513b-5f03-96b5-0138d88db265. Code: 102
+[2026-09-28 13:52:59Z INFO JobDispatcher] finish job request for job 930d9f84-513b-5f03-96b5-0138d88db265 with result: Failed
+[2026-09-28 13:52:59Z INFO BrokerMessageListener] Received job status event. JobState: Online
+[2026-09-28 13:52:59Z INFO BrokerMessageListener] Get messages has been cancelled using local token source. Continue to get messages with new status.
+[2026-09-28 13:53:01Z INFO BrokerMessageListener] Acknowledging runner request 'eeb83692-303d-516a-b3bf-e6e6f93c1d90'.
+[2026-09-28 13:53:02Z INFO GitHubActionsService] AAD Correlation ID for this token request: Unknown
+"""
+ACQUIRE_FAILED = ("[2026-09-28 13:53:13Z ERR  Runner] Caught exception from acquiring job message: "
+                  "System.Net.Http.HttpRequestException: 503\n   at GitHub.Runner.Listener.Runner.RunAsync()\n")
+
+
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -3402,6 +3422,96 @@ class GateTest(unittest.TestCase):
         while log.read_text().count(text) < count:
             self.assertLess(time.monotonic(), deadline, log.read_text())
             time.sleep(0.05)
+
+    def diag(self, text: str, name: str = "Runner_20260928-135151-utc.log") -> Path:
+        diag = self.runner / "_diag"
+        diag.mkdir(exist_ok=True)
+        (diag / name).write_text(text)
+        return diag / name
+
+    def started_gate(self) -> hook.Gate:
+        """A real gate over the fake listener, held for a full mini."""
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.reload = lambda: None  # type: ignore[method-assign]
+        gate.claimed = lambda: "all 2 canonical roots on this mini are taken"  # type: ignore[method-assign]
+        gate.confirmed = gate.claimed  # type: ignore[method-assign]
+        gate.start()
+        self.addCleanup(gate.kill)
+        deadline = time.monotonic() + 10
+        while not self.listeners():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        return gate
+
+    def assert_listening(self) -> None:
+        listeners = self.listeners()
+        self.assertEqual(len(listeners), 1, "the listener was signalled")
+        stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(listeners[0])], capture_output=True, text=True)
+        self.assertFalse(stat.stdout.strip().startswith("T"), "the listener was left frozen")
+
+    def test_an_idle_stop_never_cancels_a_job_the_listener_is_taking(self) -> None:
+        # mini-5 2026-09-28: a stop between the listener's acknowledge and its acquirejob orphaned a cmux job
+        log = self.diag(MID_ACQUIRE_DIAG)
+        gate = self.started_gate()
+        for _ in range(4):
+            self.assertIsNone(gate.step())
+        self.assert_listening()
+        self.assertIsNone(gate.stop_deadline)
+        log.write_text(log.read_text() + ACQUIRE_FAILED)  # the acquisition ended: the listener is idle again
+        gate.step(); gate.step()
+        self.assertIsNotNone(gate.stop_deadline)
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+
+    def test_the_frozen_last_look_keeps_a_listener_that_acknowledged_after_the_poll(self) -> None:
+        gate = self.started_gate()
+        log = self.diag(MID_ACQUIRE_DIAG)  # the acknowledge lands after step()'s busy look, before the signal
+        self.assertFalse(gate.stop("all 2 canonical roots on this mini are taken"))
+        self.assert_listening()
+        self.assertIsNone(gate.stop_deadline)
+        log.write_text(log.read_text() + ACQUIRE_FAILED)
+        self.assertTrue(gate.stop("all 2 canonical roots on this mini are taken"))
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+
+    def test_the_agent_stopping_waits_out_an_acquisition_but_not_a_running_job(self) -> None:
+        log = self.diag(MID_ACQUIRE_DIAG)
+        gate = self.started_gate()
+        gate.terminate()
+        for _ in range(3):
+            self.assertIsNone(gate.step())
+        self.assert_listening()
+        self.assertIsNone(gate.stop_deadline)
+        # dispatched with a Worker running: launchd is stopping the agent, so the job is cancelled as before
+        log.write_text(log.read_text() + "[2026-09-28 13:53:04Z INFO JobDispatcher] Job request 0 for plan p job "
+                       "eeb83692-303d-516a-b3bf-e6e6f93c1d90 received.\n")
+        with mock.patch.object(hook.Gate, "worker", return_value=True):
+            gate.step()
+        self.assertIsNotNone(gate.stop_deadline)
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+
+    def test_the_listener_request_reads_the_newest_runner_diag(self) -> None:
+        self.assertIsNone(hook.listener_request(self.runner), "no _diag yet")
+        self.diag(MID_ACQUIRE_DIAG)
+        self.assertEqual(hook.listener_request(self.runner), "eeb83692-303d-516a-b3bf-e6e6f93c1d90")
+        self.diag("", "Worker_20260928-135500-utc.log")  # a job's own log is not the listener's
+        self.assertEqual(hook.listener_request(self.runner), "eeb83692-303d-516a-b3bf-e6e6f93c1d90")
+        for end in (ACQUIRE_FAILED,
+                    "[x INFO Runner] Skipping message Job. 409 already acquired\n",
+                    "[x INFO JobDispatcher] Job request 0 for plan p job eeb83692 received.\n"
+                    "[x INFO JobDispatcher] Worker finished for job eeb83692. Code: 100\n",
+                    "[x INFO JobDispatcher] Job request 0 for plan p job eeb83692 received.\n"
+                    "[x INFO JobDispatcher] Stop renew job request for job eeb83692.\n",  # cancelled before its Worker
+                    "[x INFO JobDispatcher] Job request 0 for plan p job eeb83692 received.\n"
+                    "[x INFO JobDispatcher] Unable to renew job request for job eeb83692 for the first time, stop "
+                    "dispatching job to worker.\n",
+                    "[x INFO Listener] Runner execution has finished with return code 0\n"):
+            self.diag(MID_ACQUIRE_DIAG + end)
+            self.assertIsNone(hook.listener_request(self.runner), end)
+        self.diag(MID_ACQUIRE_DIAG + "[x INFO JobDispatcher] Job request 0 for plan p job eeb83692 received.\n")
+        self.assertEqual(hook.listener_request(self.runner), "eeb83692", "dispatched, its Worker not yet done")
+        self.diag(MID_ACQUIRE_DIAG + ACQUIRE_FAILED)
+        self.diag("[x INFO BrokerMessageListener] Acknowledging runner request 'next'.\n",
+                  "Runner_20260928-140000-utc.log")  # a later listener's file is the one it reads
+        self.assertEqual(hook.listener_request(self.runner), "next")
 
     def test_listen_stops_and_restarts_a_real_listener(self) -> None:
         proc, log = self.run_listen()

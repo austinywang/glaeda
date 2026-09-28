@@ -2560,6 +2560,49 @@ def source_identity() -> tuple[int, int, int] | None:
     return st.st_ino, st.st_mtime_ns, st.st_size
 
 
+# The listener's own trace of taking a job (actions/runner src/Runner.Listener/Runner.cs and JobDispatcher.cs,
+# v2.337.0). A broker job message is acknowledged, then acquired (POST acquirejob), then dispatched to a
+# Runner.Worker. Before the acknowledge the broker redelivers an unacknowledged message to another runner; after it
+# the job is this runner's, and a listener stopped before its acquirejob completes never runs it: GitHub fails it
+# 10 min later with "The self-hosted runner lost communication with the server" (mini-5, 2026-09-28 13:53:03Z,
+# https://github.com/manaflow-ai/cmux/pull/15160). A restarted listener gets a new session and never sees that
+# request again, so nothing recovers the job; the stop has to wait. The trace is flushed line by line, and the
+# acknowledge line is written before its request is sent.
+RUNNER_DIAG_TAIL = 1 << 20  # bytes of the newest Runner_*.log read; an acquisition's retries write about 50 KiB
+LISTENER_TAKES = re.compile(r"Acknowledging runner request '([^']+)'|"
+                            r"JobDispatcher\] Job request \S+ for plan \S+ job (\S+) received\.")
+LISTENER_DONE = ("Skipping message Job.", "Caught exception from acquiring job message",
+                 "JobDispatcher] Worker finished for job", "JobDispatcher] finish job request for job",
+                 # every other dispatcher exit (cancelled before or while the Worker starts, a lost first renew)
+                 "JobDispatcher] Stop renew job request for job", "JobDispatcher] Unable to renew job request for job",
+                 "Runner execution has finished")
+
+
+def listener_request(runner_dir: Path) -> str | None:
+    """The runner request the listener has acknowledged or dispatched and not yet finished, from the tail of the
+    newest _diag/Runner_*.log (a listener writes a new one each start; Worker_*.log files are jobs' own), or None.
+    From the acknowledge until its Worker finishes the job is this runner's: a stop in that span loses it."""
+    diag = runner_dir / "_diag"
+    try:
+        names = sorted(n for n in os.listdir(diag) if n.startswith("Runner_") and n.endswith(".log"))
+    except FileNotFoundError:
+        return None
+    if not names:
+        return None
+    with open(diag / names[-1], "rb") as file:
+        size = os.fstat(file.fileno()).st_size
+        file.seek(max(0, size - RUNNER_DIAG_TAIL))
+        text = file.read().decode("utf-8", "replace")
+    request = None
+    for line in text.splitlines():
+        taken = LISTENER_TAKES.search(line)
+        if taken:
+            request = taken.group(1) or taken.group(2)
+        elif request is not None and any(done in line for done in LISTENER_DONE):
+            request = None
+    return request
+
+
 GATE_DISK_RESUME_GIB = 2.0  # a disk hold ends only this far above the floor
 GATE_DISK_NOTE_S = 30 * 60  # two evictions that did not end the hold
 GATE_DISK_EVICT_EVERY_S = 15 * 60  # an eviction that left the disk short is retried this often, not every poll
@@ -2568,8 +2611,8 @@ GATE_DISK_EVICT_EVERY_S = 15 * 60  # an eviction that left the disk short is ret
 class Gate:
     """run.sh under the listener gate. The whole runner tree (run.sh, run-helper.sh, Runner.Listener and a
     job's Runner.Worker) stays in the gate's process group, so launchd's group cleanup still covers it. A
-    runner with a job is never stopped; job-started still refuses a job handed over in the moment before a
-    stop. Anything unexpected hands the runner back to plain run.sh behaviour (unexpected())."""
+    runner with a job, or taking one, is never stopped (stop()). Anything unexpected hands the runner back to plain
+    run.sh behaviour (unexpected())."""
 
     def __init__(self, runner_dir: Path, host_lock: str, reservation: str, state_dir: Path,
                  waiters: bool = True, capacity_dir: Path | None = None, fit_units: int = 1) -> None:
@@ -2586,6 +2629,7 @@ class Gate:
         self.waiting: set[int] = set()
         self.waiting_at = -GATE_WAITER_EVERY_S
         self.worker_noted = False
+        self.defer_noted = False  # stop() said once that it kept a listener taking a job
         self.source = source_identity()
         self.thermal: int | None = None  # the level while the gate holds for heat, else None
         self.thermal_at = -GATE_THERMAL_EVERY_S
@@ -2816,6 +2860,10 @@ class Gate:
         return (descendants(self.child.pid, table) if self.child is not None else []), table
 
     def busy(self) -> bool:
+        """The runner has a job: a Runner.Worker under its tree, or a request its listener is taking."""
+        return self.worker() or self.taking() is not None
+
+    def worker(self) -> bool:
         """A Runner.Worker under this runner's tree. A failed look counts as busy."""
         try:
             pids, table = self.tree()
@@ -2824,24 +2872,60 @@ class Gate:
         worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
         return any(worker in table[pid][1] for pid in pids)
 
+    def taking(self) -> str | None:
+        """The runner request the listener has acknowledged and not finished (listener_request). An unreadable
+        diag counts as taking one."""
+        try:
+            return listener_request(self.runner_dir)
+        except (OSError, ValueError) as error:
+            return f"unknown ({type(error).__name__})"
+
     def start(self) -> None:
         gate_log("starting the listener")
         self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
                                       stdin=subprocess.DEVNULL)
         self.streak = 0
 
-    def stop(self, why: str) -> None:
+    def stop(self, why: str) -> bool:
         """SIGINT to the listener: its graceful exit ends its session, so GitHub stops routing here. With no
-        listener (run-helper.sh between listeners), SIGTERM the whole tree so nothing starts one later."""
-        gate_log(f"stopping the idle listener: {why}")
-        self.held, self.stop_deadline, self.worker_noted = why, time.monotonic() + GATE_STOP_WAIT_S, False
+        listener (run-helper.sh between listeners), SIGTERM the whole tree so nothing starts one later.
+        A listener can take a job at any moment, and a SIGINT between its acknowledge and its Worker loses that
+        job (listener_request). So the listener is frozen (SIGSTOP) for the last look: frozen, it can neither
+        acknowledge a request nor start a Worker, and its trace shows every acknowledge it has sent. A listener
+        with a job, or taking one, is thawed and kept; an idle one gets the SIGINT before it is thawed. When the
+        agent is stopping, a running job is cancelled as before, but an acquisition is still waited out.
+        Returns whether it signalled; step() tries again on a later poll."""
         pids, table = self.tree()
         listener = os.fspath(self.runner_dir / "bin" / "Runner.Listener")
         listeners = [pid for pid in pids if listener in table[pid][1]]
-        targets = listeners or [*reversed(pids), *([self.child.pid] if self.child is not None else [])]
-        for pid in targets:
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGINT if listeners else signal.SIGTERM)
+        frozen = []
+        try:
+            for pid in listeners:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGSTOP)
+                    frozen.append(pid)
+            if listeners:
+                request, worker = self.taking(), self.worker()
+                if (worker and not self.terminating) or (request is not None and not worker):
+                    if not self.defer_noted:
+                        gate_log(f"not stopping the listener ({why}): it is taking job request {request}"
+                                 if request is not None and not worker else
+                                 f"not stopping the listener ({why}): it has a job")
+                        self.defer_noted = True
+                    self.streak = 0
+                    return False
+            gate_log(f"stopping the idle listener: {why}")
+            self.held, self.stop_deadline, self.worker_noted = why, time.monotonic() + GATE_STOP_WAIT_S, False
+            self.defer_noted = False
+            targets = listeners or [*reversed(pids), *([self.child.pid] if self.child is not None else [])]
+            for pid in targets:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGINT if listeners else signal.SIGTERM)
+            return True
+        finally:
+            for pid in frozen:  # a SIGINT sent while frozen is delivered as it thaws
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGCONT)
 
     def kill(self) -> None:
         try:
@@ -2918,10 +3002,10 @@ class Gate:
         signalled = False
         while (code := self.child.poll()) is None:
             if self.terminating and not signalled:  # launchd is stopping the agent: end the runner's session
-                signalled = True
                 try:
-                    self.stop("the runner agent is stopping")
+                    signalled = self.stop("the runner agent is stopping")  # False: retried on the next look
                 except Exception:  # noqa: BLE001
+                    signalled = True
                     self.child.terminate()
             time.sleep(0.5)
         return code

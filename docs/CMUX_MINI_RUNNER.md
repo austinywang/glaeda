@@ -256,6 +256,16 @@ What `--apply` does:
        `SIGTERM` to the whole runner tree instead.
      - A runner with a job (a `Runner.Worker` under its tree) is never stopped, and
        its polls don't count toward the two.
+     - Neither is a listener taking a job: from its `Acknowledging runner request`
+       diag line until that request's Worker finishes or its acquisition fails. A
+       SIGINT in that span loses the job, and GitHub fails it 10 min later with "lost
+       communication". The gate freezes the listener (`SIGSTOP`) for the last look at
+       its diag and Worker, so it cannot acknowledge a request between the look and
+       the signal, then signals and thaws it. The runner handles SIGINT on another
+       thread after the thaw, so a message it had already received in that instant
+       can still be acknowledged: milliseconds, where the old gap was seconds. The
+       acknowledge line exists only while GitHub sets the runner's acknowledge flag.
+       An agent stop still cancels a running job but waits out an acquisition.
      - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
    - **Restarting and logs.** The gate starts `run.sh` again after two free polls. While
      it waits it logs `glaeda-cmux-runner-gate: holding the listener off: <why>`, and
