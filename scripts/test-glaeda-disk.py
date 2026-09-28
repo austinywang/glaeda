@@ -735,6 +735,53 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((ci / "seeds/p-a").exists())
         self.assertFalse((ci / "cmux-ci-2/derived-data").exists())
 
+    def test_a_seed_the_archive_holds_goes_without_waiting(self) -> None:
+        ci = self.root / "ci"
+        (ci / "seeds").mkdir(parents=True)
+        (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
+        for name, age in (("p-a", 0.2), ("p-b", 0.3), ("p-c", 1), ("p-d", 2), ("p-e", 3)):
+            make(ci / "seeds" / name, age_hours=age)
+        log = self.root / "serve.jsonl"
+        archive, mini = "172.20.21.158", "172.20.21.9"
+
+        def rec(client: str, outcome: str, **kw) -> str:
+            return json.dumps({"client": client, "outcome": outcome, "role": "seed", **kw})
+
+        lst = rec(archive, "list", count=5)
+        (log.with_name("serve.jsonl.1")).write_text("\n".join([
+            lst, rec(archive, "served", status=0, key="p-c"),
+            rec(archive, "served", status=0, key="p-b"), lst, lst]) + "\n")
+        log.write_text("\n".join([
+            "not json", json.dumps({"client": ["x"], "outcome": "list"}), "[" * 5000,
+            lst, rec(archive, "served", status=0, key="p-a"),
+            rec(archive, "failed", status=1, key="p-d"),
+            # a client that never listed is not the archive
+            rec(mini, "served", status=0, key="p-e"),
+            lst, lst,
+            # served but not yet seen held by two later lists: the archive may still reject it
+            rec(archive, "served", status=0, key="p-f"), lst,
+            # the archive asked for p-b again (its check failed there): only a key's newest request counts
+            rec(archive, "served", status=0, key="p-b")]) + "\n")
+        self.assertEqual(gd.archived_seeds(log), {"p-a", "p-c"})
+        self.assertEqual(gd.archived_seeds(self.root / "missing.jsonl"), frozenset())
+        # a real DerivedData's module cache is wider than cmux_active's search budget, which reads as busy:
+        # that must not keep cmux CI's warm state, which no hq reload slot marker ever covers
+        with mock.patch.object(gd, "SEED_SERVE_LOG", log), mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
+            items = gd.survey(gd.fleet_families(ci), 24, 0)
+            got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
+            # the newest two stay even when archived; an archived older one goes; the rest wait out the window
+            self.assertEqual(got["p-a"][0], "kept")
+            self.assertEqual(got["p-b"][0], "kept")
+            self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
+            self.assertEqual(got["p-d"][0], "recent")
+            self.assertEqual(got["p-e"][0], "recent")
+            fams = {f.id: f for f in gd.fleet_families(ci)}
+            with mock.patch.object(gd, "FLEET_CI", ci):
+                gd.apply([i for i in items if i.verdict == "reclaimable"], fams, self.root / "r.jsonl", None, 24)
+        self.assertFalse((ci / "seeds/p-c").exists())
+        for name in ("p-a", "p-b", "p-d", "p-e"):
+            self.assertTrue((ci / "seeds" / name).exists(), name)
+
     def test_pressure_targets_are_per_filesystem(self) -> None:
         make(self.root / "old")
         items = gd.survey([self.fam], 24, 0)
