@@ -973,14 +973,15 @@ catch-ups, and holds no capacity unit, root or token, so no admission waits for 
   Xcode test, a take-gui, another cmux DEV app), so a runner whose hook predates FUZZ_HOLDER loses it too.
   A compile's admission leaves it alone.
 
-- **Replays for the collector first.** cmuxterm-hq's `build-fleet/fuzz/collect.py` files a finding only once
-  it reproduces on a replay it asked for, since the build user (and so any pull request job) can write a
-  finding. Its `mini-serve.sh` leaves a request in `fuzz/replays/req.XXXX/`: the collector's own `replay.py`,
-  its own copy of the fuzzer and the checked repro steps. The lane runs the oldest request (up to 5 minutes)
-  before fuzzing, against the newest main build, with the same start rules, holder and preemption and no disk
-  floor, then writes `.done`; a job that stops it leaves the request for the next tick. A fuzz run under way
-  stops for a request with SIGTERM (up to 60 s to write the finding it is minimizing). Requests older than a
-  day are removed.
+- **Replays for the collector, on trusted-only minis only.** cmuxterm-hq's `build-fleet/fuzz/collect.py` files a
+  finding only once it reproduces on a replay it asked for, since the build user (and so any pull request job)
+  can write a finding. Its `mini-serve.sh` leaves a request in `fuzz/replays/req.XXXX/`: the collector's own
+  `replay.py`, its own copy of the fuzzer and the checked repro steps. On a PR mini that proves nothing (a job
+  there can rewrite the request, the kept build and the answer), so only a mini whose runners are trusted-only
+  (2e, main pushes only) replays, and it never fuzzes. There the lane runs the oldest
+  request (up to 5 minutes) against the newest main build, with the same start rules, holder and preemption and
+  no disk floor, then writes `.done`; a job that stops it leaves the request for the next tick. A PR mini
+  removes `fuzz/replays`. Requests older than a day are removed.
 
 `glaeda-idle-warm --fuzz` prints whether it would run now (fuzz, or which replay), or why not; `--apply --fuzz`
 runs it. The collector files the findings as cmux issues.

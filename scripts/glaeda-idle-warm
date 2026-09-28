@@ -4,9 +4,9 @@
     glaeda-idle-warm              plan: would this mini warm now, which root, and why not
     glaeda-idle-warm --apply      warm (the 1-minute LaunchAgent from glaeda-mini-setup)
     glaeda-idle-warm --fuzz           plan: would the UI fuzzer lane run now, and why not
-    glaeda-idle-warm --apply --fuzz   the UI fuzzer lane (the 1-minute idle-fuzz LaunchAgent): fuzz main's build,
-                                      or first replay a finding the collector asked to see (fuzz/replays)
-                                      beside compiles until a GUI job wants the console
+    glaeda-idle-warm --apply --fuzz   the UI fuzzer lane (the 1-minute idle-fuzz LaunchAgent): fuzz main's build
+                                      beside compiles until a GUI job wants the console; on a trusted-only
+                                      mini, instead replay a finding the collector asked to see (fuzz/replays)
 
 cmux compile admission on an owned mini starts from the root's kept build (cmux owned_build_state.py) or a
 kept seed. What it compiles depends on how far that start is from the job's tree (cmux warm_distance.py):
@@ -625,6 +625,7 @@ def trim_logs(logs: Path) -> None:
 # FUZZ_WATCH_S while the fuzzer runs and stops at the first.
 #
 # On by default on every mini with glaeda runners, except NEVER_HOSTS and FUZZ_KILL_SWITCH; it ships with glaeda.
+# On a trusted-only mini it fuzzes nothing and only runs the collector's replay requests (REPLAY_* below).
 FUZZ_MINUTES = 10
 FUZZ_MINIMIZE_MINUTES = 5  # per finding
 FUZZ_MAX_FINDINGS = 2
@@ -647,11 +648,12 @@ FUZZ_TOKEN_S = 3.0
 FUZZ_APP = "cmux DEV.app"
 # The collector (cmuxterm-hq build-fleet/fuzz) files a finding only once it reproduces on a replay it asked for:
 # its mini-serve.sh drops a request (replay.py, the collector's own fuzzer and the repro steps) in
-# fuzz/replays/<nonce>/ and the lane runs it before any fuzzing, under the same rules and the same preemption,
-# against the newest main build. A fuzz run under way stops for it (SIGTERM first, so it keeps its finding).
+# fuzz/replays/<nonce>/ and the lane runs it under the same rules and the same preemption, against the newest main
+# build. Only on a trusted-only mini (main pushes only): on a PR mini the build user, and so any pull request job,
+# can rewrite the request, the kept build and the answer, so a replay there proves nothing. A trusted-only mini
+# never fuzzes, and a PR mini never replays.
 REPLAY_TIMEOUT_S = 5 * 60
 REPLAY_MAX_AGE_S = 24 * 3600
-REPLAY_GRACE_S = 60  # a fuzz run stopping for a replay gets this long to write its finding
 REPLAY_NAME = re.compile(r"req\.[A-Za-z0-9]{6,32}")
 FUZZ_KILL_SWITCH = HOME / ".config/glaeda/idle-fuzz.disabled"
 XCODE_TEST = re.compile(r"(^|/)(xctest|XCTRunner)(\s|$)|-Runner\.app/")
@@ -911,13 +913,12 @@ def free_bytes(path: Path) -> int | None:
     return stat.f_bavail * stat.f_frsize
 
 
-def watch(hook: Any, capacity: Path, ours: str, timeout_s: float, *,
-          for_replay: bool = False) -> tuple[int | None, str]:
+def watch(hook: Any, capacity: Path, ours: str, timeout_s: float) -> tuple[int | None, str]:
     """Wait for the fuzzer (_child); (its exit code or None, why it was stopped or '').
 
     Stops at the first sign of a GUI job: a reservation or (every FUZZ_WATCH_S) an Xcode test, a take-gui or
     another cmux DEV app, or (every FUZZ_TOKEN_S) the gui token taken twice in a row (a listener gate's probe holds
-    it for an instant). FOR_REPLAY: a fuzz run also stops, gently, for a replay request."""
+    it for an instant)."""
     assert _child is not None
     deadline = time.monotonic() + timeout_s
     next_token = 0.0
@@ -936,13 +937,6 @@ def watch(hook: Any, capacity: Path, ours: str, timeout_s: float, *,
         why = gui_process(ours)
         if why and why != "cannot list processes":
             return None, why
-        if for_replay and pending_replay() is not None:
-            # SIGTERM: the fuzzer finishes the finding it is minimizing, then exits; the replay runs next tick.
-            with contextlib.suppress(OSError):
-                _child.terminate()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                return _child.wait(timeout=REPLAY_GRACE_S), "a replay is waiting"
-            return None, "a replay is waiting"
         if now >= next_token:
             next_token = now + FUZZ_TOKEN_S
             token_taken = 0 if hook.probe(capacity / "gui.token") else token_taken + 1
@@ -950,14 +944,15 @@ def watch(hook: Any, capacity: Path, ours: str, timeout_s: float, *,
                 return None, "a job holds the gui token"
 
 
-def fuzz_setup() -> tuple[Any, int] | str:
-    """(the runner hook, how many canonical roots) or why this mini does not fuzz."""
+def fuzz_setup() -> tuple[Any, int, bool] | str:
+    """(the runner hook, how many canonical roots, whether a trusted-only runner runs here: then the lane only
+    replays) or why this mini does not fuzz."""
     dirs = runner_dirs()
     if not dirs:
         return "no glaeda runner on this mini"
     try:
-        if any("--trusted-ref" in (runner / "glaeda-hooks" / "job-started.sh").read_text() for runner in dirs):
-            return "a trusted-only runner (a seeder) runs here"
+        # Only picks the mode: the collector decides from the fleet manifest which minis it trusts to replay.
+        trusted = all("--trusted-ref" in (runner / "glaeda-hooks" / "job-started.sh").read_text() for runner in dirs)
         hook = load_hook(dirs[0])
         scopes = [hook.runner_scope(runner) for runner in dirs]
     except Exception as error:  # noqa: BLE001
@@ -965,7 +960,7 @@ def fuzz_setup() -> tuple[Any, int] | str:
     # Only capacity-mode admission stops the fuzzer before a gui job (take_capacity's yield_idle_fuzz).
     if max(scope.units for scope in scopes) <= 0:
         return "runners are not in capacity mode"
-    return hook, max(1, max(scope.roots for scope in scopes))
+    return hook, max(1, max(scope.roots for scope in scopes)), trusted
 
 
 def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
@@ -983,14 +978,19 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
     setup = fuzz_setup()
     if isinstance(setup, str):
         return {**base, "state": "skip", "reason": setup}
-    hook, roots_n = setup
+    hook, roots_n, trusted = setup
     capacity = FLEET_DIR / "capacity"
     why = reservation_refusal(hook, now) or console_refusal(hook) or gui_refusal(hook, capacity)
     if why:
         return {**base, "state": "skip", "reason": why}
-    replay = pending_replay(now)
+    replay = pending_replay(now) if trusted else None
+    if not trusted:  # requests an older collector left here: never answered on a PR mini
+        shutil.rmtree(fuzz_dir() / "replays", ignore_errors=True)
+    if trusted and replay is None:
+        return {**base, "state": "skip", "reason": "a trusted-only runner (a seeder) runs here: it only replays for "
+                                                   "the collector, and no replay waits"}
     free = free_bytes(FLEET_DIR)
-    if replay is None and (free is None or free < FUZZ_MIN_FREE_BYTES):
+    if not trusted and (free is None or free < FUZZ_MIN_FREE_BYTES):
         return {**base, "state": "skip", "reason": f"{(free or 0) // 1024 ** 3} GiB free, the fuzzer needs "
                                                    f"{FUZZ_MIN_FREE_BYTES // 1024 ** 3}"}
     roots = main_roots(hook, roots_n, state)
@@ -1008,7 +1008,7 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
     try:
         if replay is not None:  # the run that held the lock may have answered it
             replay = pending_replay()
-            if replay is None and (free is None or free < FUZZ_MIN_FREE_BYTES):
+            if replay is None:
                 return {**base, "state": "skip", "reason": "the replay was answered"}
         if not apply:
             what = f"replay {replay.name} on" if replay else "fuzz"
@@ -1055,7 +1055,7 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
                  "--max-findings", str(FUZZ_MAX_FINDINGS), "--seed", str(seed), "--out", os.fspath(out),
                  "--label", "main", "--sha", build.name],
                 cwd=engine, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-        code, stopped = watch(hook, capacity, ours, FUZZ_TIMEOUT_S, for_replay=True)
+        code, stopped = watch(hook, capacity, ours, FUZZ_TIMEOUT_S)
         _child = None
         kill_build()  # the app and anything else the fuzzer left in our group
         dismiss_crash_dialogs()

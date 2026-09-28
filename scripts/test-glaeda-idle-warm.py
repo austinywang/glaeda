@@ -429,7 +429,7 @@ hook.root_stamp = lambda k, s: {"merged_onto": sys.argv[5]} if k == 2 else None
 hook.console_state = lambda: None
 hook.reservation_refusal = lambda path, now: None
 warm.host_denied = lambda names=None: ""
-warm.fuzz_setup = lambda: (hook, 2)
+warm.fuzz_setup = lambda: (hook, 2, os.environ.get("FAKE_TRUSTED") == "1")
 warm.console_refusal = lambda h: ""
 warm.gui_process = lambda ours="": ""  # other agents' Xcode tests on this Mac are not this test's
 warm.free_bytes = lambda p: 500 * 1024 ** 3
@@ -438,7 +438,7 @@ print(json.dumps(warm.fuzz(True, state)), flush=True)
 
 
 class FuzzTest(Base):
-    def fuzz_setup(self, sleep: str = "0") -> types.SimpleNamespace:
+    def fuzz_setup(self, sleep: str = "0", trusted: bool = False) -> types.SimpleNamespace:
         """A mini whose root 2 keeps a main build of HEAD, with main's checkout (a git repo) for the fuzzer."""
         (self.dir / "fleet" / "host.lock").touch()
         engine = self.state / ".catch-up" / "cmux"
@@ -457,7 +457,7 @@ class FuzzTest(Base):
         app.mkdir(parents=True)
         (app / "Info.plist").write_text("main build")
         (store / "stamp.json").write_text(json.dumps({"merged_onto": self.head}))
-        os.environ.update(FAKE_CALLS=os.fspath(self.dir / "calls"), FAKE_SLEEP=sleep)
+        os.environ.update(FAKE_CALLS=os.fspath(self.dir / "calls"), FAKE_SLEEP=sleep, FAKE_TRUSTED=str(int(trusted)))
         stamps = {1: {"merged_onto": "b" * 40, "pr": 15000}, 2: {"merged_onto": self.head}}
         stub = types.SimpleNamespace(probe=hook.probe, FUZZ_HOLDER=hook.FUZZ_HOLDER,
                                      root_stamp=lambda k, state: stamps.get(k),
@@ -465,7 +465,7 @@ class FuzzTest(Base):
         self.saved.update({name: getattr(warm, name) for name in ("fuzz_setup", "gui_process", "FUZZ_KILL_SWITCH")})
         warm.FUZZ_KILL_SWITCH = self.dir / "idle-fuzz.disabled"
         warm.host_denied = lambda names=None: ""
-        warm.fuzz_setup = lambda: (stub, 2)
+        warm.fuzz_setup = lambda: (stub, 2, trusted)
         warm.console_refusal = lambda hook_module: ""
         warm.gui_process = lambda ours="": ""
         warm.free_bytes = lambda path: 500 * 1024 ** 3
@@ -533,8 +533,8 @@ class FuzzTest(Base):
         return request
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
-    def test_a_replay_request_runs_first_against_the_main_build_and_is_answered(self) -> None:
-        self.fuzz_setup()
+    def test_a_trusted_only_mini_replays_a_request_against_the_main_build_and_never_fuzzes(self) -> None:
+        self.fuzz_setup(trusted=True)
         stale = self.replay_request("req.stale1")
         old = time.time() - warm.REPLAY_MAX_AGE_S - 60
         os.utime(stale / ".ready", (old, old))
@@ -553,24 +553,36 @@ class FuzzTest(Base):
                          f"--app {staged} --sha {self.head} --out {request / 'out'}")
         self.assertEqual(json.loads((request / ".done").read_text()), {"build": self.head, "exit": 0, "reason": ""})
         self.assertIsNone(warm.pending_replay(), "answered")
-        # Next tick: back to fuzzing.
+        # Next tick: nothing waits, and a trusted-only mini never fuzzes.
         result = json.loads(self.driver().communicate(timeout=60)[0].strip().splitlines()[-1])
-        self.assertEqual(result["state"], "fuzzed", result)
+        self.assertEqual(result["state"], "skip", result)
+        self.assertIn("only replays", result["reason"])
+        self.assertFalse((self.dir / "calls").exists())
+
+    def test_fuzz_setup_says_whether_a_trusted_only_runner_runs_here(self) -> None:
+        flags = "--min-free-gib 100 --capacity-units 4 --canonical-roots 2"
+        runners = [self.runner("actions-runner-glaeda", flags)]
+        self.saved["runner_dirs"] = warm.runner_dirs
+        warm.runner_dirs = lambda: list(runners)
+        self.assertIs(warm.fuzz_setup()[2], False)
+        runners.append(self.runner("actions-runner-glaeda-1", flags + " --trusted-ref refs/heads/main"))
+        self.assertIs(warm.fuzz_setup()[2], False, "PR jobs still run beside a trusted runner")
+        runners.pop(0)
+        self.assertIs(warm.fuzz_setup()[2], True, "a seeder mini only replays")
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
-    def test_a_fuzz_run_stops_for_a_replay_request(self) -> None:
-        self.fuzz_setup(sleep="120")
-        proc = self.driver()
-        self.addCleanup(proc.kill)
-        self.started_app(proc)
-        self.replay_request()
-        out, _ = proc.communicate(timeout=60)
-        result = json.loads(out.strip().splitlines()[-1])
-        self.assertEqual((result["state"], result["reason"]), ("stopped", "a replay is waiting"), result)
+    def test_a_pr_mini_never_replays(self) -> None:
+        # A pull request job there can write the request, the kept build and the answer: a replay proves nothing.
+        self.fuzz_setup()
+        request = self.replay_request()
+        self.assertEqual(warm.fuzz(False, self.state)["would"], f"fuzz main {self.head[:12]}")
+        result = json.loads(self.driver().communicate(timeout=60)[0].strip().splitlines()[-1])
+        self.assertEqual(result["state"], "fuzzed", result)
+        self.assertFalse(request.exists(), "a PR mini removes what an older collector asked of it")
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_a_job_taking_the_gui_token_leaves_the_replay_for_later(self) -> None:
-        self.fuzz_setup()
+        self.fuzz_setup(trusted=True)
         request = self.replay_request(sleep="120")
         proc = self.driver()
         self.addCleanup(proc.kill)
