@@ -400,6 +400,14 @@ app.kill()
 json.dump({"seed": 1, "sessions": 1, "steps": 42, "findings": []}, open(os.path.join(out, "summary.json"), "w"))
 """
 
+# Stands in for the collector's replay.py: records its arguments, then sleeps.
+FAKE_REPLAY = """import os, sys, time
+args = sys.argv[1:]
+out = args[args.index("--out") + 1]
+open(os.path.join(out, "args"), "w").write(" ".join(args))
+time.sleep(SLEEP)
+"""
+
 # Loads the lane in a child process (so a SIGTERM or SIGKILL of its process group does not reach the test) with
 # the same stubs FuzzTest.fuzz_setup puts in, and runs it.
 FUZZ_DRIVER = """
@@ -515,6 +523,66 @@ class FuzzTest(Base):
         subprocess.run(["rm", "-rf", os.fspath(self.state / ".catch-up")], check=True)
         again = json.loads(self.driver().communicate(timeout=60)[0].strip().splitlines()[-1])
         self.assertEqual((again["state"], again["build"]), ("fuzzed", self.head), again)
+
+    def replay_request(self, name: str = "req.abc123", sleep: str = "0") -> Path:
+        """What the collector's mini-serve.sh leaves: replay.py (a stand-in here), then .ready."""
+        request = self.dir / "fleet" / "fuzz" / "replays" / name
+        request.mkdir(parents=True)
+        (request / "replay.py").write_text(FAKE_REPLAY.replace("SLEEP", sleep))
+        (request / ".ready").touch()
+        return request
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_replay_request_runs_first_against_the_main_build_and_is_answered(self) -> None:
+        self.fuzz_setup()
+        stale = self.replay_request("req.stale1")
+        old = time.time() - warm.REPLAY_MAX_AGE_S - 60
+        os.utime(stale / ".ready", (old, old))
+        request = self.replay_request()
+        (self.dir / "fleet" / "fuzz" / "replays" / "not-a-request").mkdir()
+        self.assertIn("replay req.abc123 on main", warm.fuzz(False, self.state)["would"])
+        self.assertFalse(stale.exists(), "a day-old request is dropped")
+        warm.free_bytes = lambda path: 10 * 1024 ** 3  # a replay writes a few frames: no disk gate
+        self.assertEqual(warm.fuzz(False, self.state)["state"], "plan")
+        result = json.loads(self.driver().communicate(timeout=60)[0].strip().splitlines()[-1])
+        self.assertEqual((result["state"], result["request"], result["build"]), ("replayed", "req.abc123", self.head),
+                         result)
+        self.assertFalse((self.dir / "calls").exists(), "no fuzzing while a replay waits")
+        staged = self.dir / "fleet" / "fuzz" / "builds" / self.head / "cmux DEV.app"
+        self.assertEqual((request / "out" / "args").read_text(),
+                         f"--app {staged} --sha {self.head} --out {request / 'out'}")
+        self.assertEqual(json.loads((request / ".done").read_text()), {"build": self.head, "exit": 0, "reason": ""})
+        self.assertIsNone(warm.pending_replay(), "answered")
+        # Next tick: back to fuzzing.
+        result = json.loads(self.driver().communicate(timeout=60)[0].strip().splitlines()[-1])
+        self.assertEqual(result["state"], "fuzzed", result)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_fuzz_run_stops_for_a_replay_request(self) -> None:
+        self.fuzz_setup(sleep="120")
+        proc = self.driver()
+        self.addCleanup(proc.kill)
+        self.started_app(proc)
+        self.replay_request()
+        out, _ = proc.communicate(timeout=60)
+        result = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual((result["state"], result["reason"]), ("stopped", "a replay is waiting"), result)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_job_taking_the_gui_token_leaves_the_replay_for_later(self) -> None:
+        self.fuzz_setup()
+        request = self.replay_request(sleep="120")
+        proc = self.driver()
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 30
+        while not (request / "out" / "args").exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        gui = hook.lock_file(self.capacity / "gui.token", fcntl.LOCK_EX)
+        self.addCleanup(os.close, gui)
+        result = json.loads(proc.communicate(timeout=30)[0].strip().splitlines()[-1])
+        self.assertEqual((result["state"], result["reason"]), ("stopped", "a job holds the gui token"), result)
+        self.assertFalse((request / ".done").exists(), "asked again next tick")
+        self.assertEqual(warm.pending_replay(), request)
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_never_beside_a_gui_job_a_reservation_or_without_a_main_build(self) -> None:
