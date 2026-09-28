@@ -340,6 +340,16 @@ jobs:
       - name: Validate repository verification wrappers
         run: bash -n examples/renderprove/run-renderprove-review.sh
 
+      # The PR minis run the LAN fetch broker under macOS's /usr/bin/python3, which is 3.9.
+      - name: Set up the minis' Python
+        id: mini-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.9"
+
+      - name: Test the LAN fetch broker on the minis' Python
+        run: '"${{ steps.mini-python.outputs.python-path }}" scripts/test-glaeda-lan-fetch.py'
+
 
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:

@@ -690,7 +690,7 @@ def serve_local(sock_path: Path | None = None, ready: threading.Event | None = N
         while True:
             try:
                 conn, _ = server.accept()
-            except TimeoutError:
+            except socket.timeout:  # not TimeoutError before Python 3.10, and the minis run 3.9
                 with active_lock:
                     idle = active[0] == 0
                 try:
