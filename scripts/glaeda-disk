@@ -58,6 +58,7 @@ build output or copies. Nested or unverifiable checkouts stay protected.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import platform
@@ -75,6 +76,7 @@ from pathlib import Path
 HOME = Path.home()
 SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
 DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (the runner hooks and the LaunchAgent)
 # Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
 # re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
 NESTED_KEEP = HOME / ".cache/glaeda-disk/nested-keep.json"
@@ -1652,6 +1654,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--emergency", default="10%:30-60",
                     help="with --pressure --apply: delete even while a CI job runs once free space is "
                          "below this, same forms as --low (default %(default)s)")
+    ap.add_argument("--floor-gib", type=float, default=0.0,
+                    help="a runner disk floor to honour besides the ones read from runner hooks (runner_floor_gib): "
+                         "the runner hook passes its own --min-free-gib when it evicts before refusing a job")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -1698,7 +1703,7 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(a.settle_minutes * 60)
         return 0
     try:
-        floor_gib = runner_floor_gib()
+        floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
                           a.tmpfs_low, a.tmpfs_target, floor_gib)
         space(a.emergency, GIB)
@@ -1717,6 +1722,15 @@ def main(argv: list[str] | None = None) -> int:
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
         if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
+            return 0
+    if a.apply:
+        # a second eviction would only race the first for the same items; its caller re-reads free space instead
+        EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        evict_lock = EVICT_LOCK.open("a")  # held until this process exits
+        try:
+            fcntl.flock(evict_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another eviction running; skipped")
             return 0
     idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
     at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()

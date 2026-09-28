@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -479,6 +480,37 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "HOME", Path("/dev")):  # another volume: no lift
             other = next(iter(gd.filesystems([self.fam], "0", "0", floor_gib=1).values()))
             self.assertEqual(other.low, 0)
+
+    def test_floor_gib_adds_the_callers_floor(self) -> None:
+        seen: list[float] = []
+
+        def fss(*args: object) -> dict:
+            seen.append(args[-1])
+            return {}
+
+        with mock.patch.object(gd, "runner_floor_gib", return_value=50.0), \
+                mock.patch.object(gd, "filesystems", side_effect=fss), contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--pressure", "--floor-gib", "150", "--no-snapshot"])
+            gd.main(["--pressure", "--floor-gib", "10", "--no-snapshot"])
+            gd.main(["--pressure", "--floor-gib", "inf", "--no-snapshot"])
+        self.assertEqual(seen, [150.0, 50.0, 50.0], "the higher of the hooks' floors and the caller's")
+
+    def test_one_eviction_at_a_time(self) -> None:
+        lock = self.root / "evict.lock"
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "EVICT_LOCK", lock), mock.patch.object(gd, "filesystems", return_value={}), \
+                mock.patch.object(gd, "survey", return_value=[]) as survey, \
+                mock.patch.object(gd, "apply", return_value=0):
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt]), 0)
+                self.assertIn("another eviction running", out.getvalue())
+                survey.assert_not_called()
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
+            survey.assert_called_once()
 
     def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
         other = gd.Family("tmp", self.root, True, "scratch")
