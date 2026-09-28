@@ -19,7 +19,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Most pull requests change only Python and shell under scripts/, which the Rust and Go jobs cannot judge: of 60
+  # recent PRs, 48 touched nothing they read, and each still spent about 295 runner-seconds on lint, test, cli and go.
+  # Those jobs now run for a pull request only when it changes something they read. A script counts as Rust input
+  # when src/, tests/ or the cli job names it (scripts/bootstrap, for one). Pushes to main run everything, and
+  # scripts and runner-tests always run, since several script tests drive cargo.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      go: ${{ steps.scope.outputs.go }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The pull request's merge commit and its first parent, the base it merges into.
+          fetch-depth: 2
+          persist-credentials: false
+          show-progress: false
+
+      - name: Decide which jobs this change needs
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if test "$EVENT" != pull_request; then
+            printf 'rust=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          rust=false
+          go=false
+          # Scripts that Rust tests run: the modules they load are Rust input too (fleet_bundle.py through
+          # scripts/test-fleet-bundle.py, for one).
+          rust_named=$(grep -rhoE 'scripts/[A-Za-z0-9_./-]+' src tests | sort -u | while read -r f; do
+            if test -f "$f"; then echo "$f"; fi
+          done)
+          # --no-renames lists a rename's old path too; writing to a file first fails the job, not open, on error.
+          git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
+          while IFS= read -r path; do
+            case "$path" in
+              docs/MODULE_INVENTORY.md) rust=true ;;
+              docs/*|*.md) ;;
+              .github/workflows/ci.yml) rust=true; go=true ;;
+              tools/scaleset-bridge/*) go=true ;;
+              scripts/bootstrap|scripts/workspace_bootstrap/*) rust=true ;;
+              .github/*|.claude/*|skills/*) ;;
+              scripts/*)
+                # The script's name as a whole word: glaeda-gh is not named by glaeda-gha-{token}.
+                # shellcheck disable=SC2086
+                if grep -rqwF -- "${path#scripts/}" src tests $rust_named; then
+                  echo "Rust sources or the scripts they run name $path"
+                  rust=true
+                fi
+                ;;
+              *) rust=true ;;
+            esac
+          done < "$RUNNER_TEMP/changed"
+          printf 'rust=%s\ngo=%s\n' "$rust" "$go" | tee -a "$GITHUB_OUTPUT"
+
   go:
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -306,6 +368,8 @@ jobs:
   # rust was one serial job of about 4.4 min (cache restore 69 s, check and two clippy runs 70 s, tests 100 s);
   # lint and test now run side by side.
   lint:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
@@ -384,6 +448,8 @@ jobs:
           key: verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
 
   test:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
@@ -438,6 +504,8 @@ jobs:
   # The workspace bootstrap receipt and the operator CLI's own entry points (front door, doctor, plans). The front
   # door's cargo run scrubs the environment, so it builds the default profile; here that is the only build.
   cli:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -519,6 +587,20 @@ jobs:
           cat "$first_receipt"
 
       # The front door's cargo run is --offline: fetch and build first, as cargo test did when these ran in one job.
+      # Its scrubbed environment builds the default dev profile, which lint and test (no debuginfo) do not share, so
+      # this job keeps its own main-written cache; without one the build was cold on every run (49 s).
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
       - name: Build the CLI
         run: cargo build --locked
 
@@ -550,10 +632,21 @@ jobs:
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account'
 
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
   # One check that stands for the whole workflow, under the old single job's name.
   verify:
     if: ${{ always() }}
-    needs: [go, scripts, runner-tests, lint, test, cli]
+    needs: [changes, go, scripts, runner-tests, lint, test, cli]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -563,5 +656,6 @@ jobs:
         run: |
           echo "results: $RESULTS"
           for result in $RESULTS; do
-            test "$result" = success
+            # A job this change cannot affect is skipped, not failed.
+            test "$result" = success || test "$result" = skipped
           done
