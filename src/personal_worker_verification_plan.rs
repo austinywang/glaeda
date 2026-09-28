@@ -33,6 +33,9 @@ use crate::rust_verification_envelope::{
 };
 use crate::rust_verification_envelope_digest::digest_rust_verification_envelope;
 use crate::trusted_workspace_receipt::TrustedWorkspaceCacheReceipt;
+use crate::verification_cache_generation::{
+    VerificationCacheIdentityGeneration, verification_cache_identity_generation,
+};
 use crate::verification_profile::{
     CacheId, ExactBuildScope, ExactVerificationScope, RepositoryCommandIdentity,
     VerificationProfileId,
@@ -45,6 +48,11 @@ pub const MAX_VERIFICATION_STDERR_BYTES: u64 = 1_048_576;
 
 const PERSONAL_LIMA_WORK_RUNNER_PROFILE: &str = "personal-lima-work";
 const REDACTED_PRIVATE_PLAN_EVIDENCE: &str = "<private-verification-plan-evidence>";
+const SMOLRUNNER_SOURCE_COMMAND_CACHE_DOMAIN: &[u8] =
+    b"smolrunner-verification-source-command-cache-v1";
+const SMOLRUNNER_ENVELOPE_CACHE_DOMAIN: &[u8] = b"smolrunner-verification-envelope-cache-v1";
+const GLAEDA_SOURCE_COMMAND_CACHE_DOMAIN: &[u8] = b"glaeda-verification-source-command-cache-v2";
+const GLAEDA_ENVELOPE_CACHE_DOMAIN: &[u8] = b"glaeda-verification-envelope-cache-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +162,7 @@ pub struct VerificationCommandBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerificationCacheBinding {
+    pub generation: VerificationCacheIdentityGeneration,
     pub installation_id: crate::verification_profile::RunnerInstallationId,
     pub workspace_id: crate::verification_profile::RunnerWorkspaceId,
     pub cache_id: CacheId,
@@ -448,6 +457,8 @@ pub fn plan_personal_worker_verification(
     if profile.canonical_command().identity().repository() != &entry.repository {
         return Err(profile_mismatch());
     }
+    let cache_generation =
+        verification_cache_identity_generation(profile).map_err(|_| profile_mismatch())?;
     if entry.requested_cpu_millis != admission.requested_limits().cpu_millis
         || entry.requested_memory_bytes != admission.requested_limits().memory_bytes
     {
@@ -472,6 +483,7 @@ pub fn plan_personal_worker_verification(
     }
 
     let source_command_namespace_digest = source_command_namespace_digest(
+        cache_generation,
         protected_namespace_digest,
         source,
         profile.canonical_command().identity(),
@@ -534,6 +546,7 @@ pub fn plan_personal_worker_verification(
     let rust_envelope_digest =
         digest_rust_verification_envelope(&rust_envelope).map_err(|_| profile_mismatch())?;
     let source_command_envelope_namespace_digest = envelope_cache_namespace_digest(
+        cache_generation,
         protected_namespace_digest,
         &source_command_namespace_digest,
         &rust_envelope_digest,
@@ -562,6 +575,7 @@ pub fn plan_personal_worker_verification(
         requested_limits: admission.requested_limits(),
         applied_limits: admission.applied_limits(),
         cache: VerificationCacheBinding {
+            generation: cache_generation,
             installation_id: workspace_receipt.installation_id().clone(),
             workspace_id: workspace_receipt.workspace_id().clone(),
             cache_id: cache_id.clone(),
@@ -599,14 +613,31 @@ const fn effective_not_after(
     }
 }
 
+const fn source_command_cache_domain(
+    generation: VerificationCacheIdentityGeneration,
+) -> &'static [u8] {
+    match generation {
+        VerificationCacheIdentityGeneration::SmolrunnerV1 => SMOLRUNNER_SOURCE_COMMAND_CACHE_DOMAIN,
+        VerificationCacheIdentityGeneration::GlaedaV2 => GLAEDA_SOURCE_COMMAND_CACHE_DOMAIN,
+    }
+}
+
+const fn envelope_cache_domain(generation: VerificationCacheIdentityGeneration) -> &'static [u8] {
+    match generation {
+        VerificationCacheIdentityGeneration::SmolrunnerV1 => SMOLRUNNER_ENVELOPE_CACHE_DOMAIN,
+        VerificationCacheIdentityGeneration::GlaedaV2 => GLAEDA_ENVELOPE_CACHE_DOMAIN,
+    }
+}
+
 fn source_command_namespace_digest(
+    generation: VerificationCacheIdentityGeneration,
     protected_namespace: &Sha256Digest,
     source: &RepositorySourceObservation,
     command: &RepositoryCommandIdentity,
 ) -> Result<Sha256Digest, PersonalWorkerVerificationPlanError> {
     let command_identity = serde_json::to_vec(command).map_err(|_| cache_mismatch())?;
     digest_namespace_fields(
-        b"smolrunner-verification-source-command-cache-v1",
+        source_command_cache_domain(generation),
         &[
             protected_namespace.as_str().as_bytes(),
             source.source().repository.as_str().as_bytes(),
@@ -618,12 +649,13 @@ fn source_command_namespace_digest(
 }
 
 fn envelope_cache_namespace_digest(
+    generation: VerificationCacheIdentityGeneration,
     protected_namespace: &Sha256Digest,
     source_command_namespace: &Sha256Digest,
     rust_envelope_digest: &Sha256Digest,
 ) -> Result<Sha256Digest, PersonalWorkerVerificationPlanError> {
     digest_namespace_fields(
-        b"smolrunner-verification-envelope-cache-v1",
+        envelope_cache_domain(generation),
         &[
             protected_namespace.as_str().as_bytes(),
             source_command_namespace.as_str().as_bytes(),
@@ -756,7 +788,10 @@ mod tests {
     };
     use crate::repository_source_observation::RepositoryWorkspaceLocationIdentity;
     use crate::verification_profile::{RunnerInstallationId, RunnerWorkspaceId};
-    use crate::verification_profile_registry::SMOLRUNNER_REQUIRED_PROFILE_ID;
+    use crate::verification_profile_registry::{
+        GLAEDA_DOCTOR_PROFILE_ID, GLAEDA_PLAN_PROFILE_ID, GLAEDA_REQUIRED_PROFILE_ID,
+        SMOLRUNNER_DOCTOR_PROFILE_ID, SMOLRUNNER_PLAN_PROFILE_ID, SMOLRUNNER_REQUIRED_PROFILE_ID,
+    };
 
     const GIB: u64 = 1_024 * 1_024 * 1_024;
 
@@ -772,12 +807,12 @@ mod tests {
         Sha256Digest::parse(&format!("sha256:{}", hex.repeat(64))).expect("digest")
     }
 
-    fn config() -> OperatorConfig {
+    fn config(profile_id: &str) -> OperatorConfig {
         OperatorConfig::new(
             PersonalWorkerStateRoot::parse("/private/test-state").expect("state root"),
             LimaInstanceName::parse("smolrunner").expect("instance"),
             GuestWorkspacePath::parse("/home/runner/workspace").expect("workspace"),
-            VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("profile"),
+            VerificationProfileId::parse(profile_id).expect("profile"),
             AvailabilityRequest::Auto,
             OperatorIdlePolicy::new(600_000, 1_800_000).expect("idle policy"),
             OperatorOutputPreference::Json,
@@ -826,12 +861,27 @@ mod tests {
         job_observed_at: EpochMillis,
         applied: ExecutionResourceLimits,
     ) -> PlanningFixture {
-        let config = config();
-        let repository = RepositoryRef::parse("teamleaderleo/smolrunner").expect("repository");
+        planning_fixture_for(
+            receipt_inode,
+            job_observed_at,
+            applied,
+            "teamleaderleo/smolrunner",
+            SMOLRUNNER_REQUIRED_PROFILE_ID,
+        )
+    }
+
+    fn planning_fixture_for(
+        receipt_inode: u64,
+        job_observed_at: EpochMillis,
+        applied: ExecutionResourceLimits,
+        repository: &str,
+        profile_id: &str,
+    ) -> PlanningFixture {
+        let config = config(profile_id);
+        let repository = RepositoryRef::parse(repository).expect("repository");
         let commit = CommitId::parse(&"1".repeat(40)).expect("commit");
         let tree = GitTreeId::parse(&"2".repeat(40)).expect("tree");
-        let profile_id =
-            VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("profile");
+        let profile_id = VerificationProfileId::parse(profile_id).expect("profile");
         let request_id = ExecutionRequestId::parse("job-one").expect("request ID");
         let runner_profile_id =
             RunnerProfileId::parse(PERSONAL_LIMA_WORK_RUNNER_PROFILE).expect("runner profile");
@@ -1014,6 +1064,10 @@ mod tests {
             report.command().identity.repository().as_str(),
             "teamleaderleo/smolrunner"
         );
+        assert_eq!(
+            report.cache().generation,
+            VerificationCacheIdentityGeneration::SmolrunnerV1
+        );
         assert_ne!(
             report.cache().source_command_envelope_namespace_digest,
             report.cache().protected_namespace_digest
@@ -1084,6 +1138,104 @@ mod tests {
     }
 
     #[test]
+    fn current_glaeda_plan_uses_successor_cache_generation() {
+        let legacy = planning_fixture(20)
+            .plan()
+            .expect("legacy verification plan");
+        let current = planning_fixture_for(
+            20,
+            time(1_000_000),
+            limits(4_000, 4 * GIB),
+            "teamleaderleo/glaeda",
+            GLAEDA_REQUIRED_PROFILE_ID,
+        )
+        .plan()
+        .expect("current Glaeda verification plan");
+
+        assert_eq!(
+            current.report().command().identity.repository().as_str(),
+            "teamleaderleo/glaeda"
+        );
+        assert_eq!(
+            current.report().cache().generation,
+            VerificationCacheIdentityGeneration::GlaedaV2
+        );
+        assert_ne!(
+            current
+                .report()
+                .cache()
+                .source_command_envelope_namespace_digest,
+            legacy
+                .report()
+                .cache()
+                .source_command_envelope_namespace_digest
+        );
+        assert_eq!(
+            current
+                .report()
+                .cache()
+                .source_command_envelope_namespace_digest
+                .as_str(),
+            "sha256:e228e51012fcee696df3cec29fbc7ad9b96043d359cde02104568d8791781d10"
+        );
+    }
+
+    #[test]
+    fn checked_in_profiles_select_exact_cache_generation_and_refuse_cross_commands() {
+        let registry = smolrunner_profile_registry().expect("registry");
+        for (profile_id, expected) in [
+            (
+                GLAEDA_REQUIRED_PROFILE_ID,
+                VerificationCacheIdentityGeneration::GlaedaV2,
+            ),
+            (
+                GLAEDA_DOCTOR_PROFILE_ID,
+                VerificationCacheIdentityGeneration::GlaedaV2,
+            ),
+            (
+                GLAEDA_PLAN_PROFILE_ID,
+                VerificationCacheIdentityGeneration::GlaedaV2,
+            ),
+            (
+                SMOLRUNNER_REQUIRED_PROFILE_ID,
+                VerificationCacheIdentityGeneration::SmolrunnerV1,
+            ),
+            (
+                SMOLRUNNER_DOCTOR_PROFILE_ID,
+                VerificationCacheIdentityGeneration::SmolrunnerV1,
+            ),
+            (
+                SMOLRUNNER_PLAN_PROFILE_ID,
+                VerificationCacheIdentityGeneration::SmolrunnerV1,
+            ),
+        ] {
+            let id = VerificationProfileId::parse(profile_id).expect("profile ID");
+            let profile = registry.lookup(&id).expect("registered profile");
+            assert_eq!(
+                verification_cache_identity_generation(profile).unwrap(),
+                expected
+            );
+        }
+
+        let glaeda = registry
+            .lookup(&VerificationProfileId::parse(GLAEDA_REQUIRED_PROFILE_ID).unwrap())
+            .unwrap();
+        let smolrunner = registry
+            .lookup(&VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).unwrap())
+            .unwrap();
+        assert!(
+            glaeda
+                .select_command(smolrunner.canonical_command().identity())
+                .is_err()
+        );
+        assert!(
+            smolrunner
+                .select_command(glaeda.canonical_command().identity())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn runtime_requirements_are_closed_and_non_downgradable() {
         let required = VerificationRuntimeRequirements::REQUIRED;
         assert_eq!(
@@ -1109,39 +1261,109 @@ mod tests {
     }
 
     #[test]
-    fn cache_subnamespace_is_deterministic_and_field_framed() {
-        let domain = b"test-cache-domain-v1";
-        let first = digest_namespace_fields(
-            domain,
-            &[b"parent", b"repo", b"commit", b"tree", b"command"],
+    fn cache_subnamespace_generations_are_pinned_deterministic_and_field_framed() {
+        let fields = &[
+            b"parent".as_slice(),
+            b"repo",
+            b"commit",
+            b"tree",
+            b"command",
+        ];
+        let old_source = digest_namespace_fields(
+            source_command_cache_domain(VerificationCacheIdentityGeneration::SmolrunnerV1),
+            fields,
         )
-        .expect("first digest");
+        .expect("old source digest");
+        let new_source = digest_namespace_fields(
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
+            fields,
+        )
+        .expect("new source digest");
+        assert_eq!(
+            old_source.as_str(),
+            "sha256:b11266e3841edaf6c2170420fb2063b5b78028642f04ab640aa6142157b870f8"
+        );
+        assert_eq!(
+            new_source.as_str(),
+            "sha256:5e59cee48307a05dd1c2762f3204ef33984ae8fae6959f04ac108963e6390b3c"
+        );
+        assert_ne!(old_source, new_source);
+
         let replay = digest_namespace_fields(
-            domain,
-            &[b"parent", b"repo", b"commit", b"tree", b"command"],
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
+            fields,
         )
         .expect("replay digest");
         let changed_tree = digest_namespace_fields(
-            domain,
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
             &[b"parent", b"repo", b"commit", b"different-tree", b"command"],
         )
-        .expect("changed digest");
-        let left = digest_namespace_fields(domain, &[b"ab", b"c"]).expect("left digest");
-        let right = digest_namespace_fields(domain, &[b"a", b"bc"]).expect("right digest");
+        .expect("changed tree digest");
+        let changed_command = digest_namespace_fields(
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
+            &[b"parent", b"repo", b"commit", b"tree", b"different-command"],
+        )
+        .expect("changed command digest");
+        let left =
+            digest_namespace_fields(b"test-cache-domain-v1", &[b"ab", b"c"]).expect("left digest");
+        let right =
+            digest_namespace_fields(b"test-cache-domain-v1", &[b"a", b"bc"]).expect("right digest");
+        assert_eq!(new_source, replay);
+        assert_ne!(new_source, changed_tree);
+        assert_ne!(new_source, changed_command);
+        assert_ne!(left, right);
+
         let protected = digest("a");
         let source_command = digest("b");
-        let envelope_one =
-            envelope_cache_namespace_digest(&protected, &source_command, &digest("c"))
-                .expect("first envelope cache digest");
-        let envelope_two =
-            envelope_cache_namespace_digest(&protected, &source_command, &digest("d"))
-                .expect("changed envelope cache digest");
+        let envelope = digest("c");
+        let old_envelope = envelope_cache_namespace_digest(
+            VerificationCacheIdentityGeneration::SmolrunnerV1,
+            &protected,
+            &source_command,
+            &envelope,
+        )
+        .expect("old envelope digest");
+        let new_envelope = envelope_cache_namespace_digest(
+            VerificationCacheIdentityGeneration::GlaedaV2,
+            &protected,
+            &source_command,
+            &envelope,
+        )
+        .expect("new envelope digest");
+        let changed_envelope = envelope_cache_namespace_digest(
+            VerificationCacheIdentityGeneration::GlaedaV2,
+            &protected,
+            &source_command,
+            &digest("d"),
+        )
+        .expect("changed envelope digest");
+        assert_eq!(
+            old_envelope.as_str(),
+            "sha256:5d6aafbb018f52018fee81f7a68c795b82c361a4461dcabe9c785f2088de2021"
+        );
+        assert_eq!(
+            new_envelope.as_str(),
+            "sha256:5db35abef5490ab8cfe7946c85f6b30bee3ee8650591cf3352f6bfa59602fb06"
+        );
+        assert_ne!(old_envelope, new_envelope);
+        assert_ne!(new_envelope, changed_envelope);
+        assert!(new_source.as_str().starts_with("sha256:"));
+    }
 
-        assert_eq!(first, replay);
-        assert_ne!(first, changed_tree);
-        assert_ne!(left, right);
-        assert_ne!(envelope_one, envelope_two);
-        assert!(first.as_str().starts_with("sha256:"));
+    #[test]
+    fn cache_generation_is_identity_only_and_contains_no_path_or_mutation_surface() {
+        for generation in [
+            VerificationCacheIdentityGeneration::SmolrunnerV1,
+            VerificationCacheIdentityGeneration::GlaedaV2,
+        ] {
+            let public = format!(
+                "{}\n{generation:?}",
+                serde_json::to_string(&generation).expect("generation JSON")
+            );
+            for forbidden in ["/", "path", "delete", "rename", "adopt", "mutate"] {
+                assert!(!public.contains(forbidden));
+            }
+        }
     }
 
     #[test]

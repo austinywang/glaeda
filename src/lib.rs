@@ -445,6 +445,8 @@ pub mod unix_protected_cache_generation_catalog_store;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;
+/// Pure closed generation selection for verification-derived cache identities.
+pub mod verification_cache_generation;
 /// Pure fixed repository verification command meanings for identity derivation and later execution.
 pub mod verification_command_semantics;
 /// Pure sealed cross-attempt verification-isolation compatibility.

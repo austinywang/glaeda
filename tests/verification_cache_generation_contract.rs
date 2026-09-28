@@ -1,20 +1,8 @@
-mod verification_profile_registry {
-    pub use glaeda::verification_profile_registry::{
-        GLAEDA_DOCTOR_COMMAND_ID, GLAEDA_DOCTOR_PROFILE_ID, GLAEDA_PLAN_COMMAND_ID,
-        GLAEDA_PLAN_PROFILE_ID, GLAEDA_REQUIRED_COMMAND_ID, GLAEDA_REQUIRED_PROFILE_ID,
-        RegisteredVerificationProfile, SMOLRUNNER_DOCTOR_PROFILE_ID, SMOLRUNNER_PLAN_PROFILE_ID,
-        SMOLRUNNER_REQUIRED_PROFILE_ID,
-    };
-}
-
-#[path = "../src/verification_cache_generation.rs"]
-mod verification_cache_generation;
-
+use glaeda::verification_cache_generation::{
+    VerificationCacheIdentityGeneration, verification_cache_identity_generation,
+};
 use glaeda::verification_profile_registry::{
     glaeda_profile_registry, smolrunner_v1_profile_registry,
-};
-use verification_cache_generation::{
-    VerificationCacheIdentityGeneration, verification_cache_identity_generation,
 };
 
 #[test]
