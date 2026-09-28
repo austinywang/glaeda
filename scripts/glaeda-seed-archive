@@ -2,14 +2,21 @@
 """glaeda-seed-archive: keep the fleet's seed archive (cmux-lawrence) filled from the trusted seeder.
 
     glaeda-seed-archive                    plan: the seeds the seeder keeps that the archive lacks
-    glaeda-seed-archive --apply            fetch them newest first, then prune (the 5-minute LaunchAgent)
+    glaeda-seed-archive --apply            fetch them newest first, then prune (the LaunchAgent, every 15 s)
     glaeda-seed-archive install [--apply]  write and load that LaunchAgent (run on the archive host)
 
 cmuxterm-hq#821. The owned minis' j14 DerivedData seeds are built by one trusted-only seeder (cmux15), which
 keeps only its recent ones on a 460 GB disk. The archive keeps them all, up to BUDGET, on cmux-lawrence's
 X10 Pro SSD, and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
-then glaeda-seed-serve --role archive answers glaeda-seed-prefetch). A seed lands here within a few minutes of
+then glaeda-seed-serve --role archive answers glaeda-seed-prefetch). A seed lands here within about a minute of
 the seeder keeping it, over the LAN, instead of every mini downloading it from R2.
+
+The LaunchAgent asks every INTERVAL (15 s) seconds. It used to ask every 5 minutes, and a PR mini's prefetch
+(also every 5 minutes) that came between the seeder keeping a seed and the archive's next run missed here and
+fell back to R2 at about 3 MB/s beside a job (755 to 1163 s instead of 63 to 184 s over the LAN): 14 of the
+68 misses on 2026-09-28 05:22-12:20Z were that wait. Asking costs one `seed-list-v1` round trip (a directory
+listing on the seeder), and a run with nothing to fetch or prune writes nothing. Polling keeps the direction
+as it was: the archive asks the trusted seeder, which never connects to the archive or reads from it.
 
 Each seed is kept as ARCHIVE/<KEY>.tar.zst: exactly the zstd stream the seeder's glaeda-seed-serve sends (a
 tar of one top-level directory named KEY), so serving it is a plain read. ARCHIVE is inside IMAGE, an APFS
@@ -73,7 +80,7 @@ LIST_TIMEOUT = 30
 FETCH_TIMEOUT = 420  # the seeder may wait 60 s for a slot, then streams within its 180 s limit
 STALE_INCOMING = 3600
 LABEL = "com.teamleaderleo.glaeda.seed-archive"
-INTERVAL = 300
+INTERVAL = 15  # seconds between runs; launchd never starts one while the last still runs
 
 
 def prefetch_module():
@@ -334,6 +341,12 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         os.close(lock)
 
 
+def quiet(record: dict) -> bool:
+    """A run that fetched, pruned and reported nothing: not logged, or the log would be one line every 15 s."""
+    return (record.get("state") == "applied" and not record.get("missing") and not record.get("fetched")
+            and not record.get("pruned") and not record.get("full"))
+
+
 def append_log(record: dict) -> None:
     try:
         LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +366,8 @@ def plist(program: Path) -> dict:
         "StartInterval": INTERVAL,
         "RunAtLoad": True,
         "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.fspath(HOME)},
-        "StandardOutPath": os.fspath(HOME / "Library/Logs/glaeda-seed-archive.out"),
+        # Every run prints its record; LOG (bounded) keeps the ones that did something.
+        "StandardOutPath": "/dev/null",
         "StandardErrorPath": os.fspath(HOME / "Library/Logs/glaeda-seed-archive.err"),
     }
 
@@ -413,7 +427,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps(report))
         return 1 if report.get("error") or (args.apply and not report.get("loaded")) else 0
     record = run(args.apply)
-    if args.apply:
+    if args.apply and not quiet(record):
         append_log(record)
     print(json.dumps(record))
     return 1 if record["state"] == "error" else 0

@@ -176,7 +176,17 @@ class ArchiveTest(unittest.TestCase):
     def test_the_launch_agent_runs_apples_python(self):
         plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))
         self.assertEqual(plist["ProgramArguments"][:2], ["/usr/bin/python3", "-I"])
-        self.assertEqual(plist["StartInterval"], 300)
+        self.assertEqual(plist["StartInterval"], 15)
+        self.assertEqual(plist["StandardOutPath"], "/dev/null")
+
+    def test_only_a_run_that_did_something_is_logged(self):
+        self.keep(KEYS[0], 100)
+        first = self.run_archive()
+        self.assertFalse(archive.quiet(first), first)
+        again = self.run_archive()
+        self.assertTrue(archive.quiet(again), again)
+        self.assertFalse(archive.quiet({**again, "state": "error"}))
+        self.assertFalse(archive.quiet({"state": "skipped", "reason": "hdiutil attach timed out"}))
 
 
 if __name__ == "__main__":
