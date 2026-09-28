@@ -39,12 +39,20 @@ What one run does, and what it refuses:
    ~/glaeda-runner/scripts (glaeda-cmux-runner-fleet stages it). After an update, and on every run that
    finds the release current, that copy is brought to the installed release's four runner files when
    it is older, so a relabel never runs from a stale copy. A copy an operator staged (its
-   .glaeda-source.json stamp not written here) dated the release's day or later is kept. Only that
-   directory, and only when it already exists; the runners' installed hooks are not touched.
+   .glaeda-source.json stamp not written here) dated the release's day or later is kept, unless its
+   commit is one the release descends from (the release's ancestry.txt). Only that directory, and only
+   when it already exists.
+
+7. When that copy is the release's (step 6 found it current or refreshed it), the runners' installed hook
+   files follow it: the release's glaeda-cmux-runner --refresh-hooks --apply brings each owned runner's
+   glaeda-hooks/glaeda-cmux-runner-hook and glaeda_reservation.py to the release's bytes, atomically, and
+   nothing else (registration, labels, wrappers, LaunchAgents and receipts stay). A runner with a job is
+   done on a later run. Each listener gate sees its hook change and re-execs it, keeping its runner.
+   A copy an operator staged and kept owns the hooks it installed, so they stay.
 
 It never runs two at a time (a lock under the state directory), never touches anything but what
-setup installs (and the runner copy in step 6), and keeps the current and previous release under
-~/.local/state/glaeda/update.
+setup installs (and the runner copy and hooks in steps 6 and 7), and keeps the current and previous
+release under ~/.local/state/glaeda/update.
 """
 from __future__ import annotations
 
@@ -93,6 +101,9 @@ RUNNER_SCRIPTS = HOME / "glaeda-runner/scripts"
 RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
 SOURCE_STAMP = ".glaeda-source.json"
 STAMP_BY = "glaeda-update"
+ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors
+HOOKS_TIMEOUT = 600  # the refresh checks the new hook against each runner's wrappers, a few seconds each
+CHILD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 class UpdateError(RuntimeError):
@@ -405,6 +416,17 @@ def tag_date(tag: str) -> str:
     return f"{day[:4]}-{day[4:6]}-{day[6:]}"
 
 
+def release_descends_from(gen: Path, commit: object) -> bool:
+    """The release's source is commit or descends from it (its ancestry.txt; a release without one: no)."""
+    if not isinstance(commit, str) or not SHA_RE.fullmatch(commit):
+        return False
+    try:
+        with open(gen / ANCESTRY, encoding="ascii") as file:
+            return any(line.strip() == commit for line in file)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS) -> str:
     """Step 6: bring the staged runner copy to the installed release when it is older. Returns what it did."""
     if not target.is_dir():
@@ -424,7 +446,7 @@ def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SC
     except (OSError, ValueError):
         stamp = None
     if (isinstance(stamp, dict) and stamp.get("by") != STAMP_BY
-            and str(stamp.get("date") or "")[:10] >= tag_date(tag)):
+            and str(stamp.get("date") or "")[:10] >= tag_date(tag) and not release_descends_from(gen, stamp.get("source"))):
         return f"kept (staged {str(stamp.get('source') or '?')[:12]} on {str(stamp['date'])[:10]}, not older than {tag})"
     for name in RUNNER_FILES:
         data, dest = (src / name).read_bytes(), target / name
@@ -437,6 +459,36 @@ def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SC
     tmp.write_text(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
     os.replace(tmp, target / SOURCE_STAMP)
     return f"refreshed to {tag}"
+
+
+def refresh_runner_hooks(copy: str, state_dir: Path = STATE_DIR, home: Path = HOME) -> str:
+    """Step 7: the runners' installed hook files follow the staged copy when it is the release's (step 6's
+    result `copy`). Runs the release's own glaeda-cmux-runner, so hooks come from the verified generation."""
+    if copy != "current" and not copy.startswith("refreshed to "):
+        return f"not refreshed (runner copy {copy.split(' (')[0]})"
+    tag = load_state(state_dir)["current"]
+    script = generation(state_dir, tag) / "glaeda/scripts/glaeda-cmux-runner"
+    if not script.is_file():
+        return f"{tag} has no runner script"
+    try:
+        result = subprocess.run([sys.executable, str(script), "--refresh-hooks", "--apply", "--output", "json"],
+                                capture_output=True, text=True, timeout=HOOKS_TIMEOUT, stdin=subprocess.DEVNULL,
+                                env={"HOME": str(home), "PATH": CHILD_PATH})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"not refreshed ({type(e).__name__})"
+    try:
+        doc = json.loads(result.stdout.strip().splitlines()[-1])
+        runners = doc["runners"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return f"not refreshed ({tag}'s glaeda-cmux-runner exited {result.returncode} with no refresh report)"
+    counts: dict[str, int] = {}
+    for runner in runners:
+        counts[str(runner.get("state"))] = counts.get(str(runner.get("state")), 0) + 1
+    if not counts:
+        return "no runners"
+    notes = sorted({str(r.get("note"))[:160] for r in runners if r.get("state") in ("blocked", "skipped") and r.get("note")})
+    return f"{tag}: " + ", ".join(f"{n} {state}" for state, n in sorted(counts.items())) + \
+        ("" if not notes else " (" + "; ".join(notes)[:400] + ")")
 
 
 def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
@@ -528,6 +580,10 @@ def main(argv: list[str] | None = None) -> int:
                         result["runnerScripts"] = refresh_runner_scripts()
                     except (OSError, ValueError, UpdateError) as e:  # never fails the update itself
                         result["runnerScripts"] = f"not refreshed ({type(e).__name__}: {e})"[:300]
+                    try:
+                        result["runnerHooks"] = refresh_runner_hooks(result["runnerScripts"])
+                    except (OSError, ValueError, UpdateError) as e:  # never fails the update itself
+                        result["runnerHooks"] = f"not refreshed ({type(e).__name__}: {e})"[:300]
         result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(json.dumps(result, sort_keys=True))
         return 1 if result["result"] in ("rolled-back", "refused") else 0

@@ -1,7 +1,8 @@
 # Over-the-air glaeda updates
 
 Status: live for the glaeda host tools (glaeda-disk, glaeda-worktree-reclaim, glaeda-fleet-cas-prune,
-glaeda-local-guard, glaeda-update itself, and the LaunchAgents and systemd units that run them). Owner issues: #525
+glaeda-local-guard, glaeda-update itself, and the LaunchAgents and systemd units that run them), and for
+the cmux runners' staged copy and hook files (step 3 below). Owner issues: #525
 (releases) and #149 (updates on hosts). The fleet runtime bundle is published in the same release
 but still installs through `glaeda-mini-fleet upgrade` (below).
 
@@ -42,6 +43,14 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    the tools it replaced (tools only; agents and config stay as the failed setup left them), and
    quarantines the failed release on that host. The health check plans from the channel files
    the run already fetched, so a network blip cannot fail a good release.
+
+   On a runner mini, each run (not only one that installs a release) then brings
+   `~/glaeda-runner/scripts` to the installed release when it is older and, while that copy is the
+   release's, the runners' `glaeda-hooks/glaeda-cmux-runner-hook` and `glaeda_reservation.py` too
+   (`glaeda-cmux-runner --refresh-hooks`, docs/CMUX_MINI_RUNNER.md 2c). Runners with a job wait for
+   the next run; the listener gates re-exec the new hook themselves. The hygiene archive's
+   `ancestry.txt` tells a copy an operator staged from an ancestor of the release (refreshed) from a
+   newer one (kept).
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit.
 5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,

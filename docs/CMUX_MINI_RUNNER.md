@@ -387,7 +387,19 @@ note names the release's own copy to run, and the release's plan labels are show
 `label drift (release ...)`. `--allow-stale` overrides. `glaeda-cmux-runner-fleet`
 writes the stamp when it stages; `glaeda-update` refreshes an older staged copy from the
 installed release every hour, and keeps a copy an operator staged on the release's day
-or later. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
+or later unless the release descends from the stamp's commit.
+
+**Hook fixes roll out without `--apply`.** While the staged copy is the installed
+release's, `glaeda-update` also runs that release's `glaeda-cmux-runner --refresh-hooks
+--apply` every hour. In each runner directory a receipt owns, it writes
+`glaeda-hooks/glaeda-cmux-runner-hook` and `glaeda_reservation.py` atomically (0755 and
+0644, the module first) and nothing else, so no registration token or org-admin access is
+needed. A runner with a `Runner.Worker` is left for the next run, and a runner whose
+wrappers pass arguments the new hook rejects (`--parse-only` under the wrapper's own
+interpreter) is blocked, since a rejected job-started would fail every job. The listener
+gate notices the new file and re-execs it, adopting its running `run.sh` ("the hook
+changed; reloading the gate"). Wrapper, label or LaunchAgent changes still need
+`--apply`. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
 `origin/main` in a temporary directory and does the whole relabel.
 
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
