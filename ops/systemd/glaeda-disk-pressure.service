@@ -1,0 +1,20 @@
+[Unit]
+Description=Reclaim idle build output and scratch space under disk pressure (glaeda-disk)
+Documentation=https://github.com/teamleaderleo/glaeda/blob/main/scripts/glaeda-disk
+# Linux counterpart of the macOS pressure LaunchAgent. Install as the owning user with
+#   scripts/glaeda-mini-setup --apply
+# which installs every unit in ops/systemd verbatim and enables the timers. Its preflight
+# reports lingering, which must be on to run without a login session.
+# Output goes to the journal (journalctl --user -u glaeda-disk-pressure); deletions are also
+# appended to ~/Projects/recovery/disk-reclaim/receipts.jsonl.
+
+[Service]
+Type=oneshot
+# Thresholds are a share of each filesystem, judged separately: on Big Red that is the
+# 937G root (act below ~140G free, stop at ~234G) and the 16G /tmp tmpfs (below ~2.3G, stop at ~3.8G).
+# %% is systemd's escape for a literal percent sign.
+ExecStart=%h/.local/bin/glaeda-disk --pressure --apply --top 0 --low 15%% --target 25%%
+Environment=PYTHONUNBUFFERED=1
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=30min

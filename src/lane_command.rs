@@ -4,7 +4,17 @@ use std::path::{Component, Path};
 use serde::Serialize;
 
 use crate::journal::{ExecutionLane, PlannedMutation};
+#[cfg(all(target_os = "linux", not(test)))]
+use crate::lane_executable::resolve_reviewed_environment_executable;
+#[cfg(all(test, target_os = "linux"))]
+use crate::lane_executable::test_environment_executable;
+#[cfg(target_os = "linux")]
+use crate::lane_executable::{
+    VerifiedEnvironmentExecutable, is_supported_environment_executable_path,
+};
 use crate::process::CommandSpec;
+#[cfg(target_os = "linux")]
+use crate::process::CommandValue;
 
 const APT_GET: &str = "/usr/bin/apt-get";
 const GROUPADD: &str = "/usr/sbin/groupadd";
@@ -13,9 +23,11 @@ const USERMOD: &str = "/usr/sbin/usermod";
 const INSTALL: &str = "/usr/bin/install";
 const MIN_SUBORDINATE_ID_COUNT: u64 = 65_536;
 const LOGINCTL: &str = "/usr/bin/loginctl";
+#[cfg(target_os = "linux")]
 const RUNUSER: &str = "/usr/sbin/runuser";
-const ENV: &str = "/usr/bin/env";
+#[cfg(target_os = "linux")]
 const PODMAN: &str = "/usr/bin/podman";
+#[cfg(target_os = "linux")]
 const GIT: &str = "/usr/bin/git";
 const NOLOGIN: &str = "/usr/sbin/nologin";
 
@@ -345,13 +357,21 @@ impl LaneCommand {
     ///
     /// # Errors
     ///
-    /// Returns an error when the action is not assigned to the runner-user lane.
+    /// Returns an error when the action is not assigned to the runner-user lane or no supported
+    /// reviewed environment executable is available.
+    #[cfg(target_os = "linux")]
     pub fn runner_podman_info(
         action: &PlannedMutation,
         runner: &RunnerUserContext,
     ) -> Result<Self, LaneCommandError> {
         require_lane(action, ExecutionLane::RunnerUser)?;
-        let spec = runner_user_spec(runner, PODMAN, &["info", "--format", "json"]);
+        let environment_program = reviewed_environment_program()?;
+        let spec = runner_user_spec(
+            runner,
+            environment_program.path(),
+            PODMAN,
+            &["info", "--format", "json"],
+        );
         Ok(Self::new(action, LaneCommandKind::RunnerPodmanInfo, spec))
     }
 
@@ -359,13 +379,21 @@ impl LaneCommand {
     ///
     /// # Errors
     ///
-    /// Returns an error when the action is not assigned to the runner-user lane.
+    /// Returns an error when the action is not assigned to the runner-user lane or no supported
+    /// reviewed environment executable is available.
+    #[cfg(target_os = "linux")]
     pub fn runner_podman_migrate(
         action: &PlannedMutation,
         runner: &RunnerUserContext,
     ) -> Result<Self, LaneCommandError> {
         require_lane(action, ExecutionLane::RunnerUser)?;
-        let spec = runner_user_spec(runner, PODMAN, &["system", "migrate"]);
+        let environment_program = reviewed_environment_program()?;
+        let spec = runner_user_spec(
+            runner,
+            environment_program.path(),
+            PODMAN,
+            &["system", "migrate"],
+        );
         Ok(Self::new(
             action,
             LaneCommandKind::RunnerPodmanMigrate,
@@ -377,14 +405,30 @@ impl LaneCommand {
     ///
     /// # Errors
     ///
-    /// Returns an error when the action is not assigned to the runner-user lane.
+    /// Returns an error when the action is not assigned to the runner-user lane or no supported
+    /// reviewed environment executable is available.
+    #[cfg(target_os = "linux")]
     pub fn runner_git_version(
         action: &PlannedMutation,
         runner: &RunnerUserContext,
     ) -> Result<Self, LaneCommandError> {
         require_lane(action, ExecutionLane::RunnerUser)?;
-        let spec = runner_user_spec(runner, GIT, &["--version"]);
-        Ok(Self::new(action, LaneCommandKind::RunnerGitVersion, spec))
+        let environment_program = reviewed_environment_program()?;
+        Ok(Self::runner_git_version_with_environment_program(
+            action,
+            runner,
+            environment_program,
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn runner_git_version_with_environment_program(
+        action: &PlannedMutation,
+        runner: &RunnerUserContext,
+        environment_program: VerifiedEnvironmentExecutable,
+    ) -> Self {
+        let spec = runner_user_spec(runner, environment_program.path(), GIT, &["--version"]);
+        Self::new(action, LaneCommandKind::RunnerGitVersion, spec)
     }
 
     #[must_use]
@@ -408,14 +452,38 @@ impl LaneCommand {
     }
 
     #[must_use]
+    #[cfg(target_os = "linux")]
+    pub(crate) fn runner_environment_program(&self) -> Option<&Path> {
+        match self.spec.arguments.get(3) {
+            Some(CommandValue::Plain(path))
+                if is_supported_environment_executable_path(Path::new(path)) =>
+            {
+                Some(Path::new(path))
+            }
+            Some(CommandValue::Plain(_)) | Some(CommandValue::Secret(_)) | None => None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(target_os = "linux")]
     pub fn required_programs(&self) -> Vec<&Path> {
         let outer = self.spec.program.as_path();
         match self.kind {
             LaneCommandKind::RunnerPodmanInfo | LaneCommandKind::RunnerPodmanMigrate => {
-                vec![outer, Path::new(ENV), Path::new(PODMAN)]
+                vec![
+                    outer,
+                    self.runner_environment_program()
+                        .expect("runner command stores reviewed environment program"),
+                    Path::new(PODMAN),
+                ]
             }
             LaneCommandKind::RunnerGitVersion => {
-                vec![outer, Path::new(ENV), Path::new(GIT)]
+                vec![
+                    outer,
+                    self.runner_environment_program()
+                        .expect("runner command stores reviewed environment program"),
+                    Path::new(GIT),
+                ]
             }
             LaneCommandKind::EnsureSystemUser => vec![outer, Path::new(NOLOGIN)],
             LaneCommandKind::AptInstall
@@ -475,8 +543,10 @@ fn subordinate_range_argument(start: u32, count: u32) -> Result<String, LaneComm
     Ok(format!("{start}-{end}"))
 }
 
+#[cfg(target_os = "linux")]
 fn runner_user_spec(
     runner: &RunnerUserContext,
+    environment_program: &Path,
     inner_program: &str,
     arguments: &[&str],
 ) -> CommandSpec {
@@ -484,7 +554,11 @@ fn runner_user_spec(
         .argument("--user")
         .argument(runner.username.as_str())
         .argument("--")
-        .argument(ENV)
+        .argument(
+            environment_program
+                .to_str()
+                .expect("reviewed environment program path is fixed UTF-8"),
+        )
         .argument("--ignore-environment")
         .argument(format!("HOME={}", runner.home()))
         .argument(format!("USER={}", runner.username.as_str()))
@@ -495,6 +569,19 @@ fn runner_user_spec(
         spec = spec.argument(*argument);
     }
     spec
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(not(test))]
+fn reviewed_environment_program() -> Result<VerifiedEnvironmentExecutable, LaneCommandError> {
+    resolve_reviewed_environment_executable().map_err(|_| {
+        LaneCommandError::single("no supported reviewed environment executable is available")
+    })
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn reviewed_environment_program() -> Result<VerifiedEnvironmentExecutable, LaneCommandError> {
+    Ok(test_environment_executable())
 }
 
 fn require_lane(action: &PlannedMutation, expected: ExecutionLane) -> Result<(), LaneCommandError> {
@@ -533,16 +620,19 @@ fn canonical_absolute_path(field: &str, value: &str) -> Result<String, LaneComma
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::path::Path;
 
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
+    #[cfg(target_os = "linux")]
     use crate::process::CommandValue;
 
     use super::{
-        APT_GET, ENV, GIT, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind,
-        LinuxAccountName, NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD,
-        USERMOD,
+        APT_GET, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
+        NOLOGIN, PackageName, RunnerUserContext, USERADD, USERMOD,
     };
+    #[cfg(target_os = "linux")]
+    use super::{GIT, PODMAN, RUNUSER};
 
     fn action(lane: ExecutionLane) -> PlannedMutation {
         PlannedMutation::new(
@@ -668,6 +758,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn system_user_command_requires_useradd_and_nologin_verification() {
         let root = action(ExecutionLane::Root);
         let account = account("project-runner");
@@ -681,11 +772,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn runner_user_commands_have_exact_runuser_boundary_and_environment() {
         let runner = RunnerUserContext::new(account("project-runner"), 1001, 1001, "/srv/runner")
             .expect("runner context");
         let action = action(ExecutionLane::RunnerUser);
         let podman = LaneCommand::runner_podman_info(&action, &runner).expect("podman command");
+        let environment_program = podman
+            .runner_environment_program()
+            .expect("runner env")
+            .to_str()
+            .expect("fixed reviewed path");
         assert_eq!(
             podman.spec().displayed_argv(),
             [
@@ -693,7 +790,7 @@ mod tests {
                 "--user",
                 "project-runner",
                 "--",
-                ENV,
+                environment_program,
                 "--ignore-environment",
                 "HOME=/srv/runner",
                 "USER=project-runner",
@@ -714,7 +811,7 @@ mod tests {
                 "--user",
                 "project-runner",
                 "--",
-                ENV,
+                environment_program,
                 "--ignore-environment",
                 "HOME=/srv/runner",
                 "USER=project-runner",
@@ -733,7 +830,7 @@ mod tests {
                 "--user",
                 "project-runner",
                 "--",
-                ENV,
+                environment_program,
                 "--ignore-environment",
                 "HOME=/srv/runner",
                 "USER=project-runner",

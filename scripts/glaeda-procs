@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""glaeda-procs: say why the Mac is lagging, and reclaim leaked idle test fixtures.
+
+    glaeda-procs                 report: host pressure, memory by owner, direct builds, leaks
+    glaeda-procs --json          the same report as one JSON object
+    glaeda-procs --apply         terminate reclaimable leaked fixtures, then report
+    glaeda-procs --min-age 1     hours an orphaned fixture must have existed (default 1)
+
+A lagging workstation is usually memory, not CPU: once swap fills, every process that
+touches a paged-out page blocks, the load average climbs into the hundreds while CPU
+stays moderate, and typing and clicking stall. The report names who holds the memory:
+
+- agent sessions (claude, codex) with everything they started, one line per session;
+- Apple builds (swift-build, swift-test, xcodebuild) started directly by a session rather
+  than by the CI runner or glaeda-apple, which is the documented way to hurt this machine;
+- leaked test fixtures: an orphan (parent is launchd) whose whole command line is a known
+  do-nothing fixture such as `python -c "import signal; signal.pause()"`, or a headless
+  Chrome/Chromium with a remote-debugging port and a --user-data-dir inside a temp dir, the
+  shape page-perf scratch scripts leave behind. Those spin rather than idle, so CPU is not a
+  criterion for them; one is skipped while anything holds a TCP connection to it, and after
+  it exits its temp profile is removed once no process names it. The temp roots are /tmp and
+  the per-user dir from `getconf DARWIN_USER_TEMP_DIR`, never $TMPDIR;
+- other orphaned commands that run more than once, which are often leaked services.
+
+Only leaked fixtures are ever signalled. Builds, sessions, services and duplicates are
+reported, never touched: a survivor gains no cleanup authority by surviving, and a slow
+build does not authorize killing another builder. Before each signal the process is
+observed again and must still have the same parent, owner, start time and command;
+anything else is skipped, and a failed observation is recorded as no-evidence rather than
+read as an exit. Every signal is preceded by an intent record in a JSONL receipt.
+
+Output carries PIDs, session ids, sizes and short labels, never full command lines,
+environments or file contents.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Callable
+
+SCHEMA = "glaeda-procs/v1"
+HOME = Path.home()
+DARWIN = sys.platform == "darwin"
+PS = "/bin/ps"
+SYSCTL = "/usr/sbin/sysctl"
+GETCONF = "/usr/bin/getconf"
+LSOF = "/usr/sbin/lsof"
+CHILD_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+TIMEOUT = 20
+GIB = 1024 ** 3
+KIB = 1024
+
+# Whole-command patterns of fixtures that exist only to be a live child and do nothing.
+# An orphan matching one is a leak from a test that lost its parent.
+FIXTURES = {
+    "python-signal-pause": re.compile(r"\S*[Pp]ython[0-9.]*\s+-c\s+['\"]?import signal; ?signal\.pause\(\)['\"]?"),
+    "sleep-forever": re.compile(r"(\S*/)?sleep\s+(infinity|\d{6,})"),
+}
+# Headless browsers that scratch perf scripts start and then lose. These spin rather than idle,
+# so CPU is not a criterion; the throwaway profile in a temp dir is what marks them as leaked.
+CHROMES = {"Google Chrome", "Google Chrome for Testing", "Chromium"}
+# The profile must end where an argument visibly ends: at the end, before the next flag, or before
+# a final URL. A path with a space cannot be delimited from ps output and is refused.
+USER_DATA_DIR = re.compile(r"(?:^|\s)--user-data-dir=(\S+)(?=$|\s-|\s(?:about|data|https?|file|chrome):\S*$)")
+SCRIPT_NAME = re.compile(r"[\w.-]{1,48}\.(?:py|mjs|cjs|js|ts|sh|rb)")
+AGENTS = {"claude", "codex"}
+APPLE_BUILDS = {"swift-build", "swift-test", "xcodebuild"}
+CI_RUNNERS = {"Runner.Listener", "Runner.Worker"}
+MANAGED_BUILDERS = re.compile(r"glaeda-apple|apple_build\.py")
+SESSION_ID = re.compile(r"--session-id[ =]([0-9a-fA-F-]{8,64})")
+PRESSURE = {"1": "normal", "2": "elevated", "4": "critical"}
+
+
+class NoEvidence(Exception):
+    """A required observation was unavailable; callers must not act on a partial picture."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Proc:
+    pid: int
+    ppid: int
+    uid: int
+    elapsed: int  # seconds
+    rss_kib: int
+    cpu: float
+    stat: str
+    start: str  # ps lstart, the identity component a reused PID cannot share
+    command: str
+    path: str = ""  # executable path from ps comm, which may contain spaces
+
+    @property
+    def exe(self) -> str:
+        return os.path.basename(self.path or self.command.split(" ", 1)[0])
+
+    def same_process(self, other: "Proc | None") -> bool:
+        return (other is not None and other.pid == self.pid and other.ppid == self.ppid
+                and other.uid == self.uid and other.start == self.start
+                and other.command == self.command)
+
+
+def run(argv: list[str]) -> str:
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT, env=CHILD_ENV)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise NoEvidence(f"{os.path.basename(argv[0])}: {e}") from e
+    if out.returncode != 0:
+        raise NoEvidence(f"{os.path.basename(argv[0])} exited {out.returncode}")
+    return out.stdout
+
+
+def parse_etime(text: str) -> int:
+    """ps etime: [[dd-]hh:]mm:ss."""
+    days, _, rest = text.rpartition("-")
+    parts = [int(p) for p in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, s = parts
+    return (int(days) if days else 0) * 86400 + h * 3600 + m * 60 + s
+
+
+PS_FIELDS = "pid=,ppid=,uid=,etime=,rss=,%cpu=,stat=,lstart=,command="
+
+
+def parse_ps(text: str) -> list[Proc]:
+    procs = []
+    for line in text.splitlines():
+        # lstart is always five tokens in the C locale: "Sat Sep 26 04:21:22 2026"
+        f = line.split(None, 12)
+        if len(f) < 12:
+            continue
+        try:
+            procs.append(Proc(int(f[0]), int(f[1]), int(f[2]), parse_etime(f[3]), int(f[4]),
+                              float(f[5]), f[6], " ".join(f[7:12]), f[12] if len(f) > 12 else ""))
+        except ValueError:
+            continue
+    return procs
+
+
+def parse_comm(text: str) -> dict[int, str]:
+    paths = {}
+    for line in text.splitlines():
+        pid, _, path = line.strip().partition(" ")
+        if pid.isdigit():
+            paths[int(pid)] = path.strip()
+    return paths
+
+
+def snapshot() -> list[Proc]:
+    procs = parse_ps(run([PS, "-axo", PS_FIELDS]))
+    # comm is a second column that may contain spaces, so it needs its own listing
+    paths = parse_comm(run([PS, "-axo", "pid=,comm="]))
+    procs = [dataclasses.replace(p, path=paths.get(p.pid, "")) for p in procs]
+    if not any(p.pid == os.getpid() for p in procs):  # we are alive, so ps must show us
+        raise NoEvidence("ps did not list this process")
+    return procs
+
+
+def observe(pid: int) -> Proc | None:
+    """The process now, None only when the PID provably no longer exists.
+
+    ps also exits non-zero on a timeout or spawn failure, so a failed listing is
+    confirmed with a null-signal probe before it is read as "gone".
+    """
+    try:
+        text = run([PS, "-o", PS_FIELDS, "-p", str(pid)])
+    except NoEvidence:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass
+        raise
+    found = parse_ps(text)
+    if not found:
+        raise NoEvidence("ps listed nothing for a live pid")
+    return found[0]  # identity uses start and command, not comm
+
+
+def debugger_connected(pid: int) -> bool:
+    """Whether anything holds an established TCP connection to this process."""
+    try:
+        out = subprocess.run([LSOF, "-a", "-n", "-P", "-p", str(pid), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"],
+                             capture_output=True, text=True, timeout=TIMEOUT, env=CHILD_ENV)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise NoEvidence(f"lsof: {e}") from e
+    if any(line.startswith("n") for line in out.stdout.splitlines()):
+        return True
+    if out.returncode == 1 and not out.stderr.strip():  # lsof's "nothing matched"
+        return False
+    raise NoEvidence(f"lsof exited {out.returncode}")
+
+
+def host() -> dict:
+    load1, load5, load15 = os.getloadavg()
+    info: dict = {"load": [round(load1, 1), round(load5, 1), round(load15, 1)],
+                  "cpus": os.cpu_count() or 1, "pressure": None,
+                  "memory_bytes": None, "swap_total_bytes": None, "swap_used_bytes": None}
+    if DARWIN:
+        def sysctl(name: str) -> str:
+            return run([SYSCTL, "-n", name]).strip()
+        with _quiet():
+            info["pressure"] = PRESSURE.get(sysctl("kern.memorystatus_vm_pressure_level"), "unknown")
+        with _quiet():
+            info["memory_bytes"] = int(sysctl("hw.memsize"))
+        with _quiet():
+            swap = dict(re.findall(r"(total|used) = ([0-9.]+)M", sysctl("vm.swapusage")))
+            info["swap_total_bytes"] = int(float(swap["total"]) * 1024 * KIB)
+            info["swap_used_bytes"] = int(float(swap["used"]) * 1024 * KIB)
+    else:
+        with _quiet():
+            mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.M))
+            info["memory_bytes"] = int(mem["MemTotal"]) * KIB
+            info["swap_total_bytes"] = int(mem["SwapTotal"]) * KIB
+            info["swap_used_bytes"] = (int(mem["SwapTotal"]) - int(mem["SwapFree"])) * KIB
+    return info
+
+
+class _quiet:
+    """Host facts are context; a missing one stays None rather than failing the report."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, kind, value, tb) -> bool:
+        return kind is not None and issubclass(kind, (NoEvidence, KeyError, ValueError, OSError))
+
+
+def verdict(h: dict) -> str:
+    if h["pressure"] in ("critical", "elevated"):
+        return h["pressure"]
+    swap_total, swap_used = h["swap_total_bytes"], h["swap_used_bytes"]
+    if swap_total and swap_used is not None and swap_used / swap_total > 0.75:
+        return "elevated"
+    if h["load"][0] > 4 * h["cpus"]:
+        return "elevated"
+    return "normal" if h["pressure"] == "normal" or not DARWIN else "unknown"
+
+
+def temp_roots() -> list[Path]:
+    """Shared /tmp plus the per-user macOS temp dir, never taken from the environment."""
+    roots = [Path(os.path.realpath("/tmp"))]
+    if DARWIN:
+        try:
+            user = run([GETCONF, "DARWIN_USER_TEMP_DIR"]).strip()
+        except NoEvidence:
+            user = ""
+        real = Path(os.path.realpath(user)) if user.startswith("/") else None
+        if real is not None and Path("/private/var/folders") in real.parents:
+            roots.append(real)
+    return roots
+
+
+def temp_profile(path: str, roots: list[Path]) -> Path | None:
+    """A throwaway profile strictly inside a temp root, else None."""
+    real = Path(os.path.realpath(path))
+    for root in roots:
+        if real != root and root in real.parents:
+            return real
+    return None
+
+
+def headless_chrome_profile(p: Proc, roots: list[Path]) -> Path | None:
+    words = p.command.split()
+    if p.exe not in CHROMES or not any(w.split("=")[0] == "--headless" for w in words):
+        return None
+    if not any(w.startswith("--remote-debugging-port=") for w in words):
+        return None
+    if p.command.count("--user-data-dir=") != 1:
+        return None
+    m = USER_DATA_DIR.search(p.command)
+    return temp_profile(m.group(1), roots) if m else None
+
+
+def fixture_kind(p: Proc, uid: int, min_age: int, roots: list[Path] | None = None) -> str | None:
+    if p.ppid != 1 or p.uid != uid or p.elapsed < min_age or p.stat.startswith("Z"):
+        return None
+    if headless_chrome_profile(p, temp_roots() if roots is None else roots):
+        return "headless-chrome"
+    if p.cpu >= 1.0:
+        return None
+    for kind, pattern in FIXTURES.items():
+        if pattern.fullmatch(p.command.strip()):
+            return kind
+    return None
+
+
+def label(p: Proc) -> str:
+    """Executable plus a script file name among the first arguments; never other arguments."""
+    words = p.command.split()
+    parts = [p.exe]
+    for w in words[1:4]:
+        if not w.startswith("-") and SCRIPT_NAME.fullmatch(os.path.basename(w)):
+            parts.append(os.path.basename(w))
+            break
+    return " ".join(parts)[:60]
+
+
+def survey(procs: list[Proc], uid: int, min_age_hours: float, roots: list[Path] | None = None) -> dict:
+    by_pid = {p.pid: p for p in procs}
+    children: dict[int, list[Proc]] = {}
+    for p in procs:
+        children.setdefault(p.ppid, []).append(p)
+
+    def ancestors(p: Proc):
+        seen = set()
+        while p.ppid in by_pid and p.ppid not in seen and p.ppid != p.pid:
+            seen.add(p.ppid)
+            p = by_pid[p.ppid]
+            yield p
+
+    def subtree_rss(p: Proc) -> int:
+        total, stack, seen = 0, [p], set()
+        while stack:
+            q = stack.pop()
+            if q.pid in seen:
+                continue
+            seen.add(q.pid)
+            total += q.rss_kib
+            stack.extend(children.get(q.pid, []))
+        return total
+
+    def is_agent(p: Proc) -> bool:
+        return p.exe in AGENTS and " app-server" not in p.command and " remote-control" not in p.command
+
+    def session(p: Proc) -> dict:
+        m = SESSION_ID.search(p.command)
+        return {"pid": p.pid, "agent": p.exe, "session_id": m.group(1) if m else None}
+
+    # memory by owner: each process counts toward its nearest agent session, else itself
+    owners: dict[int, dict] = {}
+    for p in procs:
+        if p.uid != uid:
+            continue
+        owner = p if is_agent(p) else next((a for a in ancestors(p) if is_agent(a)), None)
+        if owner is None:
+            continue
+        o = owners.setdefault(owner.pid, {**session(owner), "rss_bytes": 0, "processes": 0})
+        o["rss_bytes"] += p.rss_kib * KIB
+        o["processes"] += 1
+
+    builds = []
+    for p in procs:
+        if p.exe not in APPLE_BUILDS or any(a.exe in APPLE_BUILDS for a in ancestors(p)):
+            continue
+        chain = list(ancestors(p))
+        agent = next((a for a in chain if is_agent(a)), None)
+        if any(a.exe in CI_RUNNERS for a in chain):
+            origin = "ci-runner"
+        elif any(MANAGED_BUILDERS.search(a.command) for a in chain):
+            origin = "glaeda-apple"
+        else:
+            origin = "agent-session" if agent else "unattributed"
+        builds.append({"pid": p.pid, "tool": p.exe, "elapsed_seconds": p.elapsed,
+                       "rss_bytes": subtree_rss(p) * KIB, "origin": origin,
+                       "direct": origin in ("agent-session", "unattributed"),
+                       "session": session(agent) if agent else None})
+
+    min_age = int(min_age_hours * 3600)
+    roots = temp_roots() if roots is None else roots
+    fixtures = []
+    for p in procs:
+        kind = fixture_kind(p, uid, min_age, roots)
+        if kind:
+            # a browser's helpers are its children and exit with it
+            fixtures.append({"pid": p.pid, "kind": kind, "elapsed_seconds": p.elapsed,
+                             "rss_bytes": subtree_rss(p) * KIB, "_proc": p,
+                             "_profile": headless_chrome_profile(p, roots)})
+
+    orphan_counts: dict[str, list[int]] = {}
+    for p in procs:
+        if p.ppid == 1 and p.uid == uid and fixture_kind(p, uid, 0, roots) is None and not p.command.startswith("/Applications/") \
+                and not p.command.startswith("/System/") and not p.command.startswith("/usr/"):
+            orphan_counts.setdefault(p.command, []).append(p.pid)
+    duplicates = sorted(({"label": label(by_pid[pids[0]]), "count": len(pids), "pids": sorted(pids)}
+                         for pids in orphan_counts.values() if len(pids) > 1),
+                        key=lambda d: -d["count"])
+
+    return {
+        "sessions": sorted(owners.values(), key=lambda o: -o["rss_bytes"]),
+        "builds": sorted(builds, key=lambda b: -b["rss_bytes"]),
+        "fixtures": fixtures,
+        "duplicate_orphans": duplicates,
+    }
+
+
+def profile_in_use(profile: Path, procs: list[Proc]) -> bool:
+    """Conservative: any process naming the profile's directory, under any alias, uses it."""
+    for p in procs:
+        if profile.name in p.command:
+            return True
+        for word in p.command.split():
+            value = word.split("=", 1)[1] if word.startswith("-") and "=" in word else word
+            if value.startswith("/"):
+                real = Path(os.path.realpath(value))
+                if real == profile or profile in real.parents:
+                    return True
+    return False
+
+
+def remove_profile(profile: Path, uid: int, fresh: Callable[[], list[Proc]], wait_seconds: float = 0.0) -> str:
+    """Delete a leaked browser's temp profile once nothing names it any more."""
+    try:
+        st = profile.lstat()
+    except FileNotFoundError:
+        return "absent"
+    if not profile.is_dir() or profile.is_symlink() or st.st_uid != uid:
+        return "kept-not-owned"
+    if not (profile / "Local State").is_file():  # a Chrome profile, not a shared scratch dir
+        return "kept-not-a-profile"
+    deadline = time.monotonic() + wait_seconds
+    while True:  # helpers carry the profile too and exit shortly after the main process
+        try:
+            in_use = profile_in_use(profile, fresh())
+        except NoEvidence:
+            return "kept-no-evidence"
+        if not in_use:
+            break
+        if time.monotonic() >= deadline:
+            return "kept-in-use"
+        time.sleep(0.25)
+    shutil.rmtree(profile, ignore_errors=True)
+    return "removed" if not profile.exists() else "partial"
+
+
+def apply(fixtures: list[dict], receipt: Path,
+          look: Callable[[int], Proc | None] = observe,
+          kill: Callable[[int, int], None] = os.kill,
+          wait_seconds: float = 2.0,
+          fresh: Callable[[], list[Proc]] = snapshot,
+          connected: Callable[[int], bool] = debugger_connected,
+          uid: int | None = None) -> list[dict]:
+    """SIGTERM each fixture whose identity is unchanged; record what happened.
+
+    macOS has no pidfd, so a PID could in principle be reused between the final
+    identity check and the signal; the lstart and command comparison makes that window
+    a few milliseconds wide. An intent record is written before every signal.
+    """
+    uid = os.getuid() if uid is None else uid
+    results = []
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(record: dict) -> None:
+        with receipt.open("a") as out:
+            out.write(json.dumps(record) + "\n")
+
+    for f in fixtures:
+        proc: Proc = f["_proc"]
+        profile: Path | None = f.get("_profile")
+        record = {"schema": SCHEMA, "time": int(time.time()), "pid": proc.pid, "start": proc.start,
+                  "kind": f["kind"], "rss_bytes": f["rss_bytes"]}
+        try:
+            outcome = reap(proc, profile, record, write, look, kill, connected,
+                           wait_seconds * 5 if profile else wait_seconds)
+        except NoEvidence:
+            outcome = "no-evidence"
+        record = {**record, "time": int(time.time()), "outcome": outcome}
+        if profile:
+            # only a process this run verified, signalled and saw exit releases its profile
+            record["profile"] = (remove_profile(profile, uid, fresh, wait_seconds * 5)
+                                 if outcome == "terminated" else "kept")
+        write(record)
+        results.append(record)
+    return results
+
+
+def reap(proc: Proc, profile: Path | None, record: dict, write: Callable[[dict], None],
+         look: Callable[[int], Proc | None], kill: Callable[[int, int], None],
+         connected: Callable[[int], bool], wait_seconds: float) -> str:
+    # lsof can take seconds under load, so it runs before, not between, check and signal
+    if profile and connected(proc.pid):
+        return "skipped-in-use"  # something still drives this browser
+    now = look(proc.pid)
+    if now is None:
+        return "gone"
+    if not proc.same_process(now):
+        return "skipped-changed"
+    write({**record, "outcome": "signalling"})
+    try:
+        kill(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "skipped-permission"
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        now = look(proc.pid)
+        if now is None or not proc.same_process(now) or now.stat.startswith("Z"):
+            return "terminated"
+        time.sleep(0.05)
+    return "survived"
+
+
+def gib(n: int | None) -> str:
+    return "?" if n is None else f"{n / GIB:.1f} GiB"
+
+
+def age(seconds: int) -> str:
+    if seconds >= 86400:
+        return f"{seconds // 86400}d{seconds % 86400 // 3600}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{seconds % 3600 // 60}m"
+    return f"{seconds // 60}m"
+
+
+def render(h: dict, s: dict, applied: list[dict] | None, top: int) -> str:
+    lines = []
+    swap = (f"swap {gib(h['swap_used_bytes'])} of {gib(h['swap_total_bytes'])}"
+            if h["swap_total_bytes"] else "swap ?")
+    lines.append(f"host {verdict(h)}: memory pressure {h['pressure'] or '?'}, {swap}, "
+                 f"load {h['load'][0]:g} on {h['cpus']} cores, RAM {gib(h['memory_bytes'])}")
+    if s["sessions"]:
+        total = sum(o["rss_bytes"] for o in s["sessions"])
+        lines.append(f"\nagent sessions: {len(s['sessions'])} holding {gib(total)}")
+        for o in s["sessions"][:top]:
+            sid = f" {o['session_id'][:8]}" if o["session_id"] else ""
+            lines.append(f"  {gib(o['rss_bytes']):>9}  {o['agent']}{sid} (pid {o['pid']}), {o['processes']} processes")
+    direct = [b for b in s["builds"] if b["direct"]]
+    if s["builds"]:
+        lines.append(f"\nApple builds: {len(s['builds'])}, {len(direct)} started directly")
+        for b in s["builds"]:
+            who = b["origin"]
+            if b["session"]:
+                sid = b["session"]["session_id"]
+                who = f"{b['session']['agent']} {sid[:8] if sid else ''} (pid {b['session']['pid']})".replace("  ", " ")
+            lines.append(f"  {gib(b['rss_bytes']):>9}  {b['tool']} pid {b['pid']}, {age(b['elapsed_seconds'])}, from {who}")
+        if direct:
+            lines.append("  direct builds belong on fork CI or glaeda-apple; ask the owning session to stop them")
+    if applied is not None:
+        done = [r for r in applied if r["outcome"] in ("terminated", "gone")]
+        freed = sum(r["rss_bytes"] for r in done)
+        lines.append(f"\nleaked fixtures: terminated {len(done)} of {len(applied)}, about {gib(freed)} released")
+        for r in applied:
+            if r["outcome"] not in ("terminated", "gone"):
+                lines.append(f"  pid {r['pid']}: {r['outcome']}")
+    elif s["fixtures"]:
+        kinds: dict[str, int] = {}
+        for f in s["fixtures"]:
+            kinds[f["kind"]] = kinds.get(f["kind"], 0) + 1
+        rss = sum(f["rss_bytes"] for f in s["fixtures"])
+        summary = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+        lines.append(f"\nleaked fixtures: {len(s['fixtures'])} orphaned idle ({summary}), {gib(rss)}; "
+                     "glaeda-procs --apply terminates them")
+    if s["duplicate_orphans"]:
+        lines.append("\norphaned commands running more than once (reported only):")
+        for d in s["duplicate_orphans"][:top]:
+            lines.append(f"  {d['count']}x {d['label']}  pids {' '.join(map(str, d['pids'][:6]))}")
+    return "\n".join(lines)
+
+
+def public(s: dict) -> dict:
+    return {**s, "fixtures": [{k: v for k, v in f.items() if not k.startswith("_")} for f in s["fixtures"]]}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="terminate reclaimable leaked fixtures")
+    ap.add_argument("--json", action="store_true", help="print one JSON object")
+    ap.add_argument("--min-age", type=float, default=1.0, metavar="HOURS",
+                    help="hours an orphaned fixture must have existed (default 1)")
+    ap.add_argument("--top", type=int, default=10, help="rows per section (default 10)")
+    ap.add_argument("--receipt", type=Path, default=HOME / "Projects/recovery/proc-reclaim/receipts.jsonl")
+    a = ap.parse_args(argv)
+    try:
+        procs = snapshot()
+    except NoEvidence as e:
+        print(f"glaeda-procs: cannot observe processes ({e}); nothing done", file=sys.stderr)
+        return 2
+    h = host()
+    s = survey(procs, os.getuid(), a.min_age)
+    applied = apply(s["fixtures"], a.receipt) if a.apply else None
+    if a.json:
+        out = {"schema": SCHEMA, "host": {**h, "verdict": verdict(h)}, **public(s)}
+        if applied is not None:
+            out["applied"] = applied
+        print(json.dumps(out, indent=2))
+    else:
+        print(render(h, s, applied, a.top))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

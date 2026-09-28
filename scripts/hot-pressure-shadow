@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Compare one measured hot run with exact-work historical pressure observations.
+
+The report is descriptive and observation-only. It does not validate workload semantics, choose
+the comparison key, persist history, wait, retry, schedule, admit, route, or mutate execution.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import stat
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+HOT_RUN_SCHEMA_VERSION = 6
+MAX_RECEIPT_BYTES = 256 * 1024
+MAX_BASELINE_SAMPLES = 64
+MIN_RANGE_SAMPLES = 2
+SHA256_PREFIX = "sha256:"
+
+
+@dataclass(frozen=True)
+class MetricSpec:
+    name: str
+    unit: str
+    path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Sample:
+    comparison_key: str
+    digest: str
+    metrics: dict[str, int | float | None]
+
+
+METRICS = (
+    MetricSpec("command_elapsed_seconds", "seconds", ("elapsed_seconds",)),
+    MetricSpec(
+        "command_plus_preparation_elapsed_seconds",
+        "seconds",
+        ("command_plus_preparation_elapsed_seconds",),
+    ),
+    MetricSpec(
+        "preparation_elapsed_seconds",
+        "seconds",
+        ("preparation_elapsed_seconds",),
+    ),
+    MetricSpec("user_cpu_seconds", "seconds", ("user_cpu_seconds",)),
+    MetricSpec("system_cpu_seconds", "seconds", ("system_cpu_seconds",)),
+    MetricSpec("max_rss_kib", "kibibytes", ("max_rss_kib",)),
+    MetricSpec(
+        "available_memory_delta_bytes",
+        "bytes",
+        (
+            "machine_observation",
+            "interval",
+            "memory",
+            "available_bytes_delta",
+        ),
+    ),
+    MetricSpec(
+        "swap_used_delta_bytes",
+        "bytes",
+        (
+            "machine_observation",
+            "interval",
+            "memory",
+            "swap_used_bytes_delta",
+        ),
+    ),
+    *tuple(
+        MetricSpec(
+            f"{kind}_{pressure_class}_stall_fraction",
+            "fraction_of_command_elapsed",
+            (
+                "machine_observation",
+                "interval",
+                "pressure",
+                kind,
+                pressure_class,
+                "stall_fraction_of_command_elapsed",
+            ),
+        )
+        for kind in ("cpu", "memory", "io")
+        for pressure_class in ("some", "full")
+    ),
+)
+
+FINDING_PRESSURE_METRICS = (
+    "cpu_some_stall_fraction",
+    "memory_some_stall_fraction",
+    "io_some_stall_fraction",
+)
+FINDING_LATENCY_METRIC = "command_plus_preparation_elapsed_seconds"
+
+
+def canonical_sha256(value: object) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("receipt comparison key is absent")
+    digest = value.removeprefix(SHA256_PREFIX)
+    if (
+        not value.startswith(SHA256_PREFIX)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise RuntimeError("receipt comparison key is not canonical SHA-256")
+    return value
+
+
+def nested_value(document: dict[str, Any], path: tuple[str, ...]) -> object:
+    value: object = document
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def optional_number(value: object, *, signed: bool = False) -> int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError("receipt metric is not numeric")
+    if not math.isfinite(value) or (not signed and value < 0):
+        raise RuntimeError("receipt metric is outside its supported range")
+    return value
+
+
+def optional_integer(value: object, *, signed: bool = False) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError("receipt integer metric is not an integer")
+    if not signed and value < 0:
+        raise RuntimeError("receipt integer metric is outside its supported range")
+    return value
+
+
+def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError("measurement input contains duplicate JSON keys")
+        result[key] = value
+    return result
+
+
+def read_bounded_document(path: Path) -> tuple[dict[str, Any], str]:
+    details = path.lstat()
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+        raise RuntimeError("measurement input is not one regular no-follow file")
+    if details.st_size > MAX_RECEIPT_BYTES:
+        raise RuntimeError("measurement input exceeds the bounded size")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    with os.fdopen(descriptor, "rb") as source:
+        opened = os.fstat(source.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            details.st_dev,
+            details.st_ino,
+        ):
+            raise RuntimeError("measurement input changed before observation")
+        raw = source.read(MAX_RECEIPT_BYTES + 1)
+        final = os.fstat(source.fileno())
+    if len(raw) > MAX_RECEIPT_BYTES:
+        raise RuntimeError("measurement input exceeds the bounded size")
+    if (
+        final.st_size,
+        final.st_mtime_ns,
+        final.st_ctime_ns,
+    ) != (
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    ):
+        raise RuntimeError("measurement input changed during observation")
+    try:
+        document = json.loads(raw, object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("measurement input is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("measurement input is not one JSON object")
+    canonical = json.dumps(
+        document,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    return document, digest
+
+
+def read_sample(path: Path) -> Sample:
+    document, digest = read_bounded_document(path)
+    if (
+        document.get("schema_version") != HOT_RUN_SCHEMA_VERSION
+        or document.get("document_type") != "glaeda-hot-run-measurement"
+        or document.get("authority") != "developer_observation_only"
+    ):
+        raise RuntimeError("measurement input is not a schema-v6 hot-run observation")
+    if document.get("exit_code") != 0 or document.get("completion_reason") != "exited":
+        raise RuntimeError("failed or interrupted measurements cannot enter history")
+    comparison_key = canonical_sha256(document.get("comparison_key"))
+    interval = nested_value(document, ("machine_observation", "interval"))
+    if not isinstance(interval, dict) or interval.get("duration_basis") != "command_elapsed":
+        raise RuntimeError("measurement input has no compatible pressure interval")
+    elapsed = optional_number(document.get("elapsed_seconds"))
+    interval_elapsed = optional_number(interval.get("elapsed_seconds"))
+    if elapsed is None or interval_elapsed != elapsed:
+        raise RuntimeError("measurement pressure interval has a different duration basis")
+
+    metrics: dict[str, int | float | None] = {}
+    for metric in METRICS:
+        value = nested_value(document, metric.path)
+        if metric.name in {
+            "available_memory_delta_bytes",
+            "swap_used_delta_bytes",
+        }:
+            metrics[metric.name] = optional_integer(value, signed=True)
+        elif metric.name == "max_rss_kib":
+            metrics[metric.name] = optional_integer(value)
+        else:
+            metrics[metric.name] = optional_number(value)
+    if metrics[FINDING_LATENCY_METRIC] is None:
+        raise RuntimeError("measurement input has no complete request latency")
+    return Sample(comparison_key, digest, metrics)
+
+
+def relation(
+    current: int | float | None,
+    lower: int | float | None,
+    upper: int | float | None,
+    observed_samples: int,
+) -> str:
+    if (
+        current is None
+        or lower is None
+        or upper is None
+        or observed_samples < MIN_RANGE_SAMPLES
+    ):
+        return "unknown"
+    if current < lower:
+        return "below_observed_range"
+    if current > upper:
+        return "above_observed_range"
+    return "within_observed_range"
+
+
+def metric_report(
+    metric: MetricSpec, current: Sample, baselines: list[Sample]
+) -> dict[str, object]:
+    values = [
+        value
+        for sample in baselines
+        if (value := sample.metrics[metric.name]) is not None
+    ]
+    lower = min(values) if values else None
+    upper = max(values) if values else None
+    current_value = current.metrics[metric.name]
+    return {
+        "unit": metric.unit,
+        "current": current_value,
+        "observed_baseline_samples": len(values),
+        "observed_lower": lower,
+        "observed_upper": upper,
+        "relation": relation(current_value, lower, upper, len(values)),
+    }
+
+
+def shadow_finding(history_state: str, metrics: dict[str, dict[str, object]]) -> str:
+    if history_state == "insufficient_history":
+        return "not_evaluated"
+    finding_metrics = (FINDING_LATENCY_METRIC, *FINDING_PRESSURE_METRICS)
+    if any(metrics[name]["relation"] == "unknown" for name in finding_metrics):
+        return "partial_observation"
+    latency_above = (
+        metrics[FINDING_LATENCY_METRIC]["relation"] == "above_observed_range"
+    )
+    pressure_above = any(
+        metrics[name]["relation"] == "above_observed_range"
+        for name in FINDING_PRESSURE_METRICS
+    )
+    if latency_above and pressure_above:
+        return "slower_with_higher_pressure"
+    if latency_above:
+        return "slower_outside_observed_range"
+    if pressure_above:
+        return "higher_pressure_outside_observed_range"
+    return "within_or_below_observed_range"
+
+
+def build_report(current: Sample, baselines: list[Sample]) -> dict[str, object]:
+    if len(baselines) > MAX_BASELINE_SAMPLES:
+        raise RuntimeError("baseline history exceeds the bounded sample count")
+    seen = {current.digest}
+    for sample in baselines:
+        if sample.comparison_key != current.comparison_key:
+            raise RuntimeError("measurement comparison keys do not match")
+        if sample.digest in seen:
+            raise RuntimeError("duplicate measurement cannot inflate history")
+        seen.add(sample.digest)
+    history_state = (
+        "observed_range"
+        if len(baselines) >= MIN_RANGE_SAMPLES
+        else "insufficient_history"
+    )
+    metrics = {
+        metric.name: metric_report(metric, current, baselines) for metric in METRICS
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "document_type": "glaeda-hot-pressure-shadow-report",
+        "authority": "observation_only",
+        "comparison_key": current.comparison_key,
+        "baseline_samples": len(baselines),
+        "minimum_range_samples": MIN_RANGE_SAMPLES,
+        "history_state": history_state,
+        "shadow_finding": shadow_finding(history_state, metrics),
+        "metrics": metrics,
+        "limits": {
+            "comparison_basis": "caller_owned_exact_digest",
+            "range_kind": "descriptive_min_max",
+            "semantic_validation": "not_performed",
+            "policy_authority": "none",
+        },
+    }
+
+
+def format_number(value: object) -> str:
+    if value is None:
+        return "unknown"
+    if isinstance(value, float):
+        return f"{value:.9g}"
+    return str(value)
+
+
+def render_human(report: dict[str, object]) -> str:
+    metrics = report["metrics"]
+    assert isinstance(metrics, dict)
+    lines = [
+        "hot pressure shadow",
+        f"authority: {report['authority']}",
+        f"comparison key: {report['comparison_key']}",
+        (
+            f"history: {report['history_state']} "
+            f"({report['baseline_samples']}/{report['minimum_range_samples']} minimum samples)"
+        ),
+        f"finding: {report['shadow_finding']}",
+    ]
+    for metric in METRICS:
+        observation = metrics[metric.name]
+        assert isinstance(observation, dict)
+        lines.append(
+            f"{metric.name}: current={format_number(observation['current'])} "
+            f"observed={format_number(observation['observed_lower'])}.."
+            f"{format_number(observation['observed_upper'])} "
+            f"samples={observation['observed_baseline_samples']} "
+            f"relation={observation['relation']} unit={observation['unit']}"
+        )
+    lines.append("policy authority: none")
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", choices=("human", "json"), default="human")
+    parser.add_argument("--current", type=Path, required=True)
+    parser.add_argument("--baseline", type=Path, action="append", default=[])
+    arguments = parser.parse_args()
+    if len(arguments.baseline) > MAX_BASELINE_SAMPLES:
+        parser.error(f"at most {MAX_BASELINE_SAMPLES} baselines are supported")
+    try:
+        current = read_sample(arguments.current)
+        baselines = [read_sample(path) for path in arguments.baseline]
+        report = build_report(current, baselines)
+    except OSError:
+        print("hot-pressure-shadow error: bounded receipt read failed", file=sys.stderr)
+        return 2
+    except (RuntimeError, ValueError) as error:
+        print(f"hot-pressure-shadow error: {error}", file=sys.stderr)
+        return 2
+    if arguments.output == "json":
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(render_human(report), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

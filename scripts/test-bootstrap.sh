@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 temporary_root=$(mktemp -d)
 trap 'rm -rf "$temporary_root"' EXIT
 
-fixture="$temporary_root/smolrunner"
+fixture="$temporary_root/glaeda"
 mkdir -p "$fixture/scripts" "$temporary_root/bin" "$temporary_root/home"
 cp "$repo_root/scripts/bootstrap" "$fixture/scripts/bootstrap"
 cp -R "$repo_root/scripts/workspace_bootstrap" "$fixture/scripts/workspace_bootstrap"
@@ -13,7 +13,7 @@ chmod +x "$fixture/scripts/bootstrap"
 
 cat > "$fixture/Cargo.toml" <<'TOML'
 [package]
-name = "smolrunner"
+name = "glaeda"
 version = "0.1.0"
 edition = "2024"
 TOML
@@ -47,21 +47,44 @@ write_tool rustfmt 'rustfmt 1.8.0-stable (fixture)'
 write_unavailable_tool just
 write_unavailable_tool podman
 
-(
-  cd "$fixture"
-  git init -q
-  git config user.name 'SmolRunner Bootstrap Test'
-  git config user.email 'bootstrap-test@example.invalid'
-  git remote add origin https://github.com/teamleaderleo/smolrunner.git
-  git add Cargo.toml Cargo.lock .gitignore scripts/bootstrap scripts/workspace_bootstrap
-  git commit -qm fixture
-)
+ambient_git_config="$temporary_root/ambient-gitconfig"
+git config --file "$ambient_git_config" commit.gpgSign true
+git config --file "$ambient_git_config" init.defaultBranch hostile
+export GIT_CONFIG_GLOBAL="$ambient_git_config"
+
+fixture_git() {
+  env -i \
+    PATH=/usr/bin:/bin \
+    HOME="$temporary_root/home" \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 \
+    LANG=C \
+    LC_ALL=C \
+    git -C "$fixture" "$@"
+}
+
+fixture_git init -q -b main
+fixture_git config user.name 'Glaeda Bootstrap Test'
+fixture_git config user.email 'bootstrap-test@example.invalid'
+fixture_git remote add origin https://github.com/teamleaderleo/glaeda.git
+fixture_git add Cargo.toml Cargo.lock .gitignore scripts/bootstrap scripts/workspace_bootstrap
+fixture_git commit -qm fixture
 
 export PATH="$temporary_root/bin:/usr/bin:/bin"
 export HOME="$temporary_root/home"
 unset CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR
 
-lock_before=$(sha256sum "$fixture/Cargo.lock" | awk '{print $1}')
+sha256_file() {
+  python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
+lock_before=$(sha256_file "$fixture/Cargo.lock")
 
 # Unset defaults remain missing, owned by nobody, and safe to repeat.
 (
@@ -78,6 +101,9 @@ first = json.loads((root / "first.json").read_text())
 second = json.loads((root / "second.json").read_text())
 commit = json.loads((root / "commit.json").read_text())
 assert first["state"] == "ready_with_declared_deviations"
+assert first["repository_root"]["repository"] == "teamleaderleo/glaeda"
+assert first["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert "repository_remote_differs" not in {item["code"] for item in first["deviations"]}
 assert first["source"]["clean_before"] is True
 assert first["source"]["clean_after"] is True
 assert first["source"]["cleanliness_unchanged"] is True
@@ -128,6 +154,49 @@ caches = {item["name"]: item for item in receipt["declared_cache_paths"]}
 assert caches["cargo-target"]["path_class"] == "repository-local"
 assert caches["cargo-home"]["path_class"] == "external-private"
 assert all(item["ownership"] == "current-user" for item in caches.values())
+PY
+
+# Current Glaeda identity stays distinct from historical and foreign remotes.
+fixture_git remote set-url origin https://github.com/teamleaderleo/smolrunner.git
+(
+  cd "$fixture"
+  ./scripts/bootstrap --output json > "$temporary_root/legacy-repository.json"
+)
+python3 - "$temporary_root/legacy-repository.json" <<'PY'
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert receipt["state"] == "ready_with_declared_deviations"
+assert receipt["repository_root"]["repository"] == "teamleaderleo/smolrunner"
+assert receipt["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert {item["code"] for item in receipt["deviations"]} == {"repository_remote_differs"}
+PY
+
+fixture_git remote set-url origin https://github.com/alternate-owner/glaeda.git
+(
+  cd "$fixture"
+  ./scripts/bootstrap --output json > "$temporary_root/alternate-repository.json"
+)
+python3 - "$temporary_root/alternate-repository.json" <<'PY'
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert receipt["state"] == "ready_with_declared_deviations"
+assert receipt["repository_root"]["repository"] == "alternate-owner/glaeda"
+assert receipt["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert {item["code"] for item in receipt["deviations"]} == {"repository_remote_differs"}
+PY
+
+fixture_git remote set-url origin https://github.com/teamleaderleo/glaeda.git
+(
+  cd "$fixture"
+  ./scripts/bootstrap --output json > "$temporary_root/restored-repository.json"
+)
+python3 - "$temporary_root/restored-repository.json" <<'PY'
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert receipt["state"] == "ready"
+assert receipt["repository_root"]["repository"] == "teamleaderleo/glaeda"
+assert receipt["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert receipt["deviations"] == []
 PY
 
 # Relative configured paths resolve against the repository root.
@@ -331,5 +400,5 @@ PY
 rmdir "$fixture/nested"
 
 [[ -z $(git -C "$fixture" status --porcelain=v1 --untracked-files=all) ]]
-[[ "$lock_before" == "$(sha256sum "$fixture/Cargo.lock" | awk '{print $1}')" ]]
+[[ "$lock_before" == "$(sha256_file "$fixture/Cargo.lock")" ]]
 printf 'workspace bootstrap tests passed\n'

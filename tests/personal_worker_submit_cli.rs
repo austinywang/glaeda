@@ -7,26 +7,26 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
     ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
     PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
     PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
     PersonalWorkerTerminalTombstone, encode_personal_worker_store_document,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use rustix::fs::{FlockOperation, flock};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE: u64 = 10_000_000;
@@ -340,11 +340,11 @@ fn load_store(root: &TempRoot) -> PersonalWorkerStoreDocument {
         .expect("current document")
 }
 
-fn run_smolrunner(arguments: &[OsString]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_smolrunner"))
+fn run_glaeda(arguments: &[OsString]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_glaeda"))
         .args(arguments)
         .output()
-        .expect("run installed smolrunner binary")
+        .expect("run installed glaeda binary")
 }
 
 fn json_output(output: &Output) -> serde_json::Value {
@@ -361,7 +361,7 @@ fn submission_applies_once_replays_and_is_readable() {
     create_store(&root, &empty_document());
     let mut arguments = SubmitArgs::exact("request-one");
 
-    let applied = run_smolrunner(&arguments.command(&root, "json"));
+    let applied = run_glaeda(&arguments.command(&root, "json"));
     assert!(applied.status.success(), "{:?}", applied.stderr);
     let applied_json = json_output(&applied);
     assert_eq!(applied_json["disposition"], "applied");
@@ -376,7 +376,7 @@ fn submission_applies_once_replays_and_is_readable() {
     assert_eq!(document.queue().generation.get(), 2);
     assert_eq!(document.queue().queued, vec![request("request-one")]);
 
-    let queue = run_smolrunner(&[
+    let queue = run_glaeda(&[
         OsString::from("--output"),
         OsString::from("json"),
         OsString::from("queue"),
@@ -393,7 +393,7 @@ fn submission_applies_once_replays_and_is_readable() {
     assert_eq!(queue_json["total"], 1);
     assert_eq!(queue_json["items"][0]["request_id"], "request-one");
 
-    let job = run_smolrunner(&[
+    let job = run_glaeda(&[
         OsString::from("--output"),
         OsString::from("json"),
         OsString::from("job"),
@@ -412,7 +412,7 @@ fn submission_applies_once_replays_and_is_readable() {
     let before_duplicate = current_bytes(&root);
     arguments.revision = "2".to_owned();
     arguments.generation = "2".to_owned();
-    let duplicate = run_smolrunner(&arguments.command(&root, "json"));
+    let duplicate = run_glaeda(&arguments.command(&root, "json"));
     assert!(duplicate.status.success(), "{:?}", duplicate.stderr);
     let duplicate_json = json_output(&duplicate);
     assert_eq!(duplicate_json["disposition"], "duplicate");
@@ -422,7 +422,7 @@ fn submission_applies_once_replays_and_is_readable() {
     assert_eq!(duplicate_json["new_queue_generation"], 2);
     assert_eq!(current_bytes(&root), before_duplicate);
 
-    let human = run_smolrunner(&arguments.command(&root, "human"));
+    let human = run_glaeda(&arguments.command(&root, "human"));
     assert!(human.status.success());
     let human = String::from_utf8(human.stdout).expect("human output");
     assert!(human.contains("Personal worker submission"));
@@ -436,7 +436,7 @@ fn conflicts_stale_expectations_and_invalid_inputs_are_bounded() {
     create_store(&root, &empty_document());
     let applied_args = SubmitArgs::exact("request-one");
     assert!(
-        run_smolrunner(&applied_args.command(&root, "json"))
+        run_glaeda(&applied_args.command(&root, "json"))
             .status
             .success()
     );
@@ -446,7 +446,7 @@ fn conflicts_stale_expectations_and_invalid_inputs_are_bounded() {
     conflict.revision = "2".to_owned();
     conflict.generation = "2".to_owned();
     conflict.commit = "c".repeat(40);
-    let output = run_smolrunner(&conflict.command(&root, "json"));
+    let output = run_glaeda(&conflict.command(&root, "json"));
     assert!(!output.status.success());
     assert_eq!(json_output(&output)["kind"], "conflict");
     assert_eq!(current_bytes(&root), unchanged);
@@ -459,7 +459,7 @@ fn conflicts_stale_expectations_and_invalid_inputs_are_bounded() {
         args.revision = revision.to_owned();
         args.generation = generation.to_owned();
         args.request_id = "request-two".to_owned();
-        let output = run_smolrunner(&args.command(&root, "json"));
+        let output = run_glaeda(&args.command(&root, "json"));
         assert!(!output.status.success());
         assert_eq!(json_output(&output)["kind"], expected_kind);
         assert_eq!(current_bytes(&root), unchanged);
@@ -488,7 +488,7 @@ fn conflicts_stale_expectations_and_invalid_inputs_are_bounded() {
             "commit" => args.commit = value.to_owned(),
             _ => unreachable!(),
         }
-        let output = run_smolrunner(&args.command(&root, "json"));
+        let output = run_glaeda(&args.command(&root, "json"));
         assert!(!output.status.success());
         let public = String::from_utf8(output.stdout).expect("public JSON");
         let json: serde_json::Value = serde_json::from_str(&public).expect("error JSON");
@@ -504,8 +504,7 @@ fn existing_active_and_terminal_identities_do_not_create_queue_entries() {
     let active_root = TempRoot::new("active");
     create_store(&active_root, &active_document());
     let active_before = current_bytes(&active_root);
-    let exact_active =
-        run_smolrunner(&SubmitArgs::exact("occupied-one").command(&active_root, "json"));
+    let exact_active = run_glaeda(&SubmitArgs::exact("occupied-one").command(&active_root, "json"));
     assert!(exact_active.status.success());
     assert_eq!(json_output(&exact_active)["disposition"], "duplicate");
     assert_eq!(current_bytes(&active_root), active_before);
@@ -513,7 +512,7 @@ fn existing_active_and_terminal_identities_do_not_create_queue_entries() {
 
     let mut conflicting_active = SubmitArgs::exact("occupied-one");
     conflicting_active.commit = "c".repeat(40);
-    let output = run_smolrunner(&conflicting_active.command(&active_root, "json"));
+    let output = run_glaeda(&conflicting_active.command(&active_root, "json"));
     assert!(!output.status.success());
     assert_eq!(json_output(&output)["kind"], "conflict");
     assert_eq!(current_bytes(&active_root), active_before);
@@ -521,8 +520,7 @@ fn existing_active_and_terminal_identities_do_not_create_queue_entries() {
     let terminal_root = TempRoot::new("terminal");
     create_store(&terminal_root, &terminal_document());
     let terminal_before = current_bytes(&terminal_root);
-    let terminal =
-        run_smolrunner(&SubmitArgs::exact("terminal-one").command(&terminal_root, "json"));
+    let terminal = run_glaeda(&SubmitArgs::exact("terminal-one").command(&terminal_root, "json"));
     assert!(!terminal.status.success());
     assert_eq!(json_output(&terminal)["kind"], "conflict");
     assert_eq!(current_bytes(&terminal_root), terminal_before);
@@ -532,8 +530,7 @@ fn existing_active_and_terminal_identities_do_not_create_queue_entries() {
 #[test]
 fn missing_store_busy_lock_and_staged_recovery_follow_existing_contracts() {
     let missing = TempRoot::new("missing");
-    let missing_output =
-        run_smolrunner(&SubmitArgs::exact("missing-one").command(&missing, "json"));
+    let missing_output = run_glaeda(&SubmitArgs::exact("missing-one").command(&missing, "json"));
     assert!(!missing_output.status.success());
     assert_eq!(json_output(&missing_output)["kind"], "missing_store");
     assert!(!missing.store_directory().exists());
@@ -547,7 +544,7 @@ fn missing_store_busy_lock_and_staged_recovery_follow_existing_contracts() {
         .open(busy.store_directory().join("store.lock"))
         .expect("open writer lock");
     flock(&lock, FlockOperation::NonBlockingLockExclusive).expect("hold writer lock");
-    let busy_output = run_smolrunner(&SubmitArgs::exact("busy-one").command(&busy, "json"));
+    let busy_output = run_glaeda(&SubmitArgs::exact("busy-one").command(&busy, "json"));
     assert!(!busy_output.status.success());
     assert_eq!(json_output(&busy_output)["kind"], "busy");
     assert_eq!(current_bytes(&busy), before_busy);
@@ -571,7 +568,7 @@ fn missing_store_busy_lock_and_staged_recovery_follow_existing_contracts() {
     args.revision = "2".to_owned();
     args.generation = "2".to_owned();
     args.observed_at = (BASE + 1_000).to_string();
-    let output = run_smolrunner(&args.command(&recovered, "json"));
+    let output = run_glaeda(&args.command(&recovered, "json"));
     assert!(output.status.success(), "{:?}", output.stderr);
     let json = json_output(&output);
     assert_eq!(json["old_revision"], 2);

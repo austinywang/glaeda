@@ -6,6 +6,15 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
 
+mod admission;
+pub use admission::{
+    AdmittedHotStateCandidate, HotStateAdmissionAuthority, HotStateAdmissionContext,
+    HotStateAdmissionMismatchField, HotStateAdmissionRefusal, HotStateAdmissionSemantics,
+    HotStateAdmissionTarget, HotStateBindingRef, HotStateFamilyAdmissionEvidence,
+    HotStateFamilyRef, HotStateFamilyStanding, HotStateForbiddenReason, HotStateQuarantineReason,
+    HotStateResourceDisposition, HotStateReusableState, admit_family_evidence,
+};
+
 pub const HOT_STATE_PATH_POLICY_SCHEMA_VERSION: u8 = 1;
 const MAX_IDENTIFIER_BYTES: usize = 96;
 const MAX_POLICY_MODES: usize = 4;
@@ -263,19 +272,23 @@ impl HotStatePathPolicy {
 
     /// Select the first reviewed sharing mode supported by current capabilities.
     ///
-    /// Reused modes are eligible only when the observed candidate identity exactly matches the
-    /// policy identity. `private_empty` remains a safe fallback for absent or stale candidate state.
+    /// Reused modes require one opaque admission that remains exact for the current context,
+    /// policy path class/reuse identity, and capability-observation generation.
+    /// `private_empty` remains the safe fallback when admission is absent or stale.
     ///
     /// # Errors
     ///
     /// Returns a bounded error only if the policy identity digest cannot be represented.
     pub fn select(
         &self,
-        candidate_identity: Option<&HotStateReuseIdentity>,
+        current_context: &HotStateAdmissionContext,
+        admitted_candidate: Option<AdmittedHotStateCandidate<'_>>,
         capabilities: &HotStateCapabilityObservation,
         publisher_role: HotStatePublisherRole,
     ) -> Result<HotStateSelectionReceipt, HotStatePolicyError> {
-        let identity_matches = candidate_identity == Some(&self.expected_identity);
+        let identity_matches = admitted_candidate.is_some_and(|candidate| {
+            candidate.matches_selector(current_context, self, capabilities)
+        });
         let mut selected = None;
         for mode in &self.modes {
             if mode.reuses_existing_bytes() && !identity_matches {
@@ -445,10 +458,15 @@ const fn invalid_digest() -> HotStatePolicyError {
 
 #[cfg(test)]
 mod tests {
+    use crate::project_catalog::ProjectIdentity;
+
     use super::{
-        HotStateCapabilityGenerationId, HotStateCapabilityObservation, HotStateGenerationId,
-        HotStatePathClassId, HotStatePathPolicy, HotStatePublisherRole, HotStateReuseIdentity,
-        HotStateSelection, HotStateSharingMode,
+        AdmittedHotStateCandidate, HotStateAdmissionContext, HotStateAdmissionMismatchField,
+        HotStateAdmissionRefusal, HotStateAdmissionSemantics, HotStateAdmissionTarget,
+        HotStateBindingRef, HotStateCapabilityGenerationId, HotStateCapabilityObservation,
+        HotStateFamilyRef, HotStateGenerationId, HotStatePathClassId, HotStatePathPolicy,
+        HotStatePublisherRole, HotStateReusableState, HotStateReuseIdentity, HotStateSelection,
+        HotStateSelectionReceipt, HotStateSharingMode,
     };
 
     fn generation(value: &str) -> HotStateGenerationId {
@@ -481,9 +499,72 @@ mod tests {
         )
     }
 
+    fn admission_context_for_project(
+        path_class: &str,
+        reuse_identity: HotStateReuseIdentity,
+        project: &str,
+    ) -> HotStateAdmissionContext {
+        HotStateAdmissionContext::new(
+            HotStateAdmissionTarget::new(
+                HotStateFamilyRef::new(generation("family-1")),
+                HotStateBindingRef::new(generation("binding-1")),
+                ProjectIdentity::parse(project).unwrap(),
+                HotStatePathClassId::parse(path_class).unwrap(),
+            ),
+            HotStateAdmissionSemantics::new(
+                reuse_identity,
+                generation("profile-1"),
+                generation("validator-1"),
+                generation("platform-1"),
+            ),
+            HotStateReusableState::SealedImmutable,
+        )
+    }
+
+    fn admission_context(
+        path_class: &str,
+        reuse_identity: HotStateReuseIdentity,
+    ) -> HotStateAdmissionContext {
+        admission_context_for_project(
+            path_class,
+            reuse_identity,
+            "github.com/teamleaderleo/smolrunner",
+        )
+    }
+
+    fn admitted_candidate<'proof>(
+        proof: &'proof (),
+        context: &HotStateAdmissionContext,
+        policy: &HotStatePathPolicy,
+        capabilities: &HotStateCapabilityObservation,
+    ) -> AdmittedHotStateCandidate<'proof> {
+        super::admission::admitted_candidate_for_test(
+            proof,
+            context.clone(),
+            context,
+            policy,
+            capabilities,
+        )
+        .unwrap()
+    }
+
+    fn select_admitted(
+        policy: &HotStatePathPolicy,
+        context: &HotStateAdmissionContext,
+        capabilities: &HotStateCapabilityObservation,
+        publisher_role: HotStatePublisherRole,
+    ) -> HotStateSelectionReceipt {
+        let proof = ();
+        let candidate = admitted_candidate(&proof, context, policy, capabilities);
+        policy
+            .select(context, Some(candidate), capabilities, publisher_role)
+            .unwrap()
+    }
+
     #[test]
     fn source_policy_uses_overlay_then_cow_then_empty_in_reviewed_order() {
         let expected = identity("a");
+        let context = admission_context("source-view", expected.clone());
         let policy = HotStatePathPolicy::new(
             HotStatePathClassId::parse("source-view").unwrap(),
             expected.clone(),
@@ -495,13 +576,12 @@ mod tests {
         )
         .unwrap();
 
-        let overlay = policy
-            .select(
-                Some(&expected),
-                &capabilities(true, true, true, false, false),
-                HotStatePublisherRole::ConsumerOnly,
-            )
-            .unwrap();
+        let overlay = select_admitted(
+            &policy,
+            &context,
+            &capabilities(true, true, true, false, false),
+            HotStatePublisherRole::ConsumerOnly,
+        );
         assert_eq!(
             overlay.selection(),
             HotStateSelection::Selected {
@@ -510,13 +590,12 @@ mod tests {
             }
         );
 
-        let cow = policy
-            .select(
-                Some(&expected),
-                &capabilities(false, true, true, false, false),
-                HotStatePublisherRole::ConsumerOnly,
-            )
-            .unwrap();
+        let cow = select_admitted(
+            &policy,
+            &context,
+            &capabilities(false, true, true, false, false),
+            HotStatePublisherRole::ConsumerOnly,
+        );
         assert_eq!(
             cow.selection(),
             HotStateSelection::Selected {
@@ -525,13 +604,12 @@ mod tests {
             }
         );
 
-        let empty = policy
-            .select(
-                Some(&expected),
-                &capabilities(false, false, true, false, false),
-                HotStatePublisherRole::ConsumerOnly,
-            )
-            .unwrap();
+        let empty = select_admitted(
+            &policy,
+            &context,
+            &capabilities(false, false, true, false, false),
+            HotStatePublisherRole::ConsumerOnly,
+        );
         assert_eq!(
             empty.selection(),
             HotStateSelection::Selected {
@@ -545,6 +623,8 @@ mod tests {
     fn stale_candidate_cannot_reuse_bytes_but_can_fall_back_to_private_empty() {
         let expected = identity("a");
         let stale = identity("b");
+        let context = admission_context("source-view", expected.clone());
+        let stale_context = admission_context("source-view", stale);
         let policy = HotStatePathPolicy::new(
             HotStatePathClassId::parse("source-view").unwrap(),
             expected,
@@ -555,10 +635,27 @@ mod tests {
             ],
         )
         .unwrap();
+        let current_capabilities = capabilities(true, true, true, false, false);
+        let proof = ();
+        let refusal = super::admission::admitted_candidate_for_test(
+            &proof,
+            stale_context,
+            &context,
+            &policy,
+            &current_capabilities,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal,
+            HotStateAdmissionRefusal::Mismatch {
+                field: HotStateAdmissionMismatchField::Source
+            }
+        );
         let receipt = policy
             .select(
-                Some(&stale),
-                &capabilities(true, true, true, false, false),
+                &context,
+                None,
+                &current_capabilities,
                 HotStatePublisherRole::ConsumerOnly,
             )
             .unwrap();
@@ -575,6 +672,7 @@ mod tests {
     #[test]
     fn compiler_policy_never_selects_overlay_when_policy_does_not_offer_it() {
         let expected = identity("a");
+        let context = admission_context("compiler-output", expected.clone());
         let policy = HotStatePathPolicy::new(
             HotStatePathClassId::parse("compiler-output").unwrap(),
             expected.clone(),
@@ -584,13 +682,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let receipt = policy
-            .select(
-                Some(&expected),
-                &capabilities(true, false, true, false, false),
-                HotStatePublisherRole::ConsumerOnly,
-            )
-            .unwrap();
+        let receipt = select_admitted(
+            &policy,
+            &context,
+            &capabilities(true, false, true, false, false),
+            HotStatePublisherRole::ConsumerOnly,
+        );
         assert_eq!(
             receipt.selection(),
             HotStateSelection::Selected {
@@ -603,6 +700,7 @@ mod tests {
     #[test]
     fn shared_mutable_publish_requires_explicit_publisher_authority() {
         let expected = identity("a");
+        let context = admission_context("package-store", expected.clone());
         let policy = HotStatePathPolicy::new(
             HotStatePathClassId::parse("package-store").unwrap(),
             expected.clone(),
@@ -610,22 +708,20 @@ mod tests {
         )
         .unwrap();
 
-        let denied = policy
-            .select(
-                Some(&expected),
-                &capabilities(false, false, false, true, false),
-                HotStatePublisherRole::PublisherEnabled,
-            )
-            .unwrap();
+        let denied = select_admitted(
+            &policy,
+            &context,
+            &capabilities(false, false, false, true, false),
+            HotStatePublisherRole::PublisherEnabled,
+        );
         assert_eq!(denied.selection(), HotStateSelection::Unavailable);
 
-        let accepted = policy
-            .select(
-                Some(&expected),
-                &capabilities(false, false, false, true, true),
-                HotStatePublisherRole::PublisherEnabled,
-            )
-            .unwrap();
+        let accepted = select_admitted(
+            &policy,
+            &context,
+            &capabilities(false, false, false, true, true),
+            HotStatePublisherRole::PublisherEnabled,
+        );
         assert_eq!(
             accepted.selection(),
             HotStateSelection::Selected {
@@ -638,6 +734,7 @@ mod tests {
     #[test]
     fn missing_candidate_skips_reuse_modes() {
         let expected = identity("a");
+        let context = admission_context("dependency-view", expected.clone());
         let policy = HotStatePathPolicy::new(
             HotStatePathClassId::parse("dependency-view").unwrap(),
             expected,
@@ -649,6 +746,7 @@ mod tests {
         .unwrap();
         let receipt = policy
             .select(
+                &context,
                 None,
                 &capabilities(true, false, true, false, false),
                 HotStatePublisherRole::ConsumerOnly,
@@ -686,16 +784,22 @@ mod tests {
     #[test]
     fn receipt_serialization_exposes_digest_not_raw_identity_tokens() {
         let expected = identity("secretish");
+        let context = admission_context("index-state", expected.clone());
         let policy = HotStatePathPolicy::new(
             HotStatePathClassId::parse("index-state").unwrap(),
             expected.clone(),
             vec![HotStateSharingMode::PrivateCow],
         )
         .unwrap();
+        let current_capabilities = capabilities(false, true, false, false, false);
+        let proof = ();
+        let candidate = admitted_candidate(&proof, &context, &policy, &current_capabilities);
+        assert_eq!(format!("{candidate:?}"), "<admitted-hot-state-candidate>");
         let receipt = policy
             .select(
-                Some(&expected),
-                &capabilities(false, true, false, false, false),
+                &context,
+                Some(candidate),
+                &current_capabilities,
                 HotStatePublisherRole::ConsumerOnly,
             )
             .unwrap();
@@ -703,5 +807,11 @@ mod tests {
         assert!(json.contains("sha256:"));
         assert!(!json.contains("source-secretish"));
         assert!(!json.contains("toolchain-secretish"));
+        assert!(!json.contains("family-1"));
+        assert!(!json.contains("binding-1"));
+        assert!(!json.contains("github.com/teamleaderleo/smolrunner"));
+        assert!(!json.contains("profile-1"));
+        assert!(!json.contains("validator-1"));
+        assert!(!json.contains("platform-1"));
     }
 }

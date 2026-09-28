@@ -2,7 +2,7 @@
 
 ## Outcome
 
-SmolRunner should make the operator's development machine feel reproducible instead of precious.
+Glaeda should make the operator's development machine feel reproducible instead of precious.
 
 The target experience has two complementary promises:
 
@@ -12,19 +12,19 @@ The target experience has two complementary promises:
 The memorable journey should converge on something like:
 
 ```text
-bootstrap SmolRunner
+bootstrap Glaeda
 -> restore operator catalog
 -> converge developer environment
--> smolrunner project enter smolrunner
+-> glaeda project enter glaeda
 -> work
 ```
 
 The ordinary path should feel like:
 
 ```text
-smolrunner project enter smolrunner
-smolrunner project enter codex
-smolrunner project enter quarry
+glaeda project enter glaeda
+glaeda project enter codex
+glaeda project enter quarry
 ```
 
 `project enter` resolves the logical project, starts the developer environment when required, materializes a checkout when absent, and lands the operator at the repository root.
@@ -62,7 +62,7 @@ The acceptance thought experiment is intentionally severe: the previous Mac and 
 
 A successful recovery should be able to reconstruct or report:
 
-- the reviewed SmolRunner installation identity;
+- the reviewed Glaeda installation identity;
 - the operator's accepted workstation/project catalog;
 - required host dependencies;
 - the persistent developer Lima environment and reviewed profile;
@@ -79,7 +79,7 @@ The machine becomes increasingly disposable because the durable recovery inputs 
 
 Expected durable inputs include:
 
-- SmolRunner release/install identity;
+- Glaeda release/install identity;
 - versioned operator catalog;
 - pinned developer-VM/template inputs;
 - repository remotes and immutable source identities;
@@ -108,7 +108,7 @@ Keep logical identity separate from physical location.
 
 ### Project
 
-A `ProjectIdentity` names the logical repository independent of where it is checked out. A canonical example is:
+A `ProjectIdentity` names the logical repository independent of where it is checked out. The GitHub repository slug stays `teamleaderleo/smolrunner` until the repository-rename lane moves it, so the current canonical example remains:
 
 ```text
 github.com/teamleaderleo/smolrunner
@@ -121,7 +121,7 @@ Canonical identity should derive from a reviewed source-remote normalization con
 An alias is an ergonomic bounded name such as:
 
 ```text
-smolrunner
+glaeda
 codex
 quarry
 ```
@@ -152,7 +152,7 @@ An execution is one disposable attempt bound to exact source and job identities.
 
 ## Operator catalog
 
-SmolRunner should define a versioned, portable, secret-free catalog format. The real operator catalog may live in a separate repository chosen by the operator; the public SmolRunner repository owns only the schema and redacted examples.
+Glaeda should define a versioned, portable, secret-free catalog format. The real operator catalog may live in a separate repository chosen by the operator; the public Glaeda repository owns only the schema and redacted examples.
 
 Illustrative schema direction:
 
@@ -160,7 +160,7 @@ Illustrative schema direction:
 version: 1
 projects:
   - id: github.com/teamleaderleo/smolrunner
-    aliases: [smolrunner]
+    aliases: [glaeda]
     source: https://github.com/teamleaderleo/smolrunner.git
     materialization: developer
     restore: eager
@@ -181,18 +181,18 @@ Unknown schema versions and unknown authority-bearing fields fail closed.
 Exact names may evolve, but the intended vocabulary is compact:
 
 ```text
-smolrunner home plan
-smolrunner home converge
-smolrunner home status
+glaeda home plan
+glaeda home converge
+glaeda home status
 
-smolrunner project list
-smolrunner project adopt PATH
-smolrunner project ensure PROJECT
-smolrunner project enter PROJECT
-smolrunner project status PROJECT
-smolrunner project move PROJECT TARGET_CLASS
-smolrunner project forget PROJECT
-smolrunner project prune
+glaeda project list
+glaeda project adopt PATH
+glaeda project ensure PROJECT
+glaeda project enter PROJECT
+glaeda project status PROJECT
+glaeda project move PROJECT TARGET_CLASS
+glaeda project forget PROJECT
+glaeda project prune
 ```
 
 ### `home plan`
@@ -228,7 +228,7 @@ This is the ergonomic center of the feature.
 A standalone child process cannot change the parent zsh working directory. A later tiny shell helper may therefore provide a shorter experience such as:
 
 ```text
-p smolrunner
+p glaeda
 ```
 
 For a Mac-native checkout the helper can perform a real parent-shell `cd`. For a guest-owned checkout it can enter the developer guest at the resolved repository root.
@@ -237,7 +237,7 @@ The namespace must work before shell integration exists.
 
 ## Generation and reconciliation model
 
-Database ACID terminology does not map cleanly onto Git clones, VM lifecycle, network fetches, and filesystem publication. The useful model is closer to Nix/OSTree generation switching combined with SmolRunner's existing compare-and-swap and reconciliation contracts.
+Database ACID terminology does not map cleanly onto Git clones, VM lifecycle, network fetches, and filesystem publication. The useful model is closer to Nix/OSTree generation switching combined with Glaeda's existing compare-and-swap and reconciliation contracts.
 
 The core invariant is:
 
@@ -258,7 +258,7 @@ A new checkout, migrated materialization, or successor metadata document is prep
 
 ### Prove before publication
 
-Before a successor can become current, SmolRunner proves the evidence relevant to that resource, such as:
+Before a successor can become current, Glaeda proves the evidence relevant to that resource, such as:
 
 - canonical repository remote;
 - exact Git worktree root;
@@ -320,6 +320,42 @@ Adoption does not silently:
 - delete a fork;
 - rewrite remotes.
 
+The current read-only checkout evidence can be exercised directly on Unix hosts without catalog,
+adoption, residency, or mutation authority:
+
+```bash
+glaeda-project-observe --checkout /absolute/canonical/checkout --output json
+```
+
+This compiled front door runs the existing bounded offline checkout observer once and emits a
+path-private typed report. It requires an explicit canonical absolute checkout, disables Git
+credentials, hooks, lazy fetch, replacement objects, and ambient configuration; configured
+clean/process filters are refused. It requires two coherent snapshots. The report includes exact
+commit/tree, canonical GitHub source when one is provable, dirty/untracked/local-only recovery
+evidence, worktree/submodule topology, and one opaque physical materialization identity. It does
+not establish catalog adoption, a resident-project lease, cache validity, remote freshness,
+cleanup authority, or permission to execute inside the checkout.
+
+Once a canonical checkout and exact object IDs are already known, `repo-query/v1` collapses the
+common review-evidence sequence into one bounded local observation:
+
+```bash
+glaeda-repo-query \
+  --checkout /absolute/canonical/checkout \
+  --project github.com/owner/repository \
+  --base COMPLETE_BASE_OID \
+  --head COMPLETE_HEAD_OID \
+  --tree COMPLETE_HEAD_TREE_OID \
+  --output json
+```
+
+It returns exact object and merge-base identity, ancestry, commit count, per-file numstat, a digest
+of the complete patch, and the patch itself only when it fits the caller's bounded ceiling. Optional
+fixed fields add literal exact-tree grep, bounded blob reads, bounded path history, and object
+existence/type/size. It does not accept refs or arbitrary Git arguments, fetch, mutate, publish,
+establish remote freshness, or grant reuse authority. See the [Big Red controlled
+result](experiments/resident-repo-query-big-red-2026-08-31.md).
+
 A separate migration operation may later stage a successor in the managed developer guest and switch accepted materialization only after the successor is proven.
 
 ## Lazy materialization
@@ -367,7 +403,7 @@ Agents do not infer ownership from directory names, construct arbitrary checkout
 
 Reproducibility has a hard boundary: Git and declarations can recreate only state that reached a durable source.
 
-SmolRunner should make the gap visible. Candidate risk classes include:
+Glaeda should make the gap visible. Candidate risk classes include:
 
 - dirty tracked files;
 - untracked files outside an approved backup path;
@@ -389,7 +425,7 @@ Research examples:
 - Home Manager manages user environments and can integrate with nix-darwin.
 - OSTree uses Git-like content-addressed filesystem trees and atomic deployment transitions.
 
-SmolRunner should borrow their successful contracts without becoming another package manager or operating-system distribution. A future workstation convergence adapter may invoke Nix/nix-darwin, Homebrew, or another mature dependency manager after supply-chain, upgrade, rollback, and uninstall policy is explicit.
+Glaeda should borrow their successful contracts without becoming another package manager or operating-system distribution. A future workstation convergence adapter may invoke Nix/nix-darwin, Homebrew, or another mature dependency manager after supply-chain, upgrade, rollback, and uninstall policy is explicit.
 
 Relevant upstream references:
 
@@ -452,7 +488,7 @@ Editor/cmux integration follows after the core command works.
 
 Define and prove a reviewed bootstrap journey that can:
 
-- establish SmolRunner;
+- establish Glaeda;
 - retrieve and validate the operator catalog;
 - converge required host dependencies;
 - create/restore the developer environment;
@@ -467,9 +503,9 @@ Destructive cleanup remains separate.
 
 1. An existing Mac with many mixed clones and forks under `~/Projects` can be discovered without mutation.
 2. Selected checkouts can be adopted in place while dirty and local-only work remains intact and visible.
-3. An empty developer guest can execute `project enter smolrunner`, materialize the canonical repository, and enter its root.
-4. Killing SmolRunner during clone/staging leaves the predecessor generation authoritative and the candidate recoverable or cleanable.
-5. Killing SmolRunner immediately after generation publication leaves the successor authoritative and cleanup debt explicit.
+3. An empty developer guest can execute `project enter glaeda`, materialize the canonical repository, and enter its root.
+4. Killing Glaeda during clone/staging leaves the predecessor generation authoritative and the candidate recoverable or cleanable.
+5. Killing Glaeda immediately after generation publication leaves the successor authoritative and cleanup debt explicit.
 6. Two agents racing from one catalog revision produce exactly one publication and one stale/conflict outcome.
 7. Alias collisions block instead of guessing.
 8. A blank replacement Mac can reconstruct the declared developer environment and eager projects after reviewed install/auth steps.
@@ -490,4 +526,4 @@ The first version does not require:
 - persistent developer materializations as hostile-CI workers;
 - unrestricted agent shell authority over the Mac.
 
-A future Finder-visible or `~/SmolRunner/...` portal could make the namespace even more magical. Identity, materialization, generation safety, and `project enter` should prove themselves first.
+A future Finder-visible or `~/Glaeda/...` portal could make the namespace even more magical. Identity, materialization, generation safety, and `project enter` should prove themselves first.

@@ -1,0 +1,181 @@
+name: Cultist advisory
+
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cultist-advisory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diff:
+    name: change-scoped evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    env:
+      CULTIST_REV: 3d5311e8f78ff95a8b112b36c92eb7d92bb290b3
+
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --no-self-update
+
+      # CULTIST_REV is a fixed commit, so the built binary is identical on
+      # every run. Install it into a stable path and cache it instead of
+      # rebuilding it from source each time. Only main writes the entry;
+      # pull requests restore main's copy, so one cache serves every branch.
+      - name: Restore pinned Cultist binary
+        id: cultist-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/glaeda-cultist-install
+          key: cultist-bin-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ env.CULTIST_REV }}
+
+      - name: Install exact Cultist revision
+        if: ${{ steps.cultist-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          cargo install \
+            --git https://github.com/teamleaderleo/cultist \
+            --rev "$CULTIST_REV" \
+            --locked \
+            --root "$HOME/.cache/glaeda-cultist-install" \
+            cargo-cultist
+
+      - name: Save pinned Cultist binary
+        if: ${{ steps.cultist-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/glaeda-cultist-install
+          key: cultist-bin-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ env.CULTIST_REV }}
+
+      - name: Put pinned Cultist on PATH
+        run: |
+          set -euo pipefail
+          test -x "$HOME/.cache/glaeda-cultist-install/bin/cargo-cultist"
+          echo "$HOME/.cache/glaeda-cultist-install/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE"
+          else
+            base="$PUSH_BASE"
+          fi
+
+          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "comparison base is not an exact Git commit" >&2
+            exit 1
+          fi
+          git cat-file -e "$base^{commit}"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "revision=$base" >> "$GITHUB_OUTPUT"
+
+      # Start with the measured quiet surface. A repository-wide scan currently
+      # raises deliberate naming partitions and would add noise rather than signal.
+      - name: Inspect change-scoped Rust evidence
+        if: steps.base.outputs.available == 'true'
+        env:
+          CULTIST_BASE: ${{ steps.base.outputs.revision }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/cultist-diff.json"
+          cargo-cultist diff --base "$CULTIST_BASE" --format json . > "$report"
+          jq -e '
+            .schema_version == 1 and
+            .analysis == "diff-precedent" and
+            (.claims | type == "array") and
+            (.findings | type == "array")
+          ' "$report" >/dev/null
+          jq '{schema_version, analysis, claims, findings}' "$report"
+
+          {
+            echo "## Cultist change-scoped evidence"
+            echo
+            echo "- Cultist revision: \`$CULTIST_REV\`"
+            echo "- Comparison base: \`$CULTIST_BASE\`"
+            echo "- Claims: $(jq '.claims | length' "$report")"
+            echo "- Findings: $(jq '.findings | length' "$report")"
+            echo
+            echo "This check is advisory and does not run the noisier repository-wide scan."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Detect changed workflow surface
+        id: workflow-scope
+        if: steps.base.outputs.available == 'true'
+        env:
+          CULTIST_BASE: ${{ steps.base.outputs.revision }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$CULTIST_BASE"...HEAD -- .github/workflows; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # This analyzer is useful only when the workflow surface changes. Keeping
+      # it scoped avoids repeating a correct but irrelevant negative on every
+      # ordinary Rust change.
+      - name: Inspect CI test-filter evidence
+        if: steps.workflow-scope.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/cultist-ci-tests.json"
+          cargo-cultist ci-tests --format json . > "$report"
+          jq -e '
+            .schema_version == 1 and
+            .analysis == "ci-test-filter-inventory" and
+            (.claims | type == "array") and
+            (.findings | type == "array")
+          ' "$report" >/dev/null
+          jq '{schema_version, analysis, claims, findings}' "$report"
+
+          {
+            echo
+            echo "## Cultist CI test-filter evidence"
+            echo
+            echo "- Claims: $(jq '.claims | length' "$report")"
+            echo "- Findings: $(jq '.findings | length' "$report")"
+            echo
+            echo "This advisory inventory ran because the workflow surface changed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain unavailable comparison base
+        if: steps.base.outputs.available != 'true'
+        run: |
+          {
+            echo "## Cultist change-scoped evidence"
+            echo
+            echo "No non-zero comparison commit was available for this event."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -28,7 +28,7 @@ XFS/reflink is a later experiment. It enters only when the ext4 treatment leaves
 
 ## Physical prerequisite
 
-The treatment becomes runnable only after current reviewed SmolRunner authority can compose the full current chain:
+The treatment becomes runnable only after current reviewed Glaeda authority can compose the full current chain:
 
 ```text
 #639 / #565 P2 descriptor-bound host observation
@@ -72,7 +72,7 @@ Keep these outside the persistent project filesystem:
 - physical disk/filesystem correlation authority;
 - accepted source identity and fresh Git/source proof authority;
 - verification/result authority;
-- SmolRunner execution/journal/reconciliation state;
+- Glaeda execution/journal/reconciliation state;
 - credentials, GitHub tokens, JIT material, provider capability state, and host secrets;
 - performance receipts and the accepted experiment decision;
 - canonical cold-reconstruction inputs.
@@ -85,7 +85,7 @@ Freeze one exact Quarry commit/tree before opening timings. Use the same commit/
 
 ### 1. Task known -> first useful command
 
-`task_known` is the accepted SmolRunner task generation with exact project/source/trust/workload identity.
+`task_known` is the accepted Glaeda task generation with exact project/source/trust/workload identity.
 
 The first useful command is:
 
@@ -235,7 +235,7 @@ cargo run --bin quarry_hot_project_dogfood -- plan ...
 cargo run --bin quarry_hot_project_dogfood -- sample ...
 ```
 
-`plan` emits this frozen experiment as human or JSON output from exact Quarry/SmolRunner identities.
+`plan` emits this frozen experiment as human or JSON output from exact Quarry/Glaeda identities.
 
 `sample` accepts already-owned monotonic timings and bounded storage/resource observations, emits the common `HotExecutionPerformanceReceipt`, records the dogfood arm/sample coordinates, records the agent-brief digest when available, and computes the direct edit -> focused-pytest duration.
 

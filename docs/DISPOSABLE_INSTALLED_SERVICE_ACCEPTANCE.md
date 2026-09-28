@@ -10,12 +10,14 @@ It does not grant authority by itself. Keep the three operator gates below separ
 
 The acceptance repository must remain a deliberately selected benign test repository until the hostile-CI network boundary is accepted.
 
+The `/opt/smolrunner`, `SMOLRUNNER_*`, and installed-helper identities below describe the existing physical service contract. They remain exact transition identities until their owning migration lanes move and verify those live surfaces.
+
 ## Evidence boundary
 
 Retain only bounded evidence needed to identify the exact accepted run:
 
-- SmolRunner source commit under test;
-- installed SmolRunner executable SHA-256;
+- Glaeda source commit under test;
+- installed Glaeda executable SHA-256;
 - installed Scale Set bridge SHA-256;
 - canonical enrollment SHA-256;
 - exact LaunchAgent plan identity;
@@ -74,11 +76,11 @@ cargo test --locked \
 
 The preflight must prove all of the following before proceeding:
 
-- the selected SmolRunner executable is a stable root-owned, non-writable executable leaf;
+- the selected Glaeda executable is a stable root-owned, non-writable executable leaf;
 - `/opt/smolrunner/bin/scaleset-bridge` is a stable root-owned, non-writable executable leaf;
 - the canonical enrollment is stable, operator-owned, and mode `0600`;
 - the installed bridge digest equals the digest bound by the canonical enrollment;
-- the linked library and the selected installed SmolRunner executable derive the same exact installed-service plan identity;
+- the linked library and the selected installed Glaeda executable derive the same exact installed-service plan identity;
 - the emitted receipt exposes no private paths.
 
 Keep the receipt. It contains the public program, bridge, and enrollment digests plus the exact plan identity needed for the next gate.
@@ -222,7 +224,7 @@ Installation approval never authorizes later removal, and removal approval never
 
 A #492 acceptance comment should summarize only:
 
-- exact SmolRunner commit accepted;
+- exact Glaeda commit accepted;
 - exact program / bridge / enrollment digests;
 - exact installed plan identity and apply disposition;
 - enrolled benign repository and GitHub run identity;

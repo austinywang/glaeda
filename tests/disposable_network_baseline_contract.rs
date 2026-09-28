@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-const PREPARED_TEMPLATE: &str = include_str!("../examples/lima/smolrunner-prepared-template.yaml");
+const PREPARED_TEMPLATE: &str = include_str!("../examples/lima/glaeda-prepared-template.yaml");
 
 fn prepared_template() -> Value {
     serde_yaml::from_str(PREPARED_TEMPLATE).expect("prepared Lima template must remain valid YAML")

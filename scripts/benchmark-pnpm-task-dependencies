@@ -1,0 +1,1188 @@
+#!/usr/bin/env python3
+"""Benchmark trusted pnpm dependency materialization into task-private Git worktrees.
+
+This command is physical R&D orchestration for ultra-trusted repositories. It grants no project,
+lease, task-adoption, cleanup, or execution authority. Git creates each exact task worktree. pnpm
+then imports dependencies from one already-resident store into a unique task node_modules root.
+Repository execution requires task-private or CoW dependency bytes; hardlinks remain a read-only
+measurement control. The benchmark keeps mechanisms distinct and requires physical evidence for explicit
+hardlink and clone treatments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import math
+import os
+import pwd
+import resource
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+GIT = Path("/usr/bin/git")
+FINDMNT = Path("/usr/bin/findmnt")
+FANOUTS = (1, 8, 32)
+IMPORT_METHODS = ("auto", "hardlink", "clone")
+MAX_REPETITIONS = 100
+MAX_SAMPLE_FILES = 256
+MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+MAX_PACKAGE_JSON_BYTES = 4 * 1024 * 1024
+DEFAULT_DEADLINE_SECONDS = 600
+MAX_DEADLINE_SECONDS = 3600
+PROCESS_GROUP_TERM_GRACE_SECONDS = 2.0
+PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
+PROCESS_GROUP_POLL_SECONDS = 0.02
+FIEMAP_IOCTL = 0xC020660B
+FIEMAP_FLAG_SYNC = 0x00000001
+FIEMAP_EXTENT_SHARED = 0x00002000
+FIEMAP_HEADER_SIZE = 32
+FIEMAP_EXTENT_SIZE = 56
+FIEMAP_BATCH_EXTENTS = 64
+
+
+class BenchmarkError(RuntimeError):
+    pass
+
+
+def public_failure_message(error: BaseException) -> str:
+    if isinstance(error, BenchmarkError):
+        return str(error)
+    return "benchmark_operation_failed"
+
+
+@dataclass(frozen=True)
+class Plan:
+    source: Path
+    scratch_root: Path
+    pnpm: Path
+    fanout: int
+    import_method: str
+    repetitions: int
+    deadline_seconds: int
+    probe_script: str | None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "document_type": "glaeda-pnpm-task-dependency-plan",
+            "authority": "performance_observation_only",
+            "trust_class": "ultra_trusted_only",
+            "fanout": self.fanout,
+            "import_method": self.import_method,
+            "repetitions": self.repetitions,
+            "deadline_seconds": self.deadline_seconds,
+            "probe_script_digest": (
+                None
+                if self.probe_script is None
+                else f"sha256:{hashlib.sha256(self.probe_script.encode('utf-8')).hexdigest()}"
+            ),
+            "workspace_policy": {
+                "unique_git_worktree_per_task": True,
+                "unique_node_modules_root_per_task": True,
+                "task_local_pnpm_virtual_store": "node_modules/.pnpm",
+                "virtual_store_type": "project_forced_by_closed_environment",
+                "repository_execution_requires_task_private_dependency_bytes": True,
+                "shared_task_workspace": False,
+                "resident_store_is_dependency_state": True,
+                "resident_store_mutation": "forbidden_by_pnpm_frozen_store",
+                "hardlink_mode": "measurement_control_only",
+                "clone_mode": "task_private_cow_candidate",
+                "auto_mode": "observational_selection_only",
+                "directory_presence_grants_task_authority": False,
+            },
+            "network_policy": {
+                "dependency_install": "pnpm_offline",
+                "first_read_only_command": "local_installed_dependency_graph",
+                "repository_probe": (
+                    "absent"
+                    if self.probe_script is None
+                    else "inherits_trusted_host_network"
+                ),
+            },
+            "storage_accounting": {
+                "filesystem_available_space": "statvfs_f_bavail",
+                "node_modules_allocated_blocks": "sum_st_blocks_times_512",
+                "reflink_exclusive_ownership_inferred": False,
+            },
+            "dependency_lifecycle_scripts": "disabled_during_install",
+        }
+
+
+def absolute_plain_directory(path: Path, label: str) -> Path:
+    path = Path(os.path.abspath(path))
+    try:
+        observed = path.lstat()
+    except FileNotFoundError as error:
+        raise BenchmarkError(f"{label} does not exist") from error
+    if path.is_symlink() or not stat.S_ISDIR(observed.st_mode):
+        raise BenchmarkError(f"{label} must be a plain directory")
+    if observed.st_uid != os.getuid():
+        raise BenchmarkError(f"{label} must be owned by the current user")
+    return path
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def closed_environment(node: Path) -> dict[str, str]:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    path_parts = [os.fspath(node.parent), "/usr/bin", "/bin"]
+    return {
+        "HOME": os.fspath(home),
+        "PATH": ":".join(dict.fromkeys(path_parts)),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "CI": "1",
+        "NPM_CONFIG_USERCONFIG": "/dev/null",
+        "PNPM_CONFIG_VIRTUAL_STORE_TYPE": "project",
+    }
+
+
+def run_text(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+) -> str:
+    result = subprocess.run(
+        arguments,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    encoded = result.stdout.encode("utf-8", errors="replace")
+    if result.returncode != 0 or len(encoded) > MAX_COMMAND_OUTPUT_BYTES:
+        raise BenchmarkError("required observation command failed")
+    return result.stdout.strip()
+
+
+def git_text(source: Path, *arguments: str) -> str:
+    return run_text([os.fspath(GIT), *arguments], cwd=source)
+
+
+def git_identity(source: Path) -> dict[str, Any]:
+    if git_text(source, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise BenchmarkError("source worktree must be exactly clean")
+    commit = git_text(source, "rev-parse", "HEAD")
+    tree = git_text(source, "rev-parse", "HEAD^{tree}")
+    common_dir_text = git_text(
+        source,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    common_dir = Path(common_dir_text)
+    common = common_dir.stat()
+    if len(commit) != 40 or len(tree) != 40 or not common_dir.is_dir():
+        raise BenchmarkError("source Git identity is unsupported")
+    return {
+        "commit": commit,
+        "tree": tree,
+        "common_git_directory_device": common.st_dev,
+        "common_git_directory_inode": common.st_ino,
+    }
+
+
+def prove_task_git(task: Path, commit: str, tree: str) -> None:
+    if git_text(task, "rev-parse", "HEAD") != commit:
+        raise BenchmarkError("task HEAD differs from the exact source commit")
+    if git_text(task, "rev-parse", "HEAD^{tree}") != tree:
+        raise BenchmarkError("task tree differs from the exact source tree")
+    for arguments in (("diff-files", "--quiet"), ("diff-index", "--quiet", "HEAD", "--")):
+        result = subprocess.run(
+            [os.fspath(GIT), *arguments],
+            cwd=task,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise BenchmarkError("task tracked Git state changed during dependency materialization")
+
+
+def package_identity(source: Path) -> dict[str, Any]:
+    required = [source / "package.json", source / "pnpm-lock.yaml"]
+    for path in required:
+        if path.is_symlink() or not path.is_file():
+            raise BenchmarkError("source requires plain package.json and pnpm-lock.yaml")
+    optional = [source / "pnpm-workspace.yaml", source / ".npmrc"]
+    for path in optional:
+        if path.is_symlink():
+            raise BenchmarkError("dependency configuration symlinks are outside the benchmark")
+        if path.exists() and not path.is_file():
+            raise BenchmarkError("dependency configuration must be regular files")
+    try:
+        with (source / "package.json").open("rb") as package_file:
+            raw_package = package_file.read(MAX_PACKAGE_JSON_BYTES + 1)
+        if len(raw_package) > MAX_PACKAGE_JSON_BYTES:
+            raise BenchmarkError("package.json exceeds the benchmark size limit")
+        package = json.loads(raw_package.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BenchmarkError("package.json is invalid") from error
+    if not isinstance(package, dict):
+        raise BenchmarkError("package.json must contain an object")
+    scripts = package.get("scripts") or {}
+    if not isinstance(scripts, dict) or any(not isinstance(name, str) for name in scripts):
+        raise BenchmarkError("package.json scripts are invalid")
+    files = {
+        path.name: sha256_file(path)
+        for path in [*required, *optional]
+        if path.is_file()
+    }
+    return {
+        "files": files,
+        "package_manager": package.get("packageManager"),
+        "available_scripts": sorted(scripts),
+    }
+
+
+def program_identity(program: Path, arguments: list[str], cwd: Path, env: dict[str, str]) -> dict[str, Any]:
+    resolved = program.resolve(strict=True)
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise BenchmarkError("required executable is unavailable")
+    version = run_text([os.fspath(program), *arguments], cwd=cwd, env=env)
+    if not version or len(version) > 256:
+        raise BenchmarkError("required executable version is unavailable")
+    return {
+        "version": version,
+        "program_sha256": sha256_file(resolved),
+    }
+
+
+def pnpm_virtual_store_type(
+    pnpm: Path,
+    source: Path,
+    environment: dict[str, str],
+) -> str:
+    value = run_text(
+        [os.fspath(pnpm), "config", "get", "virtualStoreType"],
+        cwd=source,
+        env=environment,
+    )
+    if value != "project":
+        raise BenchmarkError("pnpm must report project virtual store type")
+    return value
+
+
+def pnpm_identity(pnpm: Path, source: Path) -> dict[str, Any]:
+    if not pnpm.is_absolute() or not pnpm.exists():
+        raise BenchmarkError("pnpm must be an absolute executable")
+    node_text = shutil.which("node")
+    if node_text is None:
+        raise BenchmarkError("Node executable is unavailable")
+    node = Path(node_text).resolve(strict=True)
+    environment = closed_environment(node)
+    pnpm_program = program_identity(pnpm, ["--version"], source, environment)
+    node_program = program_identity(node, ["--version"], source, environment)
+    config_text = run_text(
+        [os.fspath(pnpm), "config", "list", "--json"],
+        cwd=source,
+        env=environment,
+    )
+    config_digest = f"sha256:{hashlib.sha256(config_text.encode('utf-8')).hexdigest()}"
+    virtual_store_type = pnpm_virtual_store_type(pnpm, source, environment)
+    store_text = run_text(
+        [os.fspath(pnpm), "store", "path", "--silent"],
+        cwd=source,
+        env=environment,
+    )
+    store = Path(os.path.abspath(store_text))
+    if not store.is_dir() or store.is_symlink():
+        raise BenchmarkError("resident pnpm store is unavailable")
+    store_observed = store.stat()
+    return {
+        **pnpm_program,
+        "node": node_program,
+        "config_digest": config_digest,
+        "virtual_store_type": virtual_store_type,
+        "node_path": node,
+        "environment": environment,
+        "store": store,
+        "store_device": store_observed.st_dev,
+        "store_inode": store_observed.st_ino,
+    }
+
+
+def filesystem_observation(path: Path) -> dict[str, Any]:
+    observed = path.stat()
+    filesystem = os.statvfs(path)
+    fragment_size = filesystem.f_frsize or filesystem.f_bsize
+    result = subprocess.run(
+        [
+            os.fspath(FINDMNT),
+            "-n",
+            "-o",
+            "ID,MAJ:MIN,FSTYPE",
+            "--target",
+            os.fspath(path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    fields = result.stdout.split()
+    if result.returncode != 0 or len(fields) != 3:
+        raise BenchmarkError("filesystem identity is unavailable")
+    return {
+        "mount_id": fields[0],
+        "device_major": os.major(observed.st_dev),
+        "device_minor": os.minor(observed.st_dev),
+        "findmnt_device": fields[1],
+        "filesystem_type": fields[2],
+        "fragment_size_bytes": fragment_size,
+        "available_bytes": filesystem.f_bavail * fragment_size,
+        "available_inodes": filesystem.f_favail,
+    }
+
+
+def filesystem_capacity_observation(
+    path: Path,
+    baseline: dict[str, Any],
+) -> dict[str, Any]:
+    observed = path.stat()
+    filesystem = os.statvfs(path)
+    fragment_size = filesystem.f_frsize or filesystem.f_bsize
+    if (
+        os.major(observed.st_dev) != baseline["device_major"]
+        or os.minor(observed.st_dev) != baseline["device_minor"]
+        or fragment_size != baseline["fragment_size_bytes"]
+    ):
+        raise BenchmarkError("scratch filesystem identity changed during capacity observation")
+    return {
+        "mount_id": baseline["mount_id"],
+        "device_major": baseline["device_major"],
+        "device_minor": baseline["device_minor"],
+        "findmnt_device": baseline["findmnt_device"],
+        "filesystem_type": baseline["filesystem_type"],
+        "fragment_size_bytes": fragment_size,
+        "available_bytes": filesystem.f_bavail * fragment_size,
+        "available_inodes": filesystem.f_favail,
+    }
+
+
+def same_filesystem(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    fields = (
+        "mount_id",
+        "device_major",
+        "device_minor",
+        "findmnt_device",
+        "filesystem_type",
+        "fragment_size_bytes",
+    )
+    return all(first[field] == second[field] for field in fields)
+
+
+def add_worktree(source: Path, target: Path, commit: str) -> None:
+    result = subprocess.run(
+        [
+            os.fspath(GIT),
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            os.fspath(target),
+            commit,
+        ],
+        cwd=source,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BenchmarkError("Git worktree materialization failed")
+
+
+def remove_worktree(source: Path, target: Path) -> None:
+    result = subprocess.run(
+        [os.fspath(GIT), "worktree", "remove", "--force", os.fspath(target)],
+        cwd=source,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode == 0:
+        return
+    observed = subprocess.run(
+        [os.fspath(GIT), "worktree", "list", "--porcelain", "-z"],
+        cwd=source,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if observed.returncode != 0 or len(observed.stdout) > MAX_COMMAND_OUTPUT_BYTES:
+        raise BenchmarkError("worktree cleanup observation failed")
+    prefix = b"worktree "
+    registered = {
+        Path(os.fsdecode(field.removeprefix(prefix)))
+        for field in observed.stdout.split(b"\0")
+        if field.startswith(prefix)
+    }
+    if target in registered:
+        raise BenchmarkError("worktree cleanup failed")
+
+
+def rusage_snapshot() -> tuple[float, float]:
+    observed = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return (observed.ru_utime, observed.ru_stime)
+
+
+def rusage_delta(before: tuple[float, float], after: tuple[float, float]) -> dict[str, float]:
+    return {
+        "user_seconds": round(max(0.0, after[0] - before[0]), 6),
+        "system_seconds": round(max(0.0, after[1] - before[1]), 6),
+    }
+
+
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def wait_for_process_group_absence(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        process.poll()
+        if not process_group_exists(process.pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(PROCESS_GROUP_POLL_SECONDS)
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    process.poll()
+    if process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if not wait_for_process_group_absence(process, PROCESS_GROUP_TERM_GRACE_SECONDS):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if not wait_for_process_group_absence(process, PROCESS_GROUP_KILL_GRACE_SECONDS):
+            raise BenchmarkError("task process group cleanup failed")
+    try:
+        process.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise BenchmarkError("task process leader cleanup failed") from error
+
+
+def terminate_processes(processes: list[subprocess.Popen[bytes]]) -> None:
+    failures = 0
+    for process in processes:
+        if process.poll() is None or process_group_exists(process.pid):
+            try:
+                terminate_process_group(process)
+            except BenchmarkError:
+                failures += 1
+    if failures:
+        raise BenchmarkError("one or more task process groups survived cleanup")
+
+
+def run_cohort(
+    commands: Iterable[tuple[Path, list[str]]],
+    *,
+    env: dict[str, str],
+    deadline_seconds: int,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    processes: list[subprocess.Popen[bytes]] = []
+    try:
+        for cwd, command in commands:
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    umask=0o022,
+                )
+            )
+    except BaseException:
+        terminate_processes(processes)
+        raise
+
+    maximum_running = 0
+    deadline = started + deadline_seconds
+    timed_out = False
+    try:
+        while True:
+            running = [process for process in processes if process.poll() is None]
+            maximum_running = max(maximum_running, len(running))
+            if not running:
+                break
+            if any(process.returncode not in (None, 0) for process in processes):
+                terminate_processes(processes)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                terminate_processes(processes)
+                break
+            time.sleep(0.02)
+    except BaseException:
+        terminate_processes(processes)
+        raise
+
+    surviving_groups = [
+        process for process in processes if process_group_exists(process.pid)
+    ]
+    if surviving_groups:
+        terminate_processes(surviving_groups)
+    failures = sum(process.returncode != 0 for process in processes)
+    failures += len(surviving_groups)
+    return {
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+        "process_count": len(processes),
+        "maximum_simultaneous_observed": maximum_running,
+        "failure_count": failures,
+        "deadline_exceeded": timed_out,
+        "surviving_process_groups_detected": len(surviving_groups),
+    }
+
+
+def tree_usage(root: Path) -> dict[str, int]:
+    logical = 0
+    allocated = 0
+    inodes = 0
+    regular_files = 0
+    multiply_linked_regular_files = 0
+    for directory, child_directories, filenames in os.walk(
+        root, topdown=True, followlinks=False
+    ):
+        for name in [*child_directories, *filenames]:
+            path = Path(directory) / name
+            observed = path.lstat()
+            inodes += 1
+            logical += observed.st_size
+            allocated += observed.st_blocks * 512
+            if stat.S_ISREG(observed.st_mode):
+                regular_files += 1
+                if observed.st_nlink > 1:
+                    multiply_linked_regular_files += 1
+    return {
+        "logical_bytes": logical,
+        "allocated_bytes": allocated,
+        "inode_count": inodes,
+        "regular_file_count": regular_files,
+        "multiply_linked_regular_file_count": multiply_linked_regular_files,
+    }
+
+
+def fiemap_has_shared_extent(path: Path) -> bool | None:
+    observed = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(observed.st_mode) or observed.st_size == 0:
+        return None
+    buffer = bytearray(
+        FIEMAP_HEADER_SIZE + FIEMAP_BATCH_EXTENTS * FIEMAP_EXTENT_SIZE
+    )
+    struct.pack_into(
+        "=QQIIII",
+        buffer,
+        0,
+        0,
+        observed.st_size,
+        FIEMAP_FLAG_SYNC,
+        0,
+        FIEMAP_BATCH_EXTENTS,
+        0,
+    )
+    try:
+        with path.open("rb", buffering=0) as source:
+            fcntl.ioctl(source.fileno(), FIEMAP_IOCTL, buffer, True)
+    except OSError:
+        return None
+    mapped = struct.unpack_from("=I", buffer, 20)[0]
+    for index in range(min(mapped, FIEMAP_BATCH_EXTENTS)):
+        flags = struct.unpack_from(
+            "=I",
+            buffer,
+            FIEMAP_HEADER_SIZE + index * FIEMAP_EXTENT_SIZE + 40,
+        )[0]
+        if flags & FIEMAP_EXTENT_SHARED:
+            return True
+    return False
+
+
+def virtual_store_package_payload_file(node_modules: Path, path: Path) -> bool:
+    try:
+        parts = path.relative_to(node_modules).parts
+    except ValueError:
+        return False
+    if len(parts) < 4 or parts[0] != ".pnpm":
+        return False
+    try:
+        nested_node_modules = parts.index("node_modules", 2)
+    except ValueError:
+        return False
+    return nested_node_modules < len(parts) - 1
+
+
+def classify_mechanism(
+    sampled: int,
+    hardlinked: int,
+    fiemap_observed: int,
+    shared: int,
+) -> str:
+    if sampled < 1:
+        raise BenchmarkError("node_modules contains no non-empty package payload file sample")
+    if hardlinked > 0:
+        return "hardlink_observed"
+    if fiemap_observed != sampled:
+        return "physical_mechanism_unproven"
+    if shared == sampled:
+        return "reflink_observed"
+    if shared > 0:
+        return "mixed_private_copy_and_reflink_observed"
+    return "copy_observed"
+
+
+def sample_physical_mechanism(node_modules: Path) -> dict[str, Any]:
+    sampled = 0
+    hardlinked = 0
+    shared = 0
+    fiemap_observed = 0
+    for directory, _, filenames in os.walk(node_modules, followlinks=False):
+        for name in filenames:
+            path = Path(directory) / name
+            observed = path.lstat()
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_size == 0
+                or not virtual_store_package_payload_file(node_modules, path)
+            ):
+                continue
+            sampled += 1
+            if observed.st_nlink > 1:
+                hardlinked += 1
+            shared_extent = fiemap_has_shared_extent(path)
+            if shared_extent is not None:
+                fiemap_observed += 1
+                if shared_extent:
+                    shared += 1
+            if sampled >= MAX_SAMPLE_FILES:
+                break
+        if sampled >= MAX_SAMPLE_FILES:
+            break
+    mechanism = classify_mechanism(sampled, hardlinked, fiemap_observed, shared)
+    return {
+        "sample_scope": "pnpm_virtual_store_nonempty_package_payload_regular_files",
+        "sampled_regular_files": sampled,
+        "hardlinked_files": hardlinked,
+        "fiemap_observed_files": fiemap_observed,
+        "shared_extent_files": shared,
+        "mechanism": mechanism,
+    }
+
+
+def validate_mechanisms(import_method: str, physical: list[dict[str, Any]]) -> set[str]:
+    mechanisms: set[str] = set()
+    for item in physical:
+        usage = item["usage"]
+        sample = item["sample"]
+        if usage["regular_file_count"] < 1:
+            raise BenchmarkError("node_modules contains no regular files")
+        hardlinked = usage["multiply_linked_regular_file_count"]
+        if hardlinked > 0:
+            mechanisms.add("hardlink_observed")
+            continue
+        if sample["mechanism"] == "hardlink_observed":
+            raise BenchmarkError("dependency link evidence changed during observation")
+        mechanisms.add(sample["mechanism"])
+
+    if import_method == "clone" and mechanisms != {"reflink_observed"}:
+        raise BenchmarkError("clone mode lacks per-task shared-extent evidence")
+    if import_method == "hardlink" and mechanisms != {"hardlink_observed"}:
+        raise BenchmarkError("hardlink mode lacks per-task shared-inode evidence")
+    return mechanisms
+
+
+def percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        raise BenchmarkError("cannot summarize an empty sample set")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * quantile
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[lower]
+    weight = rank - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = (
+        "source_worktree_seconds",
+        "dependency_install_seconds",
+        "readiness_verification_seconds",
+        "ready_storage_observation_seconds",
+        "workspace_ready_seconds",
+        "task_known_to_first_command_start_seconds",
+        "first_command_seconds",
+        "task_known_to_first_command_complete_seconds",
+        "first_relevant_script_seconds",
+        "task_known_to_first_relevant_script_complete_seconds",
+        "cleanup_seconds",
+        "filesystem_available_space_delta_at_ready_bytes",
+        "filesystem_available_inode_delta_at_ready",
+        "filesystem_available_space_delta_during_cleanup_bytes",
+        "filesystem_available_inode_delta_during_cleanup",
+        "residual_filesystem_available_space_delta_after_cleanup_bytes",
+        "residual_filesystem_available_inode_delta_after_cleanup",
+        "node_modules_st_blocks_bytes",
+        "node_modules_inode_count",
+    )
+    distributions: dict[str, Any] = {}
+    successful = [sample for sample in samples if sample.get("result") == "succeeded"]
+    for field in fields:
+        values = [
+            float(sample[field])
+            for sample in successful
+            if sample.get(field) is not None
+        ]
+        if not values:
+            continue
+        distributions[field] = {
+            "count": len(values),
+            "p50": round(percentile(values, 0.50), 6),
+            "p90": round(percentile(values, 0.90), 6),
+            "p99": round(percentile(values, 0.99), 6),
+        }
+    mechanisms: dict[str, int] = {}
+    for sample in successful:
+        for mechanism in sample.get("observed_import_mechanisms", []):
+            mechanisms[mechanism] = mechanisms.get(mechanism, 0) + 1
+    return {
+        "successful_samples": len(successful),
+        "failed_samples": len(samples) - len(successful),
+        "distributions": distributions,
+        "observed_import_mechanism_sample_counts": mechanisms,
+    }
+
+
+def validate_plan(plan: Plan) -> None:
+    if plan.fanout not in FANOUTS:
+        raise BenchmarkError("fanout must be one of 1, 8, or 32")
+    if plan.import_method not in IMPORT_METHODS:
+        raise BenchmarkError("unsupported pnpm package import method")
+    if plan.repetitions < 1 or plan.repetitions > MAX_REPETITIONS:
+        raise BenchmarkError("repetitions must be between 1 and 100")
+    if plan.deadline_seconds < 1 or plan.deadline_seconds > MAX_DEADLINE_SECONDS:
+        raise BenchmarkError("deadline is outside the supported range")
+    if plan.probe_script is not None and (
+        not plan.probe_script
+        or len(plan.probe_script) > 128
+        or any(character.isspace() for character in plan.probe_script)
+    ):
+        raise BenchmarkError("probe script name is invalid")
+    if plan.import_method == "hardlink" and plan.probe_script is not None:
+        raise BenchmarkError("hardlink control cannot execute repository probe scripts")
+
+
+def install_command(pnpm: Path, store: Path, import_method: str) -> list[str]:
+    return [
+        os.fspath(pnpm),
+        "install",
+        "--frozen-store",
+        "--offline",
+        "--frozen-lockfile",
+        "--ignore-scripts",
+        "--virtual-store-dir=node_modules/.pnpm",
+        f"--store-dir={os.fspath(store)}",
+        f"--package-import-method={import_method}",
+    ]
+
+
+def first_read_only_command(pnpm: Path) -> list[str]:
+    return [os.fspath(pnpm), "list", "--depth=0"]
+
+
+def consumption_delta(before_available: int, after_available: int) -> int:
+    return before_available - after_available
+
+
+def recovered_capacity(at_ready: int, after_cleanup: int) -> int:
+    return after_cleanup - at_ready
+
+
+def measure_once(
+    plan: Plan,
+    identity: dict[str, Any],
+    pnpm: dict[str, Any],
+    ordinal: int,
+) -> dict[str, Any]:
+    before_fs = filesystem_observation(plan.scratch_root)
+    before_cpu = rusage_snapshot()
+    generation = uuid.uuid4().hex
+    experiment = plan.scratch_root / f"glaeda-pnpm-{generation}"
+    experiment.mkdir(mode=0o700)
+    tasks = [experiment / f"task-{index:02d}" for index in range(1, plan.fanout + 1)]
+    attempted: list[Path] = []
+    created: list[Path] = []
+    result = "failed"
+    failure: str | None = None
+    worktree_seconds = 0.0
+    install: dict[str, Any] = {}
+    first_command: dict[str, Any] = {}
+    probe: dict[str, Any] | None = None
+    physical: list[dict[str, Any]] = []
+    mechanisms: set[str] = set()
+    at_ready_fs: dict[str, Any] | None = None
+    after_commands_fs: dict[str, Any] | None = None
+    readiness_verification_seconds: float | None = None
+    ready_storage_observation_seconds: float | None = None
+    task_known_to_workspace_ready: float | None = None
+    task_known_to_first_command_start: float | None = None
+    task_known_to_first_command_complete: float | None = None
+    task_known_to_probe_complete: float | None = None
+    cleanup_errors: list[str] = []
+    known = time.monotonic()
+    try:
+        worktree_started = time.monotonic()
+        for task in tasks:
+            attempted.append(task)
+            add_worktree(plan.source, task, identity["commit"])
+            created.append(task)
+        worktree_seconds = time.monotonic() - worktree_started
+
+        install = run_cohort(
+            [
+                (
+                    task,
+                    install_command(plan.pnpm, pnpm["store"], plan.import_method),
+                )
+                for task in tasks
+            ],
+            env=pnpm["environment"],
+            deadline_seconds=plan.deadline_seconds,
+        )
+        if install["deadline_exceeded"]:
+            raise BenchmarkError("pnpm install cohort reached its deadline")
+        if install["failure_count"]:
+            raise BenchmarkError("one or more pnpm installs failed")
+
+        readiness_started = time.monotonic()
+        for task in tasks:
+            prove_task_git(task, identity["commit"], identity["tree"])
+            node_modules = task / "node_modules"
+            if not node_modules.is_dir() or node_modules.is_symlink():
+                raise BenchmarkError("pnpm did not create a plain task node_modules directory")
+        readiness_verification_seconds = time.monotonic() - readiness_started
+        task_known_to_workspace_ready = time.monotonic() - known
+
+        storage_observation_started = time.monotonic()
+        at_ready_fs = filesystem_capacity_observation(plan.scratch_root, before_fs)
+        ready_storage_observation_seconds = time.monotonic() - storage_observation_started
+
+        task_known_to_first_command_start = time.monotonic() - known
+        first_command = run_cohort(
+            [
+                (
+                    task,
+                    first_read_only_command(plan.pnpm),
+                )
+                for task in tasks
+            ],
+            env=pnpm["environment"],
+            deadline_seconds=plan.deadline_seconds,
+        )
+        task_known_to_first_command_complete = time.monotonic() - known
+        if first_command["deadline_exceeded"]:
+            raise BenchmarkError("first-command cohort reached its deadline")
+        if first_command["failure_count"]:
+            raise BenchmarkError("one or more dependency graph commands failed")
+
+        for task in tasks:
+            node_modules = task / "node_modules"
+            physical.append(
+                {
+                    "usage": tree_usage(node_modules),
+                    "sample": sample_physical_mechanism(node_modules),
+                }
+            )
+        mechanisms = validate_mechanisms(plan.import_method, physical)
+
+        if plan.probe_script is not None:
+            if "hardlink_observed" in mechanisms:
+                raise BenchmarkError("repository probe refused after hardlink import evidence")
+            probe = run_cohort(
+                [
+                    (
+                        task,
+                        [os.fspath(plan.pnpm), "run", plan.probe_script],
+                    )
+                    for task in tasks
+                ],
+                env=pnpm["environment"],
+                deadline_seconds=plan.deadline_seconds,
+            )
+            task_known_to_probe_complete = time.monotonic() - known
+            if probe["deadline_exceeded"]:
+                raise BenchmarkError("relevant-script cohort reached its deadline")
+            if probe["failure_count"]:
+                raise BenchmarkError("one or more relevant scripts failed")
+
+        after_commands_fs = filesystem_observation(plan.scratch_root)
+        if not same_filesystem(before_fs, after_commands_fs):
+            raise BenchmarkError("scratch filesystem identity changed during benchmark")
+        result = "succeeded"
+    except (BenchmarkError, OSError, json.JSONDecodeError) as error:
+        failure = public_failure_message(error)
+    finally:
+        cleanup_started = time.monotonic()
+        for task in reversed(attempted):
+            try:
+                remove_worktree(plan.source, task)
+            except (BenchmarkError, OSError):
+                cleanup_errors.append("worktree cleanup failed")
+        if not cleanup_errors:
+            try:
+                shutil.rmtree(experiment)
+            except OSError:
+                cleanup_errors.append("experiment tree cleanup failed")
+        cleanup_seconds = time.monotonic() - cleanup_started
+        if cleanup_errors:
+            result = "failed"
+            cleanup_failure = "; ".join(cleanup_errors)
+            failure = cleanup_failure if failure is None else f"{failure}; {cleanup_failure}"
+
+    after_cleanup_fs = filesystem_observation(plan.scratch_root)
+    if not same_filesystem(before_fs, after_cleanup_fs):
+        result = "failed"
+        identity_failure = "scratch filesystem identity changed during cleanup"
+        failure = identity_failure if failure is None else f"{failure}; {identity_failure}"
+    after_cpu = rusage_snapshot()
+
+    ready_bytes = None
+    ready_inodes = None
+    cleanup_reclaimed_bytes = None
+    cleanup_reclaimed_inodes = None
+    if at_ready_fs is not None:
+        ready_bytes = consumption_delta(before_fs["available_bytes"], at_ready_fs["available_bytes"])
+        ready_inodes = consumption_delta(before_fs["available_inodes"], at_ready_fs["available_inodes"])
+        cleanup_reclaimed_bytes = recovered_capacity(at_ready_fs["available_bytes"], after_cleanup_fs["available_bytes"])
+        cleanup_reclaimed_inodes = recovered_capacity(at_ready_fs["available_inodes"], after_cleanup_fs["available_inodes"])
+
+    allocated = sum(item["usage"]["allocated_bytes"] for item in physical)
+    inodes = sum(item["usage"]["inode_count"] for item in physical)
+    workspace_ready = task_known_to_workspace_ready
+    return {
+        "ordinal": ordinal,
+        "task_generation": generation,
+        "result": result,
+        "failure": failure,
+        "source_worktree_seconds": round(worktree_seconds, 6),
+        "dependency_install_seconds": install.get("elapsed_seconds"),
+        "readiness_verification_seconds": (
+            None
+            if readiness_verification_seconds is None
+            else round(readiness_verification_seconds, 6)
+        ),
+        "ready_storage_observation_seconds": (
+            None
+            if ready_storage_observation_seconds is None
+            else round(ready_storage_observation_seconds, 6)
+        ),
+        "workspace_ready_seconds": (
+            None if workspace_ready is None else round(workspace_ready, 6)
+        ),
+        "task_known_to_first_command_start_seconds": (
+            None
+            if task_known_to_first_command_start is None
+            else round(task_known_to_first_command_start, 6)
+        ),
+        "first_command_seconds": first_command.get("elapsed_seconds"),
+        "task_known_to_first_command_complete_seconds": (
+            None
+            if task_known_to_first_command_complete is None
+            else round(task_known_to_first_command_complete, 6)
+        ),
+        "first_relevant_script_seconds": None if probe is None else probe.get("elapsed_seconds"),
+        "task_known_to_first_relevant_script_complete_seconds": (
+            None
+            if task_known_to_probe_complete is None
+            else round(task_known_to_probe_complete, 6)
+        ),
+        "cleanup_seconds": round(cleanup_seconds, 6),
+        "filesystem_available_space_delta_at_ready_bytes": ready_bytes,
+        "filesystem_available_inode_delta_at_ready": ready_inodes,
+        "filesystem_available_space_delta_during_cleanup_bytes": cleanup_reclaimed_bytes,
+        "filesystem_available_inode_delta_during_cleanup": cleanup_reclaimed_inodes,
+        "residual_filesystem_available_space_delta_after_cleanup_bytes": consumption_delta(
+            before_fs["available_bytes"], after_cleanup_fs["available_bytes"]
+        ),
+        "residual_filesystem_available_inode_delta_after_cleanup": consumption_delta(
+            before_fs["available_inodes"], after_cleanup_fs["available_inodes"]
+        ),
+        "node_modules_st_blocks_bytes": allocated,
+        "node_modules_inode_count": inodes,
+        "observed_import_mechanisms": sorted(mechanisms),
+        "cpu": rusage_delta(before_cpu, after_cpu),
+        "filesystem_before": before_fs,
+        "filesystem_at_ready": at_ready_fs,
+        "filesystem_after_commands": after_commands_fs,
+        "filesystem_after_cleanup": after_cleanup_fs,
+        "task_dependency_evidence": physical,
+    }
+
+
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    path = Path(os.path.abspath(path))
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            os.fchmod(temporary.fileno(), 0o600)
+            json.dump(report, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def parse_arguments(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--scratch-root", type=Path, required=True)
+    parser.add_argument("--pnpm", type=Path, required=True)
+    parser.add_argument("--fanout", type=int, choices=FANOUTS, required=True)
+    parser.add_argument("--import-method", choices=IMPORT_METHODS, required=True)
+    parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--deadline-seconds", type=int, default=DEFAULT_DEADLINE_SECONDS)
+    parser.add_argument("--probe-script")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--plan", action="store_true")
+    return parser.parse_args(arguments)
+
+
+def validate_output_path(output: Path, scratch_root: Path) -> Path:
+    output = Path(os.path.abspath(output))
+    if output == scratch_root or scratch_root in output.parents:
+        raise BenchmarkError("output must remain outside the disposable scratch root")
+    return output
+
+
+def main(arguments: list[str] | None = None) -> int:
+    try:
+        parsed = parse_arguments(sys.argv[1:] if arguments is None else arguments)
+        plan = Plan(
+            source=absolute_plain_directory(parsed.source, "source"),
+            scratch_root=absolute_plain_directory(parsed.scratch_root, "scratch root"),
+            pnpm=Path(os.path.abspath(parsed.pnpm)),
+            fanout=parsed.fanout,
+            import_method=parsed.import_method,
+            repetitions=parsed.repetitions,
+            deadline_seconds=parsed.deadline_seconds,
+            probe_script=parsed.probe_script,
+        )
+        validate_plan(plan)
+        output = validate_output_path(parsed.output, plan.scratch_root)
+        if parsed.plan:
+            print(json.dumps(plan.to_json(), indent=2, sort_keys=True))
+            return 0
+
+        git_program = program_identity(
+            GIT,
+            ["--version"],
+            plan.source,
+            {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        )
+        identity = git_identity(plan.source)
+        package = package_identity(plan.source)
+        if plan.probe_script is not None and plan.probe_script not in package["available_scripts"]:
+            raise BenchmarkError("probe script is absent from package.json")
+        pnpm = pnpm_identity(plan.pnpm, plan.source)
+        scratch_device = plan.scratch_root.stat().st_dev
+        if plan.import_method in ("clone", "hardlink") and pnpm["store_device"] != scratch_device:
+            raise BenchmarkError(
+                f"{plan.import_method} mode requires resident store and task scratch on one device"
+            )
+
+        samples = [
+            measure_once(plan, identity, pnpm, ordinal)
+            for ordinal in range(1, plan.repetitions + 1)
+        ]
+        final_identity = git_identity(plan.source)
+        if final_identity != identity:
+            raise BenchmarkError("source Git identity changed across the benchmark")
+        report = {
+            **plan.to_json(),
+            "source": identity,
+            "git": git_program,
+            "dependency_identity": {
+                "files": package["files"],
+            },
+            "pnpm": {
+                "version": pnpm["version"],
+                "program_sha256": pnpm["program_sha256"],
+                "node": pnpm["node"],
+                "config_digest": pnpm["config_digest"],
+                "virtual_store_type": pnpm["virtual_store_type"],
+                "store_device": pnpm["store_device"],
+                "store_inode": pnpm["store_inode"],
+                "store_device_matches_task_scratch": pnpm["store_device"] == scratch_device,
+            },
+            "samples": samples,
+            "summary": summarize(samples),
+            "result": (
+                "succeeded"
+                if all(sample["result"] == "succeeded" for sample in samples)
+                else "failed"
+            ),
+        }
+        write_report(output, report)
+        return 0 if report["result"] == "succeeded" else 1
+    except (BenchmarkError, OSError, json.JSONDecodeError) as error:
+        print(f"error: {public_failure_message(error)}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

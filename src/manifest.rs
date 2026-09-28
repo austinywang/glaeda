@@ -127,7 +127,7 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
-/// Load and validate a SmolRunner manifest from disk.
+/// Load and validate a Glaeda manifest from disk.
 ///
 /// # Errors
 ///
@@ -142,7 +142,7 @@ pub fn load(path: &Path) -> Result<Manifest, ManifestError> {
     parse(&contents)
 }
 
-/// Parse and validate a SmolRunner manifest.
+/// Parse and validate a Glaeda manifest.
 ///
 /// # Errors
 ///
@@ -151,7 +151,7 @@ pub fn load(path: &Path) -> Result<Manifest, ManifestError> {
 pub fn parse(contents: &str) -> Result<Manifest, ManifestError> {
     let manifest: Manifest = serde_yaml::from_str(contents).map_err(|error| ManifestError {
         kind: ManifestErrorKind::Parse,
-        message: format!("failed to parse SmolRunner manifest: {error}"),
+        message: format!("failed to parse Glaeda manifest: {error}"),
         problems: Vec::new(),
     })?;
 

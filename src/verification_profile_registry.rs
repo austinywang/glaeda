@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::artifact::{ArtifactIdentityError, RepositoryRef, Sha256Digest};
 use crate::execution_admission::ExecutionResourceLimits;
@@ -14,6 +15,10 @@ use crate::rust_verification_envelope::{
     RustToolchainIdentity, RustVerificationEnvelope, RustVerificationEnvelopeDefinition,
     RustVerificationEnvelopeError, RustVerificationScope, RustVerificationSourceIdentity,
 };
+use crate::verification_command_semantics::{
+    VerificationCommandSemantics, doctor_verification_command_semantics,
+    plan_verification_command_semantics, required_verification_command_semantics,
+};
 use crate::verification_profile::{
     ApprovedEquivalentCommand, CacheId, CapabilityId, ConcurrencyPolicy, DeclaredDeviation,
     DeviationCode, DirtyWorkspacePolicy, ExactBuildScope, ExactVerificationScope,
@@ -24,30 +29,65 @@ use crate::verification_profile::{
     WorkspaceMutationAuthority, WorkspaceMutationPolicy,
 };
 
+pub const GLAEDA_REQUIRED_PROFILE_ID: &str = "glaeda.required";
+pub const GLAEDA_DOCTOR_PROFILE_ID: &str = "glaeda.doctor";
+pub const GLAEDA_PLAN_PROFILE_ID: &str = "glaeda.plan";
+
+pub const GLAEDA_REQUIRED_COMMAND_ID: &str = "glaeda.required.v2";
+pub const GLAEDA_DOCTOR_COMMAND_ID: &str = "glaeda.doctor.v2";
+pub const GLAEDA_PLAN_COMMAND_ID: &str = "glaeda.plan.v2";
+
+pub const GLAEDA_REQUIRED_COMMAND_DIGEST: &str =
+    "sha256:31507ba91034174a257f6c91922d89a6cebbf7625f02c822ff64d7230286b2d4";
+pub const GLAEDA_DOCTOR_COMMAND_DIGEST: &str =
+    "sha256:a6033eb075a192a3229829e9444f7d2fb2f7d3addae497bdefa0ffe996495d48";
+pub const GLAEDA_PLAN_COMMAND_DIGEST: &str =
+    "sha256:acf4df87a46b44d20ec70b2fee6a0d6eb3dc13cc282bebceac1f8e3760707425";
+
 pub const SMOLRUNNER_REQUIRED_PROFILE_ID: &str = "smolrunner.required";
 pub const SMOLRUNNER_DOCTOR_PROFILE_ID: &str = "smolrunner.doctor";
 pub const SMOLRUNNER_PLAN_PROFILE_ID: &str = "smolrunner.plan";
 
-const REPOSITORY: &str = "teamleaderleo/smolrunner";
-const PACKAGE: &str = "smolrunner";
-const REQUIRED_COMMAND_ID: &str = "smolrunner.required.v1";
-const DOCTOR_COMMAND_ID: &str = "smolrunner.doctor.v1";
-const PLAN_COMMAND_ID: &str = "smolrunner.plan.v1";
-const REQUIRED_COMMAND_DIGEST: &str =
+const GLAEDA_REPOSITORY: &str = "teamleaderleo/glaeda";
+const GLAEDA_PACKAGE: &str = "glaeda";
+const GLAEDA_COMMAND_DIGEST_DOMAIN: &[u8] = b"glaeda-verification-command-contract-v2\0";
+const GLAEDA_RUST_WORKSPACE_MEMBERS_DIGEST: &str =
+    "sha256:bcfa7d680b7d7d0ec12d5db42f10c11c21d33f0c63fe3c3d9b47262a89b31896";
+
+const SMOLRUNNER_V1_REPOSITORY: &str = "teamleaderleo/smolrunner";
+const SMOLRUNNER_V1_PACKAGE: &str = "smolrunner";
+const SMOLRUNNER_V1_REQUIRED_COMMAND_ID: &str = "smolrunner.required.v1";
+const SMOLRUNNER_V1_DOCTOR_COMMAND_ID: &str = "smolrunner.doctor.v1";
+const SMOLRUNNER_V1_PLAN_COMMAND_ID: &str = "smolrunner.plan.v1";
+const SMOLRUNNER_V1_REQUIRED_COMMAND_DIGEST: &str =
     "sha256:fab0c53ffcb5bf63764155bc1e9dc85371cf2240190ab9cd36ad412cace62dc5";
-const DOCTOR_COMMAND_DIGEST: &str =
+const SMOLRUNNER_V1_DOCTOR_COMMAND_DIGEST: &str =
     "sha256:46d9f7be1e888b842fe77e81e3826d6338e637901022d7acc9d18fb61b8ffe6e";
-const PLAN_COMMAND_DIGEST: &str =
+const SMOLRUNNER_V1_PLAN_COMMAND_DIGEST: &str =
     "sha256:cf9866af6335cd4d3a579dc2f61202cdd3652eb25031330062848251a6e8d0d1";
+const SMOLRUNNER_V1_RUST_WORKSPACE_MEMBERS_DIGEST: &str =
+    "sha256:7c4f356a716b2b4cc10680a9a121a56860141340ad966b311b5b419fb01fa272";
+
 const CACHE_ID: &str = "cargo-target";
 const RUST_TOOLCHAIN_ID: &str = "rust-1.97.1-minimal-clippy-rustfmt";
 const RUST_TOOLCHAIN_CONTRACT_DIGEST: &str =
     "sha256:279d77167cec5426fa80f457cd066dc74a360fbe4e2816f4f3fa01487a918fdc";
 const RUST_HOST_TRIPLE: &str = "aarch64-unknown-linux-gnu";
 const RUST_TARGET_TRIPLE: &str = "aarch64-unknown-linux-gnu";
-const RUST_WORKSPACE_MEMBERS_DIGEST: &str =
-    "sha256:7c4f356a716b2b4cc10680a9a121a56860141340ad966b311b5b419fb01fa272";
-const PROFILE_IDS: [&str; 3] = [
+const GLAEDA_PROFILE_IDS: [&str; 3] = [
+    GLAEDA_REQUIRED_PROFILE_ID,
+    GLAEDA_DOCTOR_PROFILE_ID,
+    GLAEDA_PLAN_PROFILE_ID,
+];
+const SMOLRUNNER_V1_PROFILE_IDS: [&str; 3] = [
+    SMOLRUNNER_REQUIRED_PROFILE_ID,
+    SMOLRUNNER_DOCTOR_PROFILE_ID,
+    SMOLRUNNER_PLAN_PROFILE_ID,
+];
+const COMPATIBILITY_PROFILE_IDS: [&str; 6] = [
+    GLAEDA_REQUIRED_PROFILE_ID,
+    GLAEDA_DOCTOR_PROFILE_ID,
+    GLAEDA_PLAN_PROFILE_ID,
     SMOLRUNNER_REQUIRED_PROFILE_ID,
     SMOLRUNNER_DOCTOR_PROFILE_ID,
     SMOLRUNNER_PLAN_PROFILE_ID,
@@ -97,6 +137,7 @@ pub struct RegisteredVerificationProfile {
 
 struct ProfileDefinition {
     profile_id: VerificationProfileId,
+    repository: &'static str,
     canonical_command: RepositoryCommandContract,
     approved_equivalents: Vec<ApprovedEquivalentCommand>,
     required_capabilities: Vec<RequiredCapability>,
@@ -118,17 +159,17 @@ impl RegisteredVerificationProfile {
             return Err(VerificationProfileRegistryError::new(
                 "registry.approved_equivalents",
                 "undeclared_fallback",
-                "the checked-in SmolRunner profiles declare no command fallbacks",
+                "checked-in verification profiles declare no command fallbacks",
             ));
         }
         validate_read_only(&definition.authority)?;
         if definition.canonical_command.identity().repository()
-            != &RepositoryRef::parse(REPOSITORY)?
+            != &RepositoryRef::parse(definition.repository)?
         {
             return Err(VerificationProfileRegistryError::new(
                 "registry.command.repository",
                 "repository_identity_mismatch",
-                "registered commands must belong to teamleaderleo/smolrunner",
+                "registered command repository must match its declared profile generation",
             ));
         }
         Ok(Self {
@@ -218,6 +259,7 @@ pub struct VerificationProfileRegistry {
 impl VerificationProfileRegistry {
     fn new(
         profiles: Vec<RegisteredVerificationProfile>,
+        expected_profile_ids: &[&str],
     ) -> Result<Self, VerificationProfileRegistryError> {
         let mut seen = BTreeSet::new();
         if profiles
@@ -230,16 +272,16 @@ impl VerificationProfileRegistry {
                 "registry profile IDs must be unique",
             ));
         }
-        if profiles.len() != PROFILE_IDS.len()
+        if profiles.len() != expected_profile_ids.len()
             || profiles
                 .iter()
-                .zip(PROFILE_IDS)
+                .zip(expected_profile_ids.iter().copied())
                 .any(|(profile, expected)| profile.profile_id().as_str() != expected)
         {
             return Err(VerificationProfileRegistryError::new(
                 "registry.profiles",
                 "profile_alias_or_order_mismatch",
-                "registry must contain the three canonical IDs in stable order",
+                "registry must contain exactly its canonical IDs in stable order",
             ));
         }
         Ok(Self { profiles })
@@ -312,28 +354,108 @@ impl VerificationProfileRegistry {
     }
 }
 
-/// Construct the exact checked-in SmolRunner verification profile registry.
+/// Construct the current Glaeda verification profile registry.
+///
+/// The current profiles are the only profiles emitted by fresh Glaeda workspace receipts. Their
+/// repository command identities use explicit v2 successor IDs and contract digests derived from
+/// the checked-in fixed command semantics.
 ///
 /// # Errors
 ///
-/// Returns an error if any checked-in identifier, digest, scope, capability, resource, cache,
-/// timeout, fallback, or authority no longer satisfies the merged v1 contract.
-pub fn smolrunner_profile_registry()
+/// Returns an error if a checked-in identifier, derived command digest, scope, capability,
+/// resource, cache, timeout, fallback, or authority no longer satisfies the current contract.
+pub fn glaeda_profile_registry()
 -> Result<VerificationProfileRegistry, VerificationProfileRegistryError> {
-    VerificationProfileRegistry::new(vec![
-        required_profile()?,
-        doctor_profile()?,
-        plan_profile()?,
-    ])
+    VerificationProfileRegistry::new(
+        vec![
+            glaeda_required_profile()?,
+            glaeda_doctor_profile()?,
+            glaeda_plan_profile()?,
+        ],
+        &GLAEDA_PROFILE_IDS,
+    )
 }
 
-fn required_profile() -> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
-    let required = capabilities(&["cargo", "rustc", "rustfmt", "clippy"])?;
+/// Construct the retained exact SmolRunner v1 verification profile registry.
+///
+/// This exists only to interpret old profile/command evidence without aliasing it to a distinct
+/// Glaeda command contract. Fresh Glaeda receipts and examples never emit these IDs.
+///
+/// # Errors
+///
+/// Returns an error if the retained v1 identity vectors no longer satisfy their original contract.
+pub fn smolrunner_v1_profile_registry()
+-> Result<VerificationProfileRegistry, VerificationProfileRegistryError> {
+    VerificationProfileRegistry::new(
+        vec![
+            smolrunner_v1_required_profile()?,
+            smolrunner_v1_doctor_profile()?,
+            smolrunner_v1_plan_profile()?,
+        ],
+        &SMOLRUNNER_V1_PROFILE_IDS,
+    )
+}
+
+/// Compatibility registry for current callers and retained old config/evidence interpretation.
+///
+/// Glaeda profiles are listed first for fresh selection/reporting. Old SmolRunner v1 IDs retain
+/// their original repository, package, command IDs, and exact digests; no alias equates the two
+/// generations. Callers that require historical-only interpretation can use
+/// [`smolrunner_v1_profile_registry`] explicitly.
+pub fn smolrunner_profile_registry()
+-> Result<VerificationProfileRegistry, VerificationProfileRegistryError> {
+    VerificationProfileRegistry::new(
+        vec![
+            glaeda_required_profile()?,
+            glaeda_doctor_profile()?,
+            glaeda_plan_profile()?,
+            smolrunner_v1_required_profile()?,
+            smolrunner_v1_doctor_profile()?,
+            smolrunner_v1_plan_profile()?,
+        ],
+        &COMPATIBILITY_PROFILE_IDS,
+    )
+}
+
+/// Derive the exact Glaeda v2 repository-command contract digest from one fixed checked-in command
+/// meaning.
+///
+/// The serialization itself is owned by `verification_command_semantics`; this lane adds only the
+/// versioned Glaeda command-contract domain and length framing. Any step/order/argument change
+/// therefore changes the resulting command identity.
+///
+/// # Errors
+///
+/// Returns a bounded registry error if canonical serialization or digest representation fails.
+pub fn digest_glaeda_verification_command_semantics(
+    semantics: &VerificationCommandSemantics,
+) -> Result<Sha256Digest, VerificationProfileRegistryError> {
+    let document = semantics.canonical_json().map_err(|_| {
+        VerificationProfileRegistryError::new(
+            "registry.command.semantics",
+            "command_semantics_encoding_failed",
+            "checked-in verification command semantics could not be canonically encoded",
+        )
+    })?;
+    let bytes = document.as_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(GLAEDA_COMMAND_DIGEST_DOMAIN);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    Sha256Digest::parse(&format!("sha256:{:x}", hasher.finalize()))
+        .map_err(VerificationProfileRegistryError::from)
+}
+
+fn glaeda_required_profile()
+-> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
+    let required = capabilities(&["git", "python3", "cargo", "rustc", "rustfmt", "clippy"])?;
     profile(ProfileDefinition {
-        profile_id: VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID)?,
-        canonical_command: command(
-            REQUIRED_COMMAND_ID,
-            REQUIRED_COMMAND_DIGEST,
+        profile_id: VerificationProfileId::parse(GLAEDA_REQUIRED_PROFILE_ID)?,
+        repository: GLAEDA_REPOSITORY,
+        canonical_command: glaeda_command(
+            GLAEDA_REQUIRED_COMMAND_ID,
+            GLAEDA_REQUIRED_COMMAND_DIGEST,
+            required_verification_command_semantics(),
             ExactVerificationScope::WholeWorkspaceTests,
             ExactBuildScope::WholeWorkspace,
             required.clone(),
@@ -351,11 +473,13 @@ fn required_profile() -> Result<RegisteredVerificationProfile, VerificationProfi
     })
 }
 
-fn doctor_profile() -> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
-    package_profile(
-        SMOLRUNNER_DOCTOR_PROFILE_ID,
-        DOCTOR_COMMAND_ID,
-        DOCTOR_COMMAND_DIGEST,
+fn glaeda_doctor_profile() -> Result<RegisteredVerificationProfile, VerificationProfileRegistryError>
+{
+    glaeda_package_profile(
+        GLAEDA_DOCTOR_PROFILE_ID,
+        GLAEDA_DOCTOR_COMMAND_ID,
+        GLAEDA_DOCTOR_COMMAND_DIGEST,
+        doctor_verification_command_semantics(),
         vec![
             optional("podman", "podman-unavailable", "Podman is unavailable")?,
             optional("systemd", "systemd-unavailable", "systemd is unavailable")?,
@@ -365,18 +489,134 @@ fn doctor_profile() -> Result<RegisteredVerificationProfile, VerificationProfile
     )
 }
 
-fn plan_profile() -> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
-    package_profile(
-        SMOLRUNNER_PLAN_PROFILE_ID,
-        PLAN_COMMAND_ID,
-        PLAN_COMMAND_DIGEST,
+fn glaeda_plan_profile() -> Result<RegisteredVerificationProfile, VerificationProfileRegistryError>
+{
+    glaeda_package_profile(
+        GLAEDA_PLAN_PROFILE_ID,
+        GLAEDA_PLAN_COMMAND_ID,
+        GLAEDA_PLAN_COMMAND_DIGEST,
+        plan_verification_command_semantics(),
         Vec::new(),
         resources(GIB, GIB, 1, 1, 1)?,
         600,
     )
 }
 
-fn package_profile(
+fn glaeda_package_profile(
+    profile_id: &str,
+    command_id: &str,
+    digest: &str,
+    semantics: VerificationCommandSemantics,
+    optional_capabilities: Vec<OptionalCapability>,
+    resources: ResourceDefaults,
+    timeout_seconds: u64,
+) -> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
+    let package = PackageId::parse(GLAEDA_PACKAGE)?;
+    let required = capabilities(&["cargo", "rustc"])?;
+    profile(ProfileDefinition {
+        profile_id: VerificationProfileId::parse(profile_id)?,
+        repository: GLAEDA_REPOSITORY,
+        canonical_command: glaeda_command(
+            command_id,
+            digest,
+            semantics,
+            ExactVerificationScope::WholePackageTests {
+                package: package.clone(),
+            },
+            ExactBuildScope::WholePackage { package },
+            required.clone(),
+        )?,
+        approved_equivalents: Vec::new(),
+        required_capabilities: required.into_iter().map(RequiredCapability::new).collect(),
+        optional_capabilities,
+        resources,
+        cache_class: cache_class()?,
+        timeout: TimeoutPolicy::new(timeout_seconds, Vec::new())?,
+        authority: read_only_authority()?,
+    })
+}
+
+fn glaeda_command(
+    command_id: &str,
+    expected_digest: &str,
+    semantics: VerificationCommandSemantics,
+    test_scope: ExactVerificationScope,
+    build_scope: ExactBuildScope,
+    required_capabilities: Vec<CapabilityId>,
+) -> Result<RepositoryCommandContract, VerificationProfileRegistryError> {
+    let digest = digest_glaeda_verification_command_semantics(&semantics)?;
+    if digest.as_str() != expected_digest {
+        return Err(VerificationProfileRegistryError::new(
+            "registry.command.digest",
+            "command_digest_mismatch",
+            "checked-in Glaeda command digest no longer matches its fixed semantics",
+        ));
+    }
+    command(
+        GLAEDA_REPOSITORY,
+        command_id,
+        digest.as_str(),
+        test_scope,
+        build_scope,
+        required_capabilities,
+    )
+}
+
+fn smolrunner_v1_required_profile()
+-> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
+    let required = capabilities(&["cargo", "rustc", "rustfmt", "clippy"])?;
+    profile(ProfileDefinition {
+        profile_id: VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID)?,
+        repository: SMOLRUNNER_V1_REPOSITORY,
+        canonical_command: command(
+            SMOLRUNNER_V1_REPOSITORY,
+            SMOLRUNNER_V1_REQUIRED_COMMAND_ID,
+            SMOLRUNNER_V1_REQUIRED_COMMAND_DIGEST,
+            ExactVerificationScope::WholeWorkspaceTests,
+            ExactBuildScope::WholeWorkspace,
+            required.clone(),
+        )?,
+        approved_equivalents: Vec::new(),
+        required_capabilities: required.into_iter().map(RequiredCapability::new).collect(),
+        optional_capabilities: vec![
+            optional("podman", "podman-unavailable", "Podman is unavailable")?,
+            optional("systemd", "systemd-unavailable", "systemd is unavailable")?,
+        ],
+        resources: resources(4 * GIB, 4 * GIB, 2, 1, 2)?,
+        cache_class: cache_class()?,
+        timeout: TimeoutPolicy::new(3_600, Vec::new())?,
+        authority: read_only_authority()?,
+    })
+}
+
+fn smolrunner_v1_doctor_profile()
+-> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
+    smolrunner_v1_package_profile(
+        SMOLRUNNER_DOCTOR_PROFILE_ID,
+        SMOLRUNNER_V1_DOCTOR_COMMAND_ID,
+        SMOLRUNNER_V1_DOCTOR_COMMAND_DIGEST,
+        vec![
+            optional("podman", "podman-unavailable", "Podman is unavailable")?,
+            optional("systemd", "systemd-unavailable", "systemd is unavailable")?,
+        ],
+        resources(512 * MIB, 512 * MIB, 1, 1, 1)?,
+        300,
+    )
+}
+
+fn smolrunner_v1_plan_profile()
+-> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
+    smolrunner_v1_package_profile(
+        SMOLRUNNER_PLAN_PROFILE_ID,
+        SMOLRUNNER_V1_PLAN_COMMAND_ID,
+        SMOLRUNNER_V1_PLAN_COMMAND_DIGEST,
+        Vec::new(),
+        resources(GIB, GIB, 1, 1, 1)?,
+        600,
+    )
+}
+
+fn smolrunner_v1_package_profile(
     profile_id: &str,
     command_id: &str,
     digest: &str,
@@ -384,11 +624,13 @@ fn package_profile(
     resources: ResourceDefaults,
     timeout_seconds: u64,
 ) -> Result<RegisteredVerificationProfile, VerificationProfileRegistryError> {
-    let package = PackageId::parse(PACKAGE)?;
+    let package = PackageId::parse(SMOLRUNNER_V1_PACKAGE)?;
     let required = capabilities(&["cargo", "rustc"])?;
     profile(ProfileDefinition {
         profile_id: VerificationProfileId::parse(profile_id)?,
+        repository: SMOLRUNNER_V1_REPOSITORY,
         canonical_command: command(
+            SMOLRUNNER_V1_REPOSITORY,
             command_id,
             digest,
             ExactVerificationScope::WholePackageTests {
@@ -414,6 +656,7 @@ fn profile(
 }
 
 fn command(
+    repository: &str,
     command_id: &str,
     digest: &str,
     test_scope: ExactVerificationScope,
@@ -422,7 +665,7 @@ fn command(
 ) -> Result<RepositoryCommandContract, VerificationProfileRegistryError> {
     Ok(RepositoryCommandContract::new(
         RepositoryCommandIdentity::new(
-            RepositoryRef::parse(REPOSITORY)?,
+            RepositoryRef::parse(repository)?,
             RepositoryCommandId::parse(command_id)?,
             Sha256Digest::parse(digest)?,
         ),
@@ -486,37 +729,70 @@ fn rust_envelope(
     source: RustVerificationSourceIdentity,
     source_command_namespace: Sha256Digest,
 ) -> Result<RustVerificationEnvelope, VerificationProfileRegistryError> {
-    let (cpu_millis, pids, target_directory_id, retry_policy_id, features) =
-        match profile.profile_id().as_str() {
-            SMOLRUNNER_REQUIRED_PROFILE_ID => (
-                4_000,
-                2_048,
-                "smolrunner-required-target-v1",
-                "smolrunner-required-no-retry-v1",
-                RustFeatureSelection::All,
-            ),
-            SMOLRUNNER_DOCTOR_PROFILE_ID => (
-                1_000,
-                512,
-                "smolrunner-doctor-target-v1",
-                "smolrunner-doctor-no-retry-v1",
-                RustFeatureSelection::Default,
-            ),
-            SMOLRUNNER_PLAN_PROFILE_ID => (
-                1_000,
-                512,
-                "smolrunner-plan-target-v1",
-                "smolrunner-plan-no-retry-v1",
-                RustFeatureSelection::Default,
-            ),
-            _ => {
-                return Err(VerificationProfileRegistryError::new(
-                    "registry.rust_envelope.profile_id",
-                    "unknown_rust_envelope",
-                    "profile has no checked-in Rust verification envelope",
-                ));
-            }
-        };
+    let (
+        cpu_millis,
+        pids,
+        target_directory_id,
+        retry_policy_id,
+        workspace_members_digest,
+        features,
+    ) = match profile.profile_id().as_str() {
+        GLAEDA_REQUIRED_PROFILE_ID => (
+            4_000,
+            2_048,
+            "glaeda-required-target-v2",
+            "glaeda-required-no-retry-v2",
+            GLAEDA_RUST_WORKSPACE_MEMBERS_DIGEST,
+            RustFeatureSelection::All,
+        ),
+        GLAEDA_DOCTOR_PROFILE_ID => (
+            1_000,
+            512,
+            "glaeda-doctor-target-v2",
+            "glaeda-doctor-no-retry-v2",
+            GLAEDA_RUST_WORKSPACE_MEMBERS_DIGEST,
+            RustFeatureSelection::Default,
+        ),
+        GLAEDA_PLAN_PROFILE_ID => (
+            1_000,
+            512,
+            "glaeda-plan-target-v2",
+            "glaeda-plan-no-retry-v2",
+            GLAEDA_RUST_WORKSPACE_MEMBERS_DIGEST,
+            RustFeatureSelection::Default,
+        ),
+        SMOLRUNNER_REQUIRED_PROFILE_ID => (
+            4_000,
+            2_048,
+            "smolrunner-required-target-v1",
+            "smolrunner-required-no-retry-v1",
+            SMOLRUNNER_V1_RUST_WORKSPACE_MEMBERS_DIGEST,
+            RustFeatureSelection::All,
+        ),
+        SMOLRUNNER_DOCTOR_PROFILE_ID => (
+            1_000,
+            512,
+            "smolrunner-doctor-target-v1",
+            "smolrunner-doctor-no-retry-v1",
+            SMOLRUNNER_V1_RUST_WORKSPACE_MEMBERS_DIGEST,
+            RustFeatureSelection::Default,
+        ),
+        SMOLRUNNER_PLAN_PROFILE_ID => (
+            1_000,
+            512,
+            "smolrunner-plan-target-v1",
+            "smolrunner-plan-no-retry-v1",
+            SMOLRUNNER_V1_RUST_WORKSPACE_MEMBERS_DIGEST,
+            RustFeatureSelection::Default,
+        ),
+        _ => {
+            return Err(VerificationProfileRegistryError::new(
+                "registry.rust_envelope.profile_id",
+                "unknown_rust_envelope",
+                "profile has no checked-in Rust verification envelope",
+            ));
+        }
+    };
     let profile_resources = profile.resources();
     let reserved_resources = ExecutionResourceLimits::new(
         cpu_millis,
@@ -559,7 +835,7 @@ fn rust_envelope(
     )?;
     let scope = match profile.canonical_command().test_scope() {
         ExactVerificationScope::WholeWorkspaceTests => RustVerificationScope::WorkspaceTests {
-            members_digest: Sha256Digest::parse(RUST_WORKSPACE_MEMBERS_DIGEST)?,
+            members_digest: Sha256Digest::parse(workspace_members_digest)?,
             targets: RustTargetPolicy::all_targets(true),
         },
         ExactVerificationScope::WholePackageTests { package } => {
@@ -739,190 +1015,186 @@ mod tests {
     use super::*;
     use crate::artifact::{CommitId, GitTreeId};
     use crate::rust_verification_envelope_digest::digest_rust_verification_envelope;
-    use sha2::{Digest as _, Sha256};
 
-    fn registry() -> VerificationProfileRegistry {
-        smolrunner_profile_registry().expect("registry")
+    fn current_registry() -> VerificationProfileRegistry {
+        glaeda_profile_registry().expect("Glaeda registry")
     }
 
-    fn identity(command_id: &str, digest: &str) -> RepositoryCommandIdentity {
+    fn historical_registry() -> VerificationProfileRegistry {
+        smolrunner_v1_profile_registry().expect("SmolRunner v1 registry")
+    }
+
+    fn identity(repository: &str, command_id: &str, digest: &str) -> RepositoryCommandIdentity {
         RepositoryCommandIdentity::new(
-            RepositoryRef::parse(REPOSITORY).expect("repository"),
+            RepositoryRef::parse(repository).expect("repository"),
             RepositoryCommandId::parse(command_id).expect("command ID"),
             Sha256Digest::parse(digest).expect("digest"),
         )
     }
 
-    fn rust_source() -> RustVerificationSourceIdentity {
+    fn rust_source(repository: &str) -> RustVerificationSourceIdentity {
         RustVerificationSourceIdentity::new(
-            RepositoryRef::parse(REPOSITORY).expect("repository"),
+            RepositoryRef::parse(repository).expect("repository"),
             CommitId::parse(&"1".repeat(40)).expect("commit"),
             GitTreeId::parse(&"2".repeat(40)).expect("tree"),
         )
     }
 
     #[test]
-    fn rust_envelopes_are_checked_in_exact_and_digestible() {
-        let toolchain_document_digest = format!(
-            "sha256:{:x}",
-            Sha256::digest(include_bytes!("../rust-toolchain.toml"))
+    fn current_profile_names_and_command_vectors_are_exact() {
+        let registry = current_registry();
+        assert_eq!(
+            registry
+                .profiles()
+                .iter()
+                .map(|profile| profile.profile_id().as_str())
+                .collect::<Vec<_>>(),
+            GLAEDA_PROFILE_IDS.to_vec()
         );
-        assert_eq!(toolchain_document_digest, RUST_TOOLCHAIN_CONTRACT_DIGEST);
-        let workspace_members_digest = format!(
-            "sha256:{:x}",
-            Sha256::digest(b"smolrunner-rust-workspace-members-v1\0smolrunner")
+        assert_eq!(
+            registry.human_summary(),
+            "profiles=3 ids=glaeda.required,glaeda.doctor,glaeda.plan"
         );
-        assert_eq!(workspace_members_digest, RUST_WORKSPACE_MEMBERS_DIGEST);
 
-        let registry = registry();
-        let namespace =
-            Sha256Digest::parse(&format!("sha256:{}", "a".repeat(64))).expect("namespace");
         let expected = [
             (
-                SMOLRUNNER_REQUIRED_PROFILE_ID,
-                4_000,
-                4 * GIB,
-                2_048,
-                2,
-                2,
-                ["cargo", "clippy", "rustc", "rustfmt"].as_slice(),
-                "sha256:a8169b6dd94905418011fc04fbe01a1c94bc730a94498eab64805d0cbe8940c7",
+                GLAEDA_REQUIRED_PROFILE_ID,
+                GLAEDA_REQUIRED_COMMAND_ID,
+                GLAEDA_REQUIRED_COMMAND_DIGEST,
             ),
             (
-                SMOLRUNNER_DOCTOR_PROFILE_ID,
-                1_000,
-                512 * MIB,
-                512,
-                1,
-                1,
-                ["cargo", "rustc"].as_slice(),
-                "sha256:06f63fd4887beb67ad749469d0d5cf071604c6aa9112d603b07a84ca605eda9f",
+                GLAEDA_DOCTOR_PROFILE_ID,
+                GLAEDA_DOCTOR_COMMAND_ID,
+                GLAEDA_DOCTOR_COMMAND_DIGEST,
             ),
             (
-                SMOLRUNNER_PLAN_PROFILE_ID,
-                1_000,
-                GIB,
-                512,
-                1,
-                1,
-                ["cargo", "rustc"].as_slice(),
-                "sha256:a4a1e50e5df93cf7d66ecabe24be8587fce4d5752b2f1e825c72d09ff604df2e",
+                GLAEDA_PLAN_PROFILE_ID,
+                GLAEDA_PLAN_COMMAND_ID,
+                GLAEDA_PLAN_COMMAND_DIGEST,
             ),
         ];
-        for (
-            profile_id,
-            cpu,
-            memory,
-            pids,
-            build_jobs,
-            test_threads,
-            expected_capabilities,
-            expected_digest,
-        ) in expected
-        {
-            let profile_id = VerificationProfileId::parse(profile_id).expect("profile ID");
-            let envelope = registry
-                .resolve_rust_envelope(&profile_id, rust_source(), namespace.clone())
-                .expect("Rust envelope");
-            assert_eq!(envelope.profile_id(), &profile_id);
+        for (profile_id, command_id, digest) in expected {
+            let profile = registry
+                .lookup(&VerificationProfileId::parse(profile_id).expect("profile ID"))
+                .expect("profile");
             assert_eq!(
-                envelope.command(),
-                registry
-                    .lookup(&profile_id)
-                    .expect("profile")
-                    .canonical_command()
-                    .identity()
+                profile.canonical_command().identity(),
+                &identity(GLAEDA_REPOSITORY, command_id, digest)
             );
-            assert_eq!(
-                envelope.resources().reserved_resources,
-                ExecutionResourceLimits::new(cpu, memory, pids).expect("limits")
-            );
-            assert_eq!(
-                envelope.resources().concurrency.cargo_build_jobs,
-                build_jobs
-            );
-            assert!(matches!(
-                envelope.resources().concurrency.runtime,
-                RustRuntimeConcurrency::Libtest {
-                    test_threads: actual,
-                    filter: None,
-                } if actual == test_threads
-            ));
-            assert_eq!(
-                envelope.cache().cargo_target_directory.namespace_digest,
-                namespace
-            );
-            assert_eq!(
-                envelope
-                    .required_capabilities()
-                    .iter()
-                    .map(|capability| capability.as_str())
-                    .collect::<Vec<_>>(),
-                expected_capabilities
-            );
-            assert_eq!(
-                envelope.resources().required_worker_profile,
-                LimaResourceProfile::Work
-            );
-            assert_eq!(
-                envelope.resources().minimum_guest_available_memory_bytes,
-                memory
-            );
-            assert_eq!(envelope.resources().minimum_guest_available_swap_bytes, 0);
-            assert_eq!(
-                envelope.resources().maximum_execution_millis,
-                registry
-                    .lookup(&profile_id)
-                    .expect("profile")
-                    .timeout()
-                    .total_seconds()
-                    * 1_000
-            );
-            assert!(matches!(envelope.retry(), RustRetryPolicy::NoRetry { .. }));
-            let json = serde_json::to_string(&envelope).expect("envelope JSON");
-            assert!(json.contains(RUST_TOOLCHAIN_ID));
-            assert!(json.contains(RUST_TOOLCHAIN_CONTRACT_DIGEST));
-            assert!(json.contains(RUST_TARGET_TRIPLE));
-            let digest = digest_rust_verification_envelope(&envelope).expect("envelope digest");
-            assert_eq!(digest.as_str(), expected_digest);
         }
     }
 
     #[test]
-    fn exact_names_are_enumerated_in_stable_order() {
-        let registry = registry();
-        let ids = registry
-            .profiles()
-            .iter()
-            .map(|profile| profile.profile_id().as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, PROFILE_IDS.to_vec());
+    fn successor_command_digests_recompute_from_fixed_semantics() {
+        let vectors = [
+            (
+                required_verification_command_semantics(),
+                GLAEDA_REQUIRED_COMMAND_DIGEST,
+            ),
+            (
+                doctor_verification_command_semantics(),
+                GLAEDA_DOCTOR_COMMAND_DIGEST,
+            ),
+            (
+                plan_verification_command_semantics(),
+                GLAEDA_PLAN_COMMAND_DIGEST,
+            ),
+        ];
+        let mut seen = BTreeSet::new();
+        for (semantics, expected) in vectors {
+            let digest =
+                digest_glaeda_verification_command_semantics(&semantics).expect("command digest");
+            assert_eq!(digest.as_str(), expected);
+            assert!(seen.insert(digest));
+        }
+    }
+
+    #[test]
+    fn smolrunner_v1_vectors_remain_exact_historical_evidence() {
+        let registry = historical_registry();
+        assert_eq!(
+            registry
+                .profiles()
+                .iter()
+                .map(|profile| profile.profile_id().as_str())
+                .collect::<Vec<_>>(),
+            SMOLRUNNER_V1_PROFILE_IDS.to_vec()
+        );
         assert_eq!(
             registry.human_summary(),
             "profiles=3 ids=smolrunner.required,smolrunner.doctor,smolrunner.plan"
         );
+        for (profile_id, command_id, digest) in [
+            (
+                SMOLRUNNER_REQUIRED_PROFILE_ID,
+                SMOLRUNNER_V1_REQUIRED_COMMAND_ID,
+                SMOLRUNNER_V1_REQUIRED_COMMAND_DIGEST,
+            ),
+            (
+                SMOLRUNNER_DOCTOR_PROFILE_ID,
+                SMOLRUNNER_V1_DOCTOR_COMMAND_ID,
+                SMOLRUNNER_V1_DOCTOR_COMMAND_DIGEST,
+            ),
+            (
+                SMOLRUNNER_PLAN_PROFILE_ID,
+                SMOLRUNNER_V1_PLAN_COMMAND_ID,
+                SMOLRUNNER_V1_PLAN_COMMAND_DIGEST,
+            ),
+        ] {
+            let profile = registry
+                .lookup(&VerificationProfileId::parse(profile_id).expect("profile ID"))
+                .expect("profile");
+            assert_eq!(
+                profile.canonical_command().identity(),
+                &identity(SMOLRUNNER_V1_REPOSITORY, command_id, digest)
+            );
+        }
     }
 
     #[test]
-    fn lookup_refuses_unknown_validated_names() {
-        let registry = registry();
-        let required = VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("ID");
+    fn compatibility_registry_keeps_generations_distinct_without_aliases() {
+        let registry = smolrunner_profile_registry().expect("compatibility registry");
         assert_eq!(
-            registry.lookup(&required).expect("known").profile_id(),
-            &required
+            registry
+                .profiles()
+                .iter()
+                .map(|profile| profile.profile_id().as_str())
+                .collect::<Vec<_>>(),
+            COMPATIBILITY_PROFILE_IDS.to_vec()
         );
-        let unknown = VerificationProfileId::parse("smolrunner.unknown").expect("valid ID");
+        let current = registry
+            .lookup(&VerificationProfileId::parse(GLAEDA_REQUIRED_PROFILE_ID).expect("current ID"))
+            .expect("current");
+        let historical = registry
+            .lookup(
+                &VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID)
+                    .expect("historical ID"),
+            )
+            .expect("historical");
+        assert_ne!(current.profile_id(), historical.profile_id());
+        assert_ne!(
+            current.canonical_command().identity(),
+            historical.canonical_command().identity()
+        );
         assert_eq!(
-            registry.lookup(&unknown).expect_err("unknown").code,
-            "unknown_profile"
+            current.canonical_command().identity().repository().as_str(),
+            GLAEDA_REPOSITORY
+        );
+        assert_eq!(
+            historical
+                .canonical_command()
+                .identity()
+                .repository()
+                .as_str(),
+            SMOLRUNNER_V1_REPOSITORY
         );
     }
 
     #[test]
-    fn scopes_are_exact_and_never_widened() {
-        let registry = registry();
+    fn current_scopes_packages_capabilities_and_authority_are_exact() {
+        let registry = current_registry();
         let required = registry
-            .lookup(&VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("ID"))
+            .lookup(&VerificationProfileId::parse(GLAEDA_REQUIRED_PROFILE_ID).expect("ID"))
             .expect("required");
         assert_eq!(
             required.canonical_command().test_scope(),
@@ -932,11 +1204,39 @@ mod tests {
             required.canonical_command().build_scope(),
             &ExactBuildScope::WholeWorkspace
         );
-        for id in [SMOLRUNNER_DOCTOR_PROFILE_ID, SMOLRUNNER_PLAN_PROFILE_ID] {
+        assert_eq!(
+            required
+                .required_capabilities()
+                .iter()
+                .map(|entry| entry.capability.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git", "python3", "cargo", "rustc", "rustfmt", "clippy"]
+        );
+        assert!(required.approved_equivalents().is_empty());
+        assert_eq!(
+            required.resources(),
+            resources(4 * GIB, 4 * GIB, 2, 1, 2).expect("resources")
+        );
+        assert_eq!(required.timeout().total_seconds(), 3_600);
+        assert_eq!(required.cache_class(), &cache_class().expect("cache"));
+        assert_eq!(
+            required.authority().workspace.authority,
+            WorkspaceMutationAuthority::ReadOnly
+        );
+        assert_eq!(
+            required.authority().local_commit,
+            LocalCommitAuthority::Forbidden
+        );
+        assert!(matches!(
+            &required.authority().publication,
+            PublicationAuthority::Forbidden
+        ));
+
+        for id in [GLAEDA_DOCTOR_PROFILE_ID, GLAEDA_PLAN_PROFILE_ID] {
             let profile = registry
                 .lookup(&VerificationProfileId::parse(id).expect("ID"))
                 .expect("profile");
-            let package = PackageId::parse(PACKAGE).expect("package");
+            let package = PackageId::parse(GLAEDA_PACKAGE).expect("package");
             assert_eq!(
                 profile.canonical_command().test_scope(),
                 &ExactVerificationScope::WholePackageTests {
@@ -951,67 +1251,118 @@ mod tests {
     }
 
     #[test]
-    fn command_identities_and_digests_are_stable() {
-        for (profile_id, command_id, digest) in [
+    fn current_and_historical_rust_envelopes_keep_generation_specific_ids() {
+        let namespace =
+            Sha256Digest::parse(&format!("sha256:{}", "a".repeat(64))).expect("namespace");
+        for (registry, repository, profile_id, expected_target_fragment) in [
             (
+                current_registry(),
+                GLAEDA_REPOSITORY,
+                GLAEDA_REQUIRED_PROFILE_ID,
+                "glaeda-required-target-v2",
+            ),
+            (
+                historical_registry(),
+                SMOLRUNNER_V1_REPOSITORY,
                 SMOLRUNNER_REQUIRED_PROFILE_ID,
-                REQUIRED_COMMAND_ID,
-                REQUIRED_COMMAND_DIGEST,
-            ),
-            (
-                SMOLRUNNER_DOCTOR_PROFILE_ID,
-                DOCTOR_COMMAND_ID,
-                DOCTOR_COMMAND_DIGEST,
-            ),
-            (
-                SMOLRUNNER_PLAN_PROFILE_ID,
-                PLAN_COMMAND_ID,
-                PLAN_COMMAND_DIGEST,
+                "smolrunner-required-target-v1",
             ),
         ] {
-            let profile = registry()
-                .lookup(&VerificationProfileId::parse(profile_id).expect("ID"))
-                .expect("profile")
-                .clone();
+            let profile_id = VerificationProfileId::parse(profile_id).expect("profile ID");
+            let envelope = registry
+                .resolve_rust_envelope(&profile_id, rust_source(repository), namespace.clone())
+                .expect("Rust envelope");
+            assert_eq!(envelope.profile_id(), &profile_id);
             assert_eq!(
-                profile.canonical_command().identity(),
-                &identity(command_id, digest)
+                envelope.command(),
+                registry
+                    .lookup(&profile_id)
+                    .expect("profile")
+                    .canonical_command()
+                    .identity()
             );
+            assert_eq!(
+                envelope.cache().cargo_target_directory.namespace_digest,
+                namespace
+            );
+            let json = serde_json::to_string(&envelope).expect("envelope JSON");
+            assert!(json.contains(expected_target_fragment));
+            let first = digest_rust_verification_envelope(&envelope).expect("digest");
+            let second = digest_rust_verification_envelope(&envelope).expect("digest");
+            assert_eq!(first, second);
         }
+
+        let current_workspace_members_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(b"glaeda-rust-workspace-members-v2\0glaeda")
+        );
+        assert_eq!(
+            current_workspace_members_digest,
+            GLAEDA_RUST_WORKSPACE_MEMBERS_DIGEST
+        );
+        let historical_workspace_members_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(b"smolrunner-rust-workspace-members-v1\0smolrunner")
+        );
+        assert_eq!(
+            historical_workspace_members_digest,
+            SMOLRUNNER_V1_RUST_WORKSPACE_MEMBERS_DIGEST
+        );
     }
 
     #[test]
-    fn aliases_and_duplicate_ids_are_rejected() {
-        let mut aliases = vec![
-            required_profile().expect("required"),
-            doctor_profile().expect("doctor"),
-            plan_profile().expect("plan"),
-        ];
-        aliases[0].profile_id = VerificationProfileId::parse("smolrunner.alias").expect("alias");
+    fn lookup_refuses_unknown_validated_names() {
+        let registry = current_registry();
+        let unknown = VerificationProfileId::parse("glaeda.unknown").expect("valid ID");
         assert_eq!(
-            VerificationProfileRegistry::new(aliases)
+            registry.lookup(&unknown).expect_err("unknown").code,
+            "unknown_profile"
+        );
+        let historical =
+            VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("historical ID");
+        assert_eq!(
+            registry
+                .lookup(&historical)
+                .expect_err("historical excluded")
+                .code,
+            "unknown_profile"
+        );
+    }
+
+    #[test]
+    fn aliases_duplicate_ids_fallbacks_and_scope_widening_are_rejected() {
+        let mut aliases = vec![
+            glaeda_required_profile().expect("required"),
+            glaeda_doctor_profile().expect("doctor"),
+            glaeda_plan_profile().expect("plan"),
+        ];
+        aliases[0].profile_id = VerificationProfileId::parse("glaeda.alias").expect("alias");
+        assert_eq!(
+            VerificationProfileRegistry::new(aliases, &GLAEDA_PROFILE_IDS)
                 .expect_err("alias")
                 .code,
             "profile_alias_or_order_mismatch"
         );
-        let duplicate = required_profile().expect("required");
+
+        let duplicate = glaeda_required_profile().expect("required");
         assert_eq!(
-            VerificationProfileRegistry::new(vec![
-                duplicate.clone(),
-                duplicate,
-                plan_profile().expect("plan"),
-            ])
+            VerificationProfileRegistry::new(
+                vec![
+                    duplicate.clone(),
+                    duplicate,
+                    glaeda_plan_profile().expect("plan"),
+                ],
+                &GLAEDA_PROFILE_IDS,
+            )
             .expect_err("duplicate")
             .code,
             "duplicate_profile_id"
         );
-    }
 
-    #[test]
-    fn undeclared_fallback_is_rejected() {
-        let profile = required_profile().expect("required");
+        let profile = glaeda_required_profile().expect("required");
         let fallback = identity(
-            "smolrunner.required.fallback",
+            GLAEDA_REPOSITORY,
+            "glaeda.required.fallback",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         assert_eq!(
@@ -1021,14 +1372,15 @@ mod tests {
                 .code,
             "undeclared_fallback"
         );
-    }
 
-    #[test]
-    fn shared_contract_rejects_scope_widening() {
         let error = RepositoryCommandContract::new(
-            identity(REQUIRED_COMMAND_ID, REQUIRED_COMMAND_DIGEST),
+            identity(
+                GLAEDA_REPOSITORY,
+                GLAEDA_REQUIRED_COMMAND_ID,
+                GLAEDA_REQUIRED_COMMAND_DIGEST,
+            ),
             ExactVerificationScope::WholePackageTests {
-                package: PackageId::parse(PACKAGE).expect("package"),
+                package: PackageId::parse(GLAEDA_PACKAGE).expect("package"),
             },
             ExactBuildScope::WholeWorkspace,
             capabilities(&["cargo"]).expect("capability"),
@@ -1039,7 +1391,7 @@ mod tests {
 
     #[test]
     fn authority_widening_is_rejected() {
-        let mut profile = required_profile().expect("required");
+        let mut profile = glaeda_required_profile().expect("required");
         profile.authority.local_commit = LocalCommitAuthority::CreateInRunnerOwnedWorkspace;
         assert_eq!(
             validate_read_only(profile.authority())
@@ -1050,65 +1402,25 @@ mod tests {
     }
 
     #[test]
-    fn exact_capability_resource_cache_timeout_and_authority_bindings_hold() {
-        let required = required_profile().expect("required");
-        assert!(required.approved_equivalents().is_empty());
-        assert_eq!(
-            required.resources(),
-            resources(4 * GIB, 4 * GIB, 2, 1, 2).expect("resources")
-        );
-        assert_eq!(required.timeout().total_seconds(), 3_600);
-        assert_eq!(required.cache_class(), &cache_class().expect("cache"));
-        assert_eq!(required.cache_class().cache_id().as_str(), "cargo-target");
-        assert_eq!(
-            required
-                .required_capabilities()
-                .iter()
-                .map(|entry| entry.capability.as_str())
-                .collect::<Vec<_>>(),
-            vec!["cargo", "rustc", "rustfmt", "clippy"]
-        );
-        assert_eq!(
-            required
-                .optional_capabilities()
-                .iter()
-                .map(|entry| entry.capability.as_str())
-                .collect::<Vec<_>>(),
-            vec!["podman", "systemd"]
-        );
-        assert_eq!(
-            required.authority().workspace.authority,
-            WorkspaceMutationAuthority::ReadOnly
-        );
-        assert_eq!(
-            required.authority().local_commit,
-            LocalCommitAuthority::Forbidden
-        );
-        assert!(matches!(
-            &required.authority().publication,
-            PublicationAuthority::Forbidden
-        ));
-    }
-
-    #[test]
     fn public_output_contains_no_private_paths_or_secrets() {
-        let registry = registry();
-        let json = serde_json::to_string(&registry).expect("JSON");
-        let debug = format!("{registry:?}");
-        assert!(json.contains("\"cache_id\":\"cargo-target\""));
-        assert!(!json.contains("namespace_digest"));
-        for private in [
-            "/var/lib/smolrunner",
-            "/home/runner",
-            "/Users/",
-            "CARGO_HOME=",
-            "RUSTUP_HOME=",
-            "credential-value",
-            "secret-token",
-            "github.token",
-        ] {
-            assert!(!json.contains(private), "JSON leaked {private}");
-            assert!(!debug.contains(private), "Debug leaked {private}");
+        for registry in [current_registry(), historical_registry()] {
+            let json = serde_json::to_string(&registry).expect("JSON");
+            let debug = format!("{registry:?}");
+            assert!(json.contains("\"cache_id\":\"cargo-target\""));
+            assert!(!json.contains("namespace_digest"));
+            for private in [
+                "/var/lib/smolrunner",
+                "/home/runner",
+                "/Users/",
+                "CARGO_HOME=",
+                "RUSTUP_HOME=",
+                "credential-value",
+                "secret-token",
+                "github.token",
+            ] {
+                assert!(!json.contains(private), "JSON leaked {private}");
+                assert!(!debug.contains(private), "Debug leaked {private}");
+            }
         }
     }
 }

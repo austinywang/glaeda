@@ -1,0 +1,50 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly install_dir="/opt/smolrunner/actions-runner"
+readonly entries="/etc/smolrunner/actions-runner.entries"
+readonly checksums="/etc/smolrunner/actions-runner.sha256"
+readonly runner_work="${install_dir}/_work"
+readonly runner_guard_group="smolrunner-runner-guard"
+readonly runner_diag="${install_dir}/_diag"
+readonly jit_launcher="/opt/smolrunner/bin/smolrunner-jit-launcher"
+readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
+
+[[ "$(/usr/bin/id -u)" == "0" ]]
+[[ "$(/usr/sbin/sysctl -n fs.suid_dumpable)" == "0" ]]
+listener_mount_options="$(/usr/bin/findmnt --noheadings --output OPTIONS --target "${install_dir}/bin/Runner.Listener")"
+readonly listener_mount_options
+[[ -n "${listener_mount_options}" ]]
+! /usr/bin/grep --quiet --word-regexp nosuid <<<"${listener_mount_options}"
+[[ "$(/usr/bin/stat --format=%U:%G:%a "${install_dir}/bin/Runner.Listener")" == "root:${runner_guard_group}:2755" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${install_dir}")" == "root:smolrunner-runner:1775:directory" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${entries}")" == "root:root:444:regular file" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${checksums}")" == "root:root:444:regular file" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${jit_launcher}")" == "root:root:755:regular file" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_work}")" == "smolrunner-runner:smolrunner-runner:750:directory" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_diag}")" == "smolrunner-runner:smolrunner-runner:750:directory" ]]
+
+if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 \
+  \( -path "${runner_work}" -o -path "${runner_diag}" \) -prune -o \
+  ! -user root -print -quit | /usr/bin/grep -q .; then
+  exit 1
+fi
+if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 \
+  \( -path "${runner_work}" -o -path "${runner_diag}" \) -prune -o \
+  ! -type l -perm /022 -print -quit | /usr/bin/grep -q .; then
+  exit 1
+fi
+
+(
+  cd "${install_dir}"
+  /usr/bin/find -P . -xdev -mindepth 1 -printf '%y %m %P %l\n' | /usr/bin/sort
+) | /usr/bin/cmp --silent - "${entries}"
+(
+  cd "${install_dir}"
+  /usr/bin/sha256sum --check --strict --quiet "${checksums}"
+)
+/usr/bin/printf '%s\n' "${jit_launcher_sha256}  ${jit_launcher}" | /usr/bin/sha256sum --check --status
+
+/usr/bin/printf '%s\n' 'smolrunner-runner-integrity-ok'

@@ -191,6 +191,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "glaeda"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "rustix",
+ "seccompiler",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha1",
+ "sha2",
+ "signal-hook",
+ "zeroize",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,6 +304,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +392,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,21 +431,6 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
-]
-
-[[package]]
-name = "smolrunner"
-version = "0.1.0"
-dependencies = [
- "clap",
- "rustix",
- "security-framework",
- "serde",
- "serde_json",
- "serde_norway",
- "sha2",
- "signal-hook",
- "zeroize",
 ]
 
 [[package]]

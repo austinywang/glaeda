@@ -1,28 +1,28 @@
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     EpochMillis, ExecutionAdmissionIdentity, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, RunnerProfileId,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
     PersonalWorkerJobRequest, PersonalWorkerPriority, PersonalWorkerQueueGeneration,
     PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerStoreError, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRevision,
 };
-use smolrunner::personal_worker_store_transaction::{
+use glaeda::personal_worker_store_transaction::{
     PersonalWorkerStoreMutation, PersonalWorkerStoreMutationError,
     PersonalWorkerStoreMutationErrorKind, PersonalWorkerStoreMutationReceipt,
     apply_personal_worker_store_mutation,
 };
 #[cfg(unix)]
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use serde::Serialize;
 
 pub const PERSONAL_WORKER_SUBMIT_COMMAND_SCHEMA_VERSION: u8 = 1;
 

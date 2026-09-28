@@ -1,0 +1,82 @@
+#!/bin/bash
+# glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
+#
+#   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
+#                            [--prewarm REPO] NODE_HOST... [--apply]
+#
+# Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
+# listens on the store host's tailnet address port 7450; every NODE_HOST gets a read-only
+# node daemon pointed at it. With --trusted-keys, the store keeps and every node uses only
+# index entries signed by those keys. --writer makes that host the signing writer: its node
+# signs with the key at --sign-key (a path on the writer, created there beforehand with
+# `fleet-cas keygen`), and its tailnet address becomes the store's only allowed writer. The
+# writer host must run no PR or other untrusted job: any process there can reach the signing
+# node's socket. Each host
+# receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
+# ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
+# (docs/CMUX_BUILD_SLOT_MODES.md). With --prewarm REPO (cmux@catchup-v1), every node also gets
+# the prewarm agent (fleet-cas-prewarm.sh), which keeps it warm with the writer's newest fill.
+# Every host needs the tailnet grant for the store port.
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+PORT=7450
+store= apply= trusted= writer= sign_key= prewarm= nodes=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --store) store=${2:?}; shift ;;
+    --trusted-keys) trusted=${2:?}; shift ;;
+    --writer) writer=${2:?}; shift ;;
+    --sign-key) sign_key=${2:?}; shift ;;
+    --prewarm) prewarm=${2:?}; shift ;;
+    --apply) apply=--apply ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) nodes+=("$1") ;;
+  esac
+  shift
+done
+[ -n "$store" ] || { sed -n '2,6p' "$0" >&2; exit 2; }
+if [ -n "$writer" ]; then
+  [ -n "$sign_key" ] && [ -n "$trusted" ] || { echo "--writer needs --sign-key PATH and --trusted-keys HEX" >&2; exit 2; }
+elif [ -n "$sign_key" ]; then
+  echo "--sign-key needs --writer HOST" >&2; exit 2
+fi
+# The rollout is stateless: whatever it is given replaces the deployed configuration.
+[ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
+[ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
+for h in "$store" ${writer:+"$writer"} ${nodes[@]+"${nodes[@]}"}; do
+  target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
+  case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
+done
+
+ship() {  # host
+  ssh -o BatchMode=yes "$1" 'mkdir -p ~/.cache/glaeda-fleet-cas/glaeda/scripts ~/.cache/glaeda-fleet-cas/glaeda/tools'
+  rsync -a -e 'ssh -o BatchMode=yes' "$here/scripts/glaeda-fleet-cas" "$1:.cache/glaeda-fleet-cas/glaeda/scripts/"
+  rsync -a -e 'ssh -o BatchMode=yes' --delete --exclude target "$here/tools/fleet-cas-prototype" "$1:.cache/glaeda-fleet-cas/glaeda/tools/"
+}
+run() {  # host, args...
+  local h=$1; shift
+  echo "== $h"
+  ship "$h"
+  # Quote each argument for the remote shell.
+  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
+}
+
+# The store's tailnet address: launchd-started third-party binaries on these minis cannot
+# reach other hosts' LAN addresses (macOS Local Network privacy), and tailnet addresses work.
+# The tailnet grants the store port to the build minis (cmuxterm-hq#591). Every client,
+# the writer included, then connects from its own tailnet address, so --writers sees real
+# peers (glaeda#1208).
+tailnet_ip() {
+  local ip; ip=$(ssh -o BatchMode=yes "$1" "ifconfig | awk '/inet 100\\./ {print \$2; exit}'")
+  [ -n "$ip" ] || { echo "no tailnet (100.x) address on $1" >&2; exit 1; }
+  echo "$ip"
+}
+ip=$(tailnet_ip "$store")
+writer_ip=
+[ -z "$writer" ] || writer_ip=$(tailnet_ip "$writer")
+run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
+[ -z "$writer" ] || run "$writer" writer --store "$ip:$PORT" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
+for n in ${nodes[@]+"${nodes[@]}"}; do
+  [ "$n" = "$writer" ] && continue
+  run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} ${prewarm:+--prewarm "$prewarm"} $apply
+done

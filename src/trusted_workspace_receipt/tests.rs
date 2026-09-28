@@ -4,14 +4,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ownership::{OwnershipMarker, ProjectIdentity, ResourceIdentity};
+use crate::project_workspace_identity::ProjectWorkspaceIdentityGeneration;
 use crate::state::InstallationId;
 use crate::state_document::{
     ProjectStateDocument, ResourceStateDocument, StateDocument, encode_state_document,
 };
+use crate::state_root_generation::{
+    GLAEDA_CURRENT_STATE_ROOT, SMOLRUNNER_LEGACY_STATE_ROOT, StateRootSelection,
+};
 
 use super::{
     CACHE_RESOURCE_FILE, PROJECT_FILE, RESOURCES_DIRECTORY, TrustedWorkspaceReceiptErrorKind,
-    WORKSPACE_RESOURCE_FILE, produce_trusted_workspace_cache_receipt, produce_with_hook,
+    WORKSPACE_RESOURCE_FILE, produce_trusted_workspace_cache_receipt,
+    produce_trusted_workspace_cache_receipt_for_generation, produce_with_hook,
+    select_trusted_workspace_root,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -133,6 +139,18 @@ impl Fixture {
     fn receipt(&self) -> super::TrustedWorkspaceCacheReceipt {
         produce_trusted_workspace_cache_receipt(self.root.path(), &self.project).expect("receipt")
     }
+
+    fn receipt_for_generation(
+        &self,
+        generation: ProjectWorkspaceIdentityGeneration,
+    ) -> super::TrustedWorkspaceCacheReceipt {
+        produce_trusted_workspace_cache_receipt_for_generation(
+            self.root.path(),
+            &self.project,
+            generation,
+        )
+        .expect("receipt")
+    }
 }
 
 fn create_directory(path: impl AsRef<Path>, mode: u32) {
@@ -166,6 +184,10 @@ fn descriptor_relative_success_is_private_and_deterministic() {
         fixture.installation_id.as_str()
     );
     assert_eq!(first.repository().as_str(), "example/project");
+    assert_eq!(
+        first.identity_generation(),
+        ProjectWorkspaceIdentityGeneration::GlaedaV2
+    );
     assert_eq!(first.cache_id().as_str(), "cargo-target");
     assert!(first_workspace_id.starts_with("workspace-"));
     assert!(first_namespace.starts_with("sha256:"));
@@ -182,6 +204,8 @@ fn descriptor_relative_success_is_private_and_deterministic() {
         assert!(!debug.contains(private));
     }
     assert!(!json.contains("ready"));
+    assert!(json.contains("\"schema_version\":2"));
+    assert!(json.contains("\"identity_generation\":\"glaeda_v2\""));
 
     let second = fixture.receipt();
     assert_eq!(second.workspace_id().as_str(), first_workspace_id);
@@ -190,6 +214,64 @@ fn descriptor_relative_success_is_private_and_deterministic() {
     assert_eq!(
         second.workspace_location_identity(),
         first.workspace_location_identity()
+    );
+}
+
+#[test]
+fn fixed_root_selection_seals_the_matching_identity_generation() {
+    let current = select_trusted_workspace_root(StateRootSelection::Current);
+    let legacy = select_trusted_workspace_root(StateRootSelection::LegacySmolrunnerV1);
+
+    assert_eq!(
+        current.root.fixed_path(),
+        Path::new(GLAEDA_CURRENT_STATE_ROOT)
+    );
+    assert_eq!(
+        current.identity_generation,
+        ProjectWorkspaceIdentityGeneration::GlaedaV2
+    );
+    assert_eq!(
+        legacy.root.fixed_path(),
+        Path::new(SMOLRUNNER_LEGACY_STATE_ROOT)
+    );
+    assert_eq!(
+        legacy.identity_generation,
+        ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+    );
+    assert_ne!(current.root.fixed_path(), legacy.root.fixed_path());
+    assert_ne!(current.identity_generation, legacy.identity_generation);
+}
+
+#[test]
+fn legacy_and_current_generations_are_explicit_and_fully_separated() {
+    let fixture = Fixture::new("generations");
+    if !fixture.root.supported_owner() {
+        return;
+    }
+
+    let legacy = fixture.receipt_for_generation(ProjectWorkspaceIdentityGeneration::SmolrunnerV1);
+    let current = fixture.receipt_for_generation(ProjectWorkspaceIdentityGeneration::GlaedaV2);
+
+    assert_eq!(
+        legacy.identity_generation(),
+        ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+    );
+    assert_eq!(
+        current.identity_generation(),
+        ProjectWorkspaceIdentityGeneration::GlaedaV2
+    );
+    assert_ne!(legacy.workspace_id(), current.workspace_id());
+    assert_ne!(
+        legacy.cache_namespace_digest(),
+        current.cache_namespace_digest()
+    );
+    assert_ne!(
+        legacy.trusted_evidence_digest(),
+        current.trusted_evidence_digest()
+    );
+    assert_eq!(
+        legacy.workspace_location_identity(),
+        current.workspace_location_identity()
     );
 }
 

@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, test_kill_process_group};
-use serde_json::Value;
-use smolrunner::disposable_template_runtime::DisposableTemplateRuntime;
-use smolrunner::lima_observation::{LimaInstanceName, SystemLimaObservationClock};
-use smolrunner::process::{
+use glaeda::disposable_template_runtime::DisposableTemplateRuntime;
+use glaeda::lima_observation::{LimaInstanceName, SystemLimaObservationClock};
+use glaeda::process::{
     CommandExecutor, CommandSpec, ExecutionRecord, ProcessExecutor, TimedCommandExecutor,
 };
+use rustix::process::{Pid, test_kill_process_group};
+use serde_json::Value;
 
 const OPT_IN_ENV: &str = "SMOLRUNNER_PHYSICAL_CONTROLLER_DEATH_ACCEPTANCE";
 const OPT_IN_TOKEN: &str = "template-create-sigkill";

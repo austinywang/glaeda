@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::disposable_attempt_catalog::DisposableAttemptReservation;
 use crate::disposable_attempt_state::DisposableAttemptRevision;
+use crate::disposable_clone_runtime::CloneRuntimeClock;
 use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableVmIdentity,
 };
@@ -26,7 +27,8 @@ use crate::github_scale_set_bridge::{
 use crate::github_scale_set_protocol::ScaleSetRunnerName;
 use crate::github_scale_set_protocol::ScaleSetRunnerReference;
 use crate::lima_observation::{LIMACTL_SAFE_HOME, LIMACTL_SAFE_PATH};
-use crate::process::CommandSpec;
+use crate::owned_linux_jit_runtime::OwnedLinuxJitRuntime;
+use crate::process::{CommandSpec, TimedCommandExecutor};
 
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 const RUNNER_WORK_DIRECTORY: &str = "/opt/smolrunner/actions-runner";
@@ -102,10 +104,37 @@ impl fmt::Display for DisposableRunnerRuntimeError {
 
 impl std::error::Error for DisposableRunnerRuntimeError {}
 
-/// Fixed command builder for the official one-job runner inside a disposable Lima VM.
+/// Fixed command builder for the official one-job runner inside an admitted physical target.
 pub(crate) struct DisposableRunnerRuntime {
-    limactl_program: PathBuf,
-    lima_home: PathBuf,
+    backend: DisposableRunnerBackend,
+}
+
+enum DisposableRunnerBackend {
+    Lima {
+        limactl_program: PathBuf,
+        lima_home: PathBuf,
+    },
+    OwnedLinux(OwnedLinuxJitRuntime),
+}
+
+/// Backend-specific proof that the same exact physical target remains eligible around JIT mutation.
+pub(crate) trait DisposableRunnerTargetRuntime {
+    type Confirmation;
+
+    fn confirm_runner_target(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<Self::Confirmation, DisposableRunnerRuntimeError>;
+
+    fn reconfirm_runner_target(
+        &self,
+        confirmation: &Self::Confirmation,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<(), DisposableRunnerRuntimeError>;
 }
 
 pub(crate) trait DisposableRunnerRegistrationSource {
@@ -144,9 +173,17 @@ impl DisposableRunnerRuntime {
         lima_home: impl Into<PathBuf>,
     ) -> Result<Self, DisposableRunnerRuntimeError> {
         Ok(Self {
-            limactl_program: validate_private_path(limactl_program.into())?,
-            lima_home: validate_private_path(lima_home.into())?,
+            backend: DisposableRunnerBackend::Lima {
+                limactl_program: validate_private_path(limactl_program.into())?,
+                lima_home: validate_private_path(lima_home.into())?,
+            },
         })
+    }
+
+    pub(crate) fn new_owned_linux(runtime: OwnedLinuxJitRuntime) -> Self {
+        Self {
+            backend: DisposableRunnerBackend::OwnedLinux(runtime),
+        }
     }
 
     /// Consume one JIT response into a secret-bearing, non-executable plan.
@@ -190,23 +227,29 @@ impl DisposableRunnerRuntime {
         })?;
         validate_jit(&encoded)?;
 
-        let command = self
-            .base_command()
-            .argument("shell")
-            .argument("--workdir")
-            .argument(RUNNER_WORK_DIRECTORY)
-            .argument(attempt.vm_id().as_str())
-            .argument(SUDO)
-            .argument("--non-interactive")
-            .argument("--set-home")
-            .argument("--user")
-            .argument(RUNNER_USER)
-            .argument(ENV)
-            .argument("-i")
-            .argument(format!("HOME={RUNNER_HOME}"))
-            .argument("PATH=/usr/bin:/bin")
-            .argument(JIT_LAUNCHER)
-            .zeroizing_secret_stdin_line(encoded);
+        let command = match &self.backend {
+            DisposableRunnerBackend::Lima { .. } => self
+                .base_command()
+                .expect("Lima backend has a Lima base command")
+                .argument("shell")
+                .argument("--workdir")
+                .argument(RUNNER_WORK_DIRECTORY)
+                .argument(attempt.vm_id().as_str())
+                .argument(SUDO)
+                .argument("--non-interactive")
+                .argument("--set-home")
+                .argument("--user")
+                .argument(RUNNER_USER)
+                .argument(ENV)
+                .argument("-i")
+                .argument(format!("HOME={RUNNER_HOME}"))
+                .argument("PATH=/usr/bin:/bin")
+                .argument(JIT_LAUNCHER)
+                .zeroizing_secret_stdin_line(encoded),
+            DisposableRunnerBackend::OwnedLinux(runtime) => {
+                runtime.runner_command(reservation, now, encoded)?
+            }
+        };
 
         Ok(DisposableRunnerLaunchPlan {
             attempt_id: attempt.attempt_id().clone(),
@@ -243,29 +286,45 @@ impl DisposableRunnerRuntime {
         Ok(())
     }
 
-    fn base_command(&self) -> CommandSpec {
-        CommandSpec::new(&self.limactl_program)
-            .argument("--tty=false")
-            .environment("HOME", LIMACTL_SAFE_HOME)
-            .secret_environment(
-                "LIMA_HOME",
-                self.lima_home
-                    .to_str()
-                    .expect("validated Lima home remains UTF-8"),
-            )
-            .environment("LANG", "C")
-            .environment("LC_ALL", "C")
-            .environment("PATH", LIMACTL_SAFE_PATH)
+    fn base_command(&self) -> Option<CommandSpec> {
+        let DisposableRunnerBackend::Lima {
+            limactl_program,
+            lima_home,
+        } = &self.backend
+        else {
+            return None;
+        };
+        Some(
+            CommandSpec::new(limactl_program)
+                .argument("--tty=false")
+                .environment("HOME", LIMACTL_SAFE_HOME)
+                .secret_environment(
+                    "LIMA_HOME",
+                    lima_home
+                        .to_str()
+                        .expect("validated Lima home remains UTF-8"),
+                )
+                .environment("LANG", "C")
+                .environment("LC_ALL", "C")
+                .environment("PATH", LIMACTL_SAFE_PATH),
+        )
     }
 }
 
 impl fmt::Debug for DisposableRunnerRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DisposableRunnerRuntime")
-            .field("limactl_program", &"<private-program-path>")
-            .field("lima_home", &"<private-lima-home>")
-            .finish()
+        match &self.backend {
+            DisposableRunnerBackend::Lima { .. } => formatter
+                .debug_struct("DisposableRunnerRuntime")
+                .field("backend", &"lima")
+                .field("paths", &"<private>")
+                .finish(),
+            DisposableRunnerBackend::OwnedLinux(_) => formatter
+                .debug_struct("DisposableRunnerRuntime")
+                .field("backend", &"owned_linux")
+                .field("paths", &"<private>")
+                .finish(),
+        }
     }
 }
 

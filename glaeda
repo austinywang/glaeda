@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Canonical one-command Glaeda source-checkout front door."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+scripts = Path(__file__).resolve().parent / "scripts"
+sys.path.insert(0, str(scripts))
+
+from workspace_bootstrap.journey import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,12 +1,12 @@
-use smolrunner::disposable_attempt_state::{
+use glaeda::disposable_attempt_state::{
     DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION, DisposableAttemptState,
     decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
-use smolrunner::disposable_worker_reconciler::{
+use glaeda::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
 };
-use smolrunner::execution_admission::EpochMillis;
-use smolrunner::github_scale_set_protocol::{
+use glaeda::execution_admission::EpochMillis;
+use glaeda::github_scale_set_protocol::{
     ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
     ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };

@@ -2,11 +2,11 @@
 
 use std::env;
 
-use serde_json::json;
-use smolrunner::lima_host_identity::LimaHostIdentityAdapter;
-use smolrunner::lima_observation::{
+use glaeda::lima_host_identity::LimaHostIdentityAdapter;
+use glaeda::lima_observation::{
     LimaArchitecture, LimaInstanceName, LimaObservationRequest, LimaVmType,
 };
+use serde_json::json;
 
 const RECEIPT_TYPE: &str = "smolrunner-lima-host-identity-observation";
 

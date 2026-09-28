@@ -112,7 +112,7 @@ Important M6 capabilities already landed:
 | single-writer project-disk lease core | #565 / #567 | logical disk/attachment generations; physical Lima correlation still pending |
 | Git index-v2 stat-cache patcher | #568 / #569 | pure verified index-byte handling |
 | source-anchor/task-view lifecycle | #570 / #571 | exact leases and ready/run/cleanup ordering |
-| trusted OverlayFS mount plan | #572 / #575 | exact lower/upper/work/merged identities and fixed mount policy |
+| trusted OverlayFS mount plan | #572 / #575 | exact lower/upper/work/merged identities, per-role ownership/mode trust, and fixed mount policy |
 | hot-state path policy | #573 / #579 | overlay/private-CoW/private-empty/reviewed-share selection |
 | immutable Git object-pool lease core | #581 / #583 | pool generation identity, consumer leases, draining and retirement |
 | mount-plan reconfirmation | #576 / #582 | fresh authority/evidence before privileged mount work |
@@ -127,6 +127,12 @@ Important M6 capabilities already landed:
 | immutable-pool publication guest operation | #592 / #626 | distinct closed protocol tag for pool publication; no handler or mutation authority |
 
 #607 contains physical mount mechanics, while normal product code still cannot mint the required project-filesystem correlation proof. Physical activation waits for accepted #565 P2 evidence.
+
+Mount-plan role trust declares its enforcement status and cites the exact path plus symbol the claim rests on, the same way `docs/THREAT_MODEL.md` does.
+
+- **enforced** — every OverlayFS role directory must be owned by root or the observing effective identity and must carry no group or world write bit, and `upperdir`/`workdir` must additionally grant full owner access. `src/trusted_overlay_mount_plan.rs::observe_directory` applies `src/trusted_overlay_mount_plan.rs::require_role_trust` before any snapshot becomes plan evidence, so a foreign-owned or untrusted-writable `lowerdir` can never become a task's read-only base. Refusals are `overlay_mount_role_owner_foreign`, `overlay_mount_role_untrusted_writable`, and `overlay_mount_role_owner_access_missing`.
+- **enforced** — later ownership or mode drift on an admitted role is refused as observation drift, because `src/trusted_overlay_mount_plan.rs::revalidate_directory` and `src/trusted_overlay_mount_plan.rs::require_held_directory` compare the complete recorded `DirectorySnapshot`, which includes `uid`, `gid`, and `mode`.
+- **required** — the role directories' parent chains. This observer binds each role by device and inode and holds descriptors, so a swapped role is caught as drift, but it states no policy about who may write the directories above a role. The operator's layout owner must place the four roles under a private, non-foreign-writable parent.
 
 ## Performance and kernel evidence
 
@@ -345,6 +351,98 @@ PR #612 landed the pure canonical one-shot request/receipt envelope. It binds ex
 The main production physical blocker remains #565 P2: exact operator-Mac evidence tying the standalone Lima disk generation/attachment to the guest filesystem identity. #618 is the current observation-only receipt lane on hardened head `a0bdf00fdcf98e7fd3484d8d8630904a1db37f64`; exact Verify `32760003780` is green. The collector now opens the supplied disk-directory path component-by-component with no-follow semantics and requires decoded Linux guest `st_dev` major/minor to equal the single exact project `mountinfo` row. It still leaves physical ownership unresolved and adds no writable #589 proof constructor. Because the final repair is ownership-adjacent, #618 remains gated on implementation-independent exact-head acceptance.
 
 #607 stays sealed until accepted #565 P2 evidence can mint the project-filesystem correlation proof.
+
+## #568 native same-HEAD XFS task materialization
+
+The bounded P2/P3 research spike now has a native Linux implementation. It is deliberately one
+materialization primitive rather than another pipeline or lifecycle controller:
+
+```text
+exact clean held-stable source at one commit/tree
+-> detached no-checkout linked worktree + read-tree
+-> FICLONE exact tracked regular files
+-> publish only target index-v2 stat-cache fields through the existing pure patcher
+-> exact detached HEAD + non-mutating diff-files + diff-index proof
+-> ready research receipt, or complete ordinary Git fallback
+```
+
+The CLI accepts one to 32 distinct targets. A fan-out shares one tree inventory and the opening and
+closing source-clean observations. Four bounded file workers each open a disjoint source-file range
+once and clone it across all eligible targets. Each held source descriptor is streamed through
+SHA-1 once and must equal the exact tree-entry blob OID; the opening and closing stat snapshots span
+both that proof and every clone. Target files inherit the verified source timestamps before their
+final stat publication, avoiding Git's otherwise-correct racily-clean content rehash without
+forging the index timestamp or weakening the final proof. Per-target failures remain independent
+and reset through ordinary Git. The target `.git` control file, linked-worktree backlink, and
+detached `HEAD` are read as bounded regular files with no-follow opens and must bind under the
+previously observed source common Git directory. Git subprocesses use the fixed absolute Git path,
+bounded concurrent output capture, a cleared environment, and disabled optional locks, replacement
+objects, lazy fetch, credentials, prompts, hooks, fsmonitor, external diffs, and protocols.
+Symlinks, gitlinks, unsupported index variants, dirty/moved/wrong-content source evidence,
+filesystem mismatch, and unavailable reflink support all fail to ordinary materialization. Returned
+reports contain identities, bounded counts, phase durations, dispositions, and fixed fallback
+classes but no paths or output.
+
+This code grants no resident-source lease, filesystem-generation lease, task adoption, execution,
+cache, cleanup, or reusable-checkout authority. The caller must still hold those lifecycle facts
+and authorize Git's required linked-worktree registration under the source common administration
+directory. Interrupted targets and their linked-worktree registrations are discardable cleanup
+debt; directory presence never proves readiness. The research adapter has no local deadline or
+cancellation protocol. Its outer Glaeda runtime must own the Git child process group and prove that
+child is gone before it cleans or reconstructs an interrupted target or linked registration.
+
+### Exact big-red control
+
+The corrected implementation benchmark head was `ea3ccc1f66ca58e73678d8b9bdfb824279b4a094`, tree
+`79e70042b3e68797ae35e54896227645e44f646a`, release-binary SHA-256
+`733b9455590d55cb1724f8e1994fafa877dfe0db4188cc40971914d8bdb1e60f`. The source stayed clean at
+that exact head before and after every arm. The host used kernel `7.0.0-30-generic`; the disposable
+4 GiB XFS filesystem reported `reflink=1`, `crc=1`, `bigtime=1`, 4 KiB blocks, and `noatime`.
+
+Each count used three A-B-B-A brackets, giving six ordinary and six reflink samples. Both arms ran
+through the same release binary, source, commit, task count, final Git validator, resident and
+otherwise uncontrolled page cache, and sequential `git worktree remove --force` cleanup. Parent
+monotonic wall time includes binary startup. Child CPU/RSS came from GNU `time`. Physical deltas are
+mount-level `statvfs` used bytes sampled only after `syncfs` on the exact experiment mount, outside
+the timed materialization window; this avoids treating summed file `st_blocks` as unique usage for
+shared extents. Each invocation had a 30-second process-group deadline; none approached it.
+
+| Tasks | Ordinary median | Reflink median | Latency delta | Ordinary new bytes | Reflink new bytes | Byte reduction |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 66.264 ms | 33.773 ms | -49.0% | 11,538,432 | 421,888 | 96.3% |
+| 8 | 88.654 ms | 61.011 ms | -31.2% | 92,282,880 | 3,350,528 | 96.4% |
+| 32 | 227.162 ms | 177.322 ms | -21.9% | 369,041,408 | 13,312,000 | 96.4% |
+
+All 36 timed task sets completed with the requested disposition, exact commit/tree, zero candidate
+fallbacks, and the final proof. Reflink child RSS maxima were 6.40, 6.45, and 13.76 MiB at 1/8/32;
+ordinary maxima were 12.11, 12.21, and 11.46 MiB. Reflink median cleanup was also lower: 8.324,
+72.400, and 340.650 ms versus ordinary 10.083, 80.856, and 381.286 ms.
+
+An exact-head physical follow-up reflinked all 501 regular files / 10,036,925 logical bytes. For
+`src/linux_reflink_task_materialization.rs`, `xfs_bmap -v` reported the same
+`6319368..6319519` physical block range and shared-extent flag `100000` in source and target. Both
+files had SHA-256 `176e217764c90ce0d0a19690214a00b29e5a2b785debd8947da5eb7472e7444e` and exact matching
+source-derived timestamps before cleanup.
+
+### Scaling decision
+
+The first native fan-out opened the same 501 source files independently in every task thread and
+made the 32-way reflink median 958.850 ms. Entry-major traversal reduced redundant source opens;
+four disjoint file workers produced the result above. Eight file workers were rejected after a
+32-way smoke raised preparation to 471.373 ms and total wall time to 542.277 ms. XFS metadata
+concurrency has a measured knee on this host; more threads are not automatically faster.
+
+Independent review then exposed that the earlier fast candidate did not bind opened source bytes to
+tree-entry blob OIDs. The first corrected allocation-heavy hash implementation measured 121.876 ms
+versus 104.901 ms ordinary at eight tasks (+16.2%). Streaming the exact hash reduced that to
+105.532 ms versus 101.620 ms (+3.9%). Publishing verified source timestamps removed redundant
+racily-clean Git rehashes and produced the final 61.011 ms versus 88.654 ms result (-31.2%). These
+are separate exact-code A-B-B-A matrices, not an attribution inferred from one uncontrolled run.
+
+The spike therefore passes the narrow research decision: one, eight, and 32 tasks are faster while
+allocating roughly 27 times fewer new bytes. It is suitable for integration behind exact
+resident-source and filesystem-generation evidence, ordinary fallback, and the existing outer
+admission/resource controller. It is not a generic XFS speed claim or a product-default grant.
 
 ## Failed experiments and corrected assumptions
 

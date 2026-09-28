@@ -1,4 +1,4 @@
-const JIT_LAUNCHER: &str = include_str!("../examples/lima/smolrunner-jit-launcher");
+const JIT_LAUNCHER: &str = include_str!("../examples/lima/glaeda-jit-launcher");
 
 #[test]
 fn jit_launcher_keeps_workflow_result_out_of_runner_process_exit_semantics() {

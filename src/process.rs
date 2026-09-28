@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -220,6 +220,26 @@ pub trait TimedInputCommandExecutor: TimedCommandExecutor {
     ) -> io::Result<ExecutionRecord>;
 }
 
+pub trait TimedWorkingDirectoryCommandExecutor: TimedCommandExecutor {
+    /// Execute one explicit program from one exact normalized working directory.
+    ///
+    /// This retains the ordinary timeout, process-group termination, bounded output, closed stdin,
+    /// and cleared-environment contract. The working directory remains private and never enters the
+    /// returned execution record.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` unless the directory is a normalized absolute non-root UTF-8 path,
+    /// or when the timeout is invalid. Spawn, capture, output-limit, and timeout failures retain the
+    /// ordinary timed-executor contract.
+    fn execute_in_directory_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        working_directory: &Path,
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord>;
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessExecutor;
 
@@ -253,6 +273,25 @@ impl TimedInputCommandExecutor for ProcessExecutor {
     }
 }
 
+impl TimedWorkingDirectoryCommandExecutor for ProcessExecutor {
+    fn execute_in_directory_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        working_directory: &Path,
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord> {
+        validate_timeout(timeout)?;
+        validate_working_directory(working_directory)?;
+        execute_process_with_working_directory_input_spawner(
+            spec,
+            Some(timeout),
+            None,
+            Some(working_directory),
+            &ThreadCaptureSpawner,
+        )
+    }
+}
+
 fn validate_timeout(timeout: Duration) -> io::Result<()> {
     if timeout.is_zero() || timeout > MAX_COMMAND_TIMEOUT {
         return Err(io::Error::new(
@@ -268,6 +307,22 @@ fn validate_plain_stdin(input: &[u8]) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "command stdin exceeds the fixed bounded input limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_working_directory(working_directory: &Path) -> io::Result<()> {
+    if !working_directory.is_absolute()
+        || working_directory == Path::new("/")
+        || working_directory.to_str().is_none()
+        || !working_directory
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "working directory must be a normalized absolute non-root UTF-8 path",
         ));
     }
     Ok(())
@@ -289,6 +344,16 @@ fn execute_process_with_input_spawner<S: CaptureThreadSpawner>(
     spec: &CommandSpec,
     timeout: Option<Duration>,
     input: Option<&[u8]>,
+    spawner: &S,
+) -> io::Result<ExecutionRecord> {
+    execute_process_with_working_directory_input_spawner(spec, timeout, input, None, spawner)
+}
+
+fn execute_process_with_working_directory_input_spawner<S: CaptureThreadSpawner>(
+    spec: &CommandSpec,
+    timeout: Option<Duration>,
+    input: Option<&[u8]>,
+    working_directory: Option<&Path>,
     spawner: &S,
 ) -> io::Result<ExecutionRecord> {
     ensure_absolute_program(&spec.program)?;
@@ -318,7 +383,12 @@ fn execute_process_with_input_spawner<S: CaptureThreadSpawner>(
         })
         .transpose()?;
     if spec.secret_stdin.is_some() {
-        return execute_secret_process_with_discarded_output(spec, deadline, spawner);
+        return execute_secret_process_with_discarded_output(
+            spec,
+            deadline,
+            working_directory,
+            spawner,
+        );
     }
 
     let mut command = Command::new(&spec.program);
@@ -332,6 +402,9 @@ fn execute_process_with_input_spawner<S: CaptureThreadSpawner>(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
     command.args(spec.arguments.iter().map(CommandValue::exposed));
     for (key, value) in &spec.environment {
         command.env(key, value.exposed());
@@ -561,6 +634,7 @@ fn execute_process_with_input_spawner<S: CaptureThreadSpawner>(
 fn execute_secret_process_with_discarded_output<S: CaptureThreadSpawner>(
     spec: &CommandSpec,
     deadline: Option<Instant>,
+    working_directory: Option<&Path>,
     spawner: &S,
 ) -> io::Result<ExecutionRecord> {
     let deadline = deadline.ok_or_else(|| {
@@ -580,6 +654,9 @@ fn execute_secret_process_with_discarded_output<S: CaptureThreadSpawner>(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
     command.args(spec.arguments.iter().map(CommandValue::exposed));
     for (key, value) in &spec.environment {
         command.env(key, value.exposed());
@@ -894,8 +971,9 @@ mod tests {
     use super::{
         CaptureEvent, CaptureThreadSpawner, CapturedStream, CommandExecutor, CommandSpec,
         MAX_CAPTURED_STDIN_BYTES, MAX_CAPTURED_STREAM_BYTES, MAX_COMMAND_TIMEOUT, ProcessExecutor,
-        REDACTED, ThreadCaptureSpawner, TimedCommandExecutor, TimedInputCommandExecutor, Zeroizing,
-        execute_process_with_input_spawner, execute_process_with_spawner,
+        REDACTED, ThreadCaptureSpawner, TimedCommandExecutor, TimedInputCommandExecutor,
+        TimedWorkingDirectoryCommandExecutor, Zeroizing, execute_process_with_input_spawner,
+        execute_process_with_spawner,
     };
 
     struct FailingCaptureSpawner {
@@ -1098,6 +1176,40 @@ mod tests {
             .execute(&CommandSpec::new("printf"))
             .expect_err("relative program must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn timed_working_directory_is_exact_private_and_validated_before_spawn() -> io::Result<()> {
+        let pwd = Path::new("/usr/bin/pwd");
+        if !pwd.is_file() {
+            return Ok(());
+        }
+        let fixture = timeout_fixture_directory()?;
+        let record = ProcessExecutor.execute_in_directory_with_timeout(
+            &CommandSpec::new(pwd),
+            &fixture,
+            Duration::from_secs(1),
+        )?;
+        assert!(record.success);
+        assert_eq!(record.stdout.trim_end(), fixture.to_string_lossy());
+        assert!(!format!("{record:?}").contains("working_directory"));
+
+        for invalid in [
+            Path::new("relative"),
+            Path::new("/"),
+            Path::new("/tmp/../tmp"),
+        ] {
+            let error = ProcessExecutor
+                .execute_in_directory_with_timeout(
+                    &CommandSpec::new("/absolute/program/that/must/not/exist"),
+                    invalid,
+                    Duration::from_secs(1),
+                )
+                .expect_err("invalid cwd must fail before spawn");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        fs::remove_dir(fixture)?;
+        Ok(())
     }
 
     #[test]

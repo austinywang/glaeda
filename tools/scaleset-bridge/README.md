@@ -1,18 +1,18 @@
-# SmolRunner Runner Scale Set bridge
+# Glaeda Runner Scale Set bridge
 
 This is a deliberately small process boundary around GitHub's official
 [`actions/scaleset`](https://github.com/actions/scaleset) Go client. The module pins exact commit
 `cb0405b2d874500e75ae34eff8d582ab75956b45` through the Go pseudo-version in `go.mod`.
 
-The bridge exists so SmolRunner does not reimplement GitHub's Runner Scale Set authentication,
+The bridge exists so Glaeda does not reimplement GitHub's Runner Scale Set authentication,
 message-session refresh, long polling, JIT configuration, or runner API semantics in Rust. It does
 not use the client's convenience listener because that listener acknowledges a message before it
-invokes lifecycle handlers. SmolRunner needs this ordering instead:
+invokes lifecycle handlers. Glaeda needs this ordering instead:
 
 ```text
 poll through official client
 -> return one bounded normalized message to Rust
--> persist/reconcile it under the durable SmolRunner lock
+-> persist/reconcile it under the durable Glaeda lock
 -> explicit ack from Rust
 -> delete the message and acquire its available job request IDs
 ```

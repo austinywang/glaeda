@@ -5,19 +5,17 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use smolrunner::durable_journal::StateStoreJournalCheckpoint;
-use smolrunner::host_preparation_execution::{
+use glaeda::durable_journal::StateStoreJournalCheckpoint;
+use glaeda::host_preparation_execution::{
     HostPreparationExecutionDisposition, execute_confirmed_host_preparation,
 };
-use smolrunner::host_preparation_plan::HostPreparationResult;
-use smolrunner::journal::ActionOutcome;
-use smolrunner::lane_command::LaneCommandKind;
-use smolrunner::linux_state::LinuxStateRoot;
-use smolrunner::process::ProcessExecutor;
-use smolrunner::runner_account_observation::{
-    RunnerAccountObservationPaths, observe_runner_account,
-};
-use smolrunner::runner_user_observation::{
+use glaeda::host_preparation_plan::HostPreparationResult;
+use glaeda::journal::ActionOutcome;
+use glaeda::lane_command::LaneCommandKind;
+use glaeda::linux_state::LinuxStateRoot;
+use glaeda::process::ProcessExecutor;
+use glaeda::runner_account_observation::{RunnerAccountObservationPaths, observe_runner_account};
+use glaeda::runner_user_observation::{
     FreshRunnerUserEvidenceErrorKind, observe_verified_runner_user,
 };
 

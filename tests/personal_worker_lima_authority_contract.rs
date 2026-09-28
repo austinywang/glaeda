@@ -13,46 +13,46 @@ mod lima_host_identity_support;
 
 use lima_host_identity_support::LimaHostIdentityFixture;
 
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::disposable_attempt_catalog::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::disposable_attempt_catalog::{
     DisposableAttemptCatalogDocument, encode_disposable_attempt_catalog,
 };
-use smolrunner::execution_admission::{
+use glaeda::execution_admission::{
     EpochMillis, ExecutionRequestId, ExecutionResourceLimits, HostCapacityObservation,
     RunnerProfileId,
 };
-use smolrunner::lima_lifecycle::{
+use glaeda::lima_lifecycle::{
     LimaCacheDiskId, LimaCacheDiskIdentity, LimaInstanceId, LimaInstanceIdentity,
     LimaLifecycleObservation, LimaLifecycleObservationDefinition, LimaLifecyclePolicy,
     LimaLifecycleState, LimaObservedResources, LimaProfileGeneration, LimaResourceProfile,
 };
-use smolrunner::lima_observation::{
+use glaeda::lima_observation::{
     LimaArchitecture, LimaInstanceName, LimaObservationAdapter, LimaObservationRequest, LimaVmType,
 };
-use smolrunner::mac_availability::{
+use glaeda::mac_availability::{
     AvailabilityRequest, EffectiveAvailabilityMode, HostPowerSource, JobActivity,
     MacAvailabilityObservation, MemoryPressure, ObservationFreshness, VmPowerState,
 };
-use smolrunner::macos_resource_observation::{
+use glaeda::macos_resource_observation::{
     lima_process_command, memory_pressure_command, power_command, swap_command,
 };
-use smolrunner::operator_config::{
+use glaeda::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
-use smolrunner::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
-use smolrunner::personal_worker_lima_authority::{
+use glaeda::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
+use glaeda::personal_worker_lima_authority::{
     PERSONAL_WORKER_LIMA_AUTHORITY_SCHEMA_VERSION, PERSONAL_WORKER_LIMA_RECOVERY_SCHEMA_VERSION,
     PersonalWorkerLimaAttemptInput, PersonalWorkerLimaAttemptPhase,
     PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityErrorKind,
     PersonalWorkerLimaRecoveryDisposition, decode_personal_worker_lima_authority,
     encode_personal_worker_lima_authority, personal_worker_lima_enrollment_confirmation,
 };
-use smolrunner::personal_worker_mac_observation::{
+use glaeda::personal_worker_mac_observation::{
     PersonalWorkerMacObservation, PersonalWorkerMacObservationAdapter,
     PersonalWorkerMacObservationClock, logical_cpu_command, vm_stat_command,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PERSONAL_WORKER_QUEUE_SCHEMA_VERSION, PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
     PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES, PersonalWorkerActivityEvidence,
     PersonalWorkerCacheAccessMode, PersonalWorkerCacheLeaseState, PersonalWorkerCacheNamespace,
@@ -61,19 +61,19 @@ use smolrunner::personal_worker_queue::{
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerQueueVisibility,
     PersonalWorkerSelection,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
     PersonalWorkerStoreRevision,
 };
-use smolrunner::personal_worker_tick::{
+use glaeda::personal_worker_tick::{
     PersonalWorkerTickInput, PersonalWorkerTickPlan, PersonalWorkerTickPolicy,
 };
-use smolrunner::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::unix_personal_worker_store::lima_authority::{
+use glaeda::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::unix_personal_worker_store::lima_authority::{
     UnixPersonalWorkerLimaAuthorityErrorKind, UnixPersonalWorkerLimaAuthorityGuard,
 };
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
 
 const CACHE_PATH: &str = "/home/runner/.cache/cargo";
 const DISK_BYTES: u64 = 80 * 1024 * 1024 * 1024;
@@ -652,7 +652,7 @@ fn enrollment_uses_sealed_running_identity_and_has_canonical_private_encoding() 
     assert_eq!(
         document.persistent_identity(),
         match &running.report().lima.guest {
-            smolrunner::lima_observation::LimaGuestObservation::Observed(guest) => {
+            glaeda::lima_observation::LimaGuestObservation::Observed(guest) => {
                 &guest.persistent_identity
             }
             _ => panic!("running guest"),
@@ -765,7 +765,7 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     assert!(
         matches!(
             tick.action(),
-            smolrunner::personal_worker_tick::PersonalWorkerTickAction::StopVm {
+            glaeda::personal_worker_tick::PersonalWorkerTickAction::StopVm {
                 current_profile: LimaResourceProfile::Interactive,
                 target_after_stop: PersonalWorkerProfile::Work,
                 ..
@@ -786,7 +786,7 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     let attempt = prepared.attempt().expect("attempt");
     assert_eq!(
         attempt.action(),
-        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToWork
+        glaeda::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToWork
     );
     assert_eq!(attempt.store_revision().get(), 5);
     assert_eq!(attempt.queue_generation().get(), 7);
@@ -967,7 +967,7 @@ fn stopped_start_and_profile_change_require_the_enrolled_host_identity() {
     let tick = worker_tick(&before);
     assert!(matches!(
         tick.action(),
-        smolrunner::personal_worker_tick::PersonalWorkerTickAction::ChangeProfile {
+        glaeda::personal_worker_tick::PersonalWorkerTickAction::ChangeProfile {
             from_profile: LimaResourceProfile::Interactive,
             to_profile: LimaResourceProfile::Work,
             ..
@@ -984,7 +984,7 @@ fn stopped_start_and_profile_change_require_the_enrolled_host_identity() {
         .expect("stopped edit uses current immutable ownership proof");
     assert_eq!(
         prepared_edit.attempt().expect("attempt").action(),
-        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::EditToWork
+        glaeda::personal_worker_lima_authority::PersonalWorkerLimaAction::EditToWork
     );
     assert_eq!(
         decode_personal_worker_lima_authority(
@@ -1048,7 +1048,7 @@ fn stopped_start_and_profile_change_require_the_enrolled_host_identity() {
     let start_tick = worker_tick(&stopped_work);
     assert!(matches!(
         start_tick.action(),
-        smolrunner::personal_worker_tick::PersonalWorkerTickAction::StartVm { .. }
+        glaeda::personal_worker_tick::PersonalWorkerTickAction::StartVm { .. }
     ));
     let prepared_start = authority
         .begin_attempt(PersonalWorkerLimaAttemptInput {
@@ -1061,7 +1061,7 @@ fn stopped_start_and_profile_change_require_the_enrolled_host_identity() {
         .expect("stopped start uses current immutable ownership proof");
     assert_eq!(
         prepared_start.attempt().expect("attempt").action(),
-        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::Start
+        glaeda::personal_worker_lima_authority::PersonalWorkerLimaAction::Start
     );
     assert_eq!(
         decode_personal_worker_lima_authority(
@@ -1151,7 +1151,7 @@ fn stop_attempt_preserves_the_exact_b01_target_after_stop() {
     let tick = stop_tick(&before);
     assert!(matches!(
         tick.action(),
-        smolrunner::personal_worker_tick::PersonalWorkerTickAction::StopVm {
+        glaeda::personal_worker_tick::PersonalWorkerTickAction::StopVm {
             target_after_stop: PersonalWorkerProfile::Stopped,
             ..
         }
@@ -1167,7 +1167,7 @@ fn stop_attempt_preserves_the_exact_b01_target_after_stop() {
         .expect("prepared exact stop");
     assert!(matches!(
         prepared.attempt().expect("attempt").action(),
-        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToStopped
+        glaeda::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToStopped
     ));
     assert!(
         String::from_utf8(encode_personal_worker_lima_authority(&prepared).expect("encode"))

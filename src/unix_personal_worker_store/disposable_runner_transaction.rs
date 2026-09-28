@@ -10,10 +10,10 @@
 use super::*;
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalogAction;
-use crate::disposable_clone_runtime::{CloneRuntimeClock, DisposableCloneRuntime};
+use crate::disposable_clone_runtime::CloneRuntimeClock;
 use crate::disposable_runner_runtime::{
     DisposableRunnerCommandReceipt, DisposableRunnerRegistrationSource, DisposableRunnerRuntime,
-    DisposableRunnerRuntimeError,
+    DisposableRunnerRuntimeError, DisposableRunnerTargetRuntime,
 };
 use crate::disposable_worker_reconciler::DisposableAttemptId;
 use crate::github_scale_set_bridge::ScaleSetRunnerLookup;
@@ -26,10 +26,10 @@ pub(crate) enum DisposableRunnerTransactionOutcome {
 }
 
 impl UnixPersonalWorkerStore {
-    pub(crate) fn execute_disposable_runner_transaction(
+    pub(crate) fn execute_disposable_runner_transaction<T: DisposableRunnerTargetRuntime>(
         &mut self,
         runtime: &DisposableRunnerRuntime,
-        clone_runtime: &DisposableCloneRuntime,
+        target_runtime: &T,
         attempt_id: &DisposableAttemptId,
         registration: &mut impl DisposableRunnerRegistrationSource,
         executor: &impl TimedCommandExecutor,
@@ -108,12 +108,8 @@ impl UnixPersonalWorkerStore {
             .epoch_millis()
             .map_err(|_| DisposableRunnerRuntimeError::observation("runner_clock_unavailable"))?;
         runtime.validate_pre_jit_candidate(reservation, now)?;
-        let ready = clone_runtime
-            .confirm_ready_worker(reservation, executor, clock)
-            .map_err(|_| DisposableRunnerRuntimeError::observation("runner_target_not_ready"))?;
-        ready.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
+        let ready = target_runtime.confirm_runner_target(reservation, executor, clock)?;
+        target_runtime.reconfirm_runner_target(&ready, reservation, executor, clock)?;
 
         match registration.observe_runner(reservation.attempt().runner_name())? {
             ScaleSetRunnerLookup::Present(runner) => {
@@ -125,15 +121,15 @@ impl UnixPersonalWorkerStore {
             ScaleSetRunnerLookup::Absent => {}
         }
 
-        let ready_after_lookup = clone_runtime
-            .confirm_ready_worker(reservation, executor, clock)
-            .map_err(|_| DisposableRunnerRuntimeError::observation("runner_target_not_ready"))?;
-        ready.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
-        ready_after_lookup.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
+        let ready_after_lookup =
+            target_runtime.confirm_runner_target(reservation, executor, clock)?;
+        target_runtime.reconfirm_runner_target(&ready, reservation, executor, clock)?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_lookup,
+            reservation,
+            executor,
+            clock,
+        )?;
         let before_jit = clock
             .epoch_millis()
             .map_err(|_| DisposableRunnerRuntimeError::observation("runner_clock_unavailable"))?;
@@ -158,15 +154,20 @@ impl UnixPersonalWorkerStore {
         let jit_started_reservation = jit_started
             .find_active(attempt_id)
             .ok_or_else(|| DisposableRunnerRuntimeError::durable("runner_attempt_missing"))?;
-        let ready_after_jit_checkpoint = clone_runtime
-            .confirm_ready_worker(jit_started_reservation, executor, clock)
-            .map_err(|_| DisposableRunnerRuntimeError::observation("runner_target_not_ready"))?;
-        ready_after_lookup.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
-        ready_after_jit_checkpoint.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
+        let ready_after_jit_checkpoint =
+            target_runtime.confirm_runner_target(jit_started_reservation, executor, clock)?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_lookup,
+            jit_started_reservation,
+            executor,
+            clock,
+        )?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_jit_checkpoint,
+            jit_started_reservation,
+            executor,
+            clock,
+        )?;
         let before_generate = clock
             .epoch_millis()
             .map_err(|_| DisposableRunnerRuntimeError::observation("runner_clock_unavailable"))?;
@@ -175,9 +176,12 @@ impl UnixPersonalWorkerStore {
                 "runner_attempt_expired_before_jit",
             ));
         }
-        ready_after_jit_checkpoint.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_jit_checkpoint,
+            jit_started_reservation,
+            executor,
+            clock,
+        )?;
 
         let jit = registration.generate_jit(jit_started_reservation.attempt().runner_name())?;
         let plan = runtime.plan_launch(jit_started_reservation, before_generate, jit)?;
@@ -204,15 +208,20 @@ impl UnixPersonalWorkerStore {
         let registered_reservation = registered
             .find_active(attempt_id)
             .ok_or_else(|| DisposableRunnerRuntimeError::durable("runner_attempt_missing"))?;
-        let ready_after_jit = clone_runtime
-            .confirm_ready_worker(registered_reservation, executor, clock)
-            .map_err(|_| DisposableRunnerRuntimeError::observation("runner_target_not_ready"))?;
-        ready_after_lookup.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
-        ready_after_jit.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
+        let ready_after_jit =
+            target_runtime.confirm_runner_target(registered_reservation, executor, clock)?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_lookup,
+            registered_reservation,
+            executor,
+            clock,
+        )?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_jit,
+            registered_reservation,
+            executor,
+            clock,
+        )?;
         let before_checkpoint = clock
             .epoch_millis()
             .map_err(|_| DisposableRunnerRuntimeError::observation("runner_clock_unavailable"))?;
@@ -239,25 +248,40 @@ impl UnixPersonalWorkerStore {
         let started_reservation = started
             .find_active(attempt_id)
             .ok_or_else(|| DisposableRunnerRuntimeError::durable("runner_attempt_missing"))?;
-        ready_after_jit.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
-        let ready_after_checkpoint = clone_runtime
-            .confirm_ready_worker(started_reservation, executor, clock)
-            .map_err(|_| DisposableRunnerRuntimeError::observation("runner_target_not_ready"))?;
-        ready_after_checkpoint.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_jit,
+            started_reservation,
+            executor,
+            clock,
+        )?;
+        let ready_after_checkpoint =
+            target_runtime.confirm_runner_target(started_reservation, executor, clock)?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_checkpoint,
+            started_reservation,
+            executor,
+            clock,
+        )?;
         let command_started_at = clock
             .epoch_millis()
             .map_err(|_| DisposableRunnerRuntimeError::observation("runner_clock_unavailable"))?;
-        ready_after_checkpoint.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::observation("runner_target_identity_drift")
-        })?;
+        target_runtime.reconfirm_runner_target(
+            &ready_after_checkpoint,
+            started_reservation,
+            executor,
+            clock,
+        )?;
         let receipt = plan.execute_started(started_reservation, command_started_at, executor)?;
-        ready_after_checkpoint.confirm_current().map_err(|_| {
-            DisposableRunnerRuntimeError::recovery("runner_target_post_command_drift")
-        })?;
+        target_runtime
+            .reconfirm_runner_target(
+                &ready_after_checkpoint,
+                started_reservation,
+                executor,
+                clock,
+            )
+            .map_err(|_| {
+                DisposableRunnerRuntimeError::recovery("runner_target_post_command_drift")
+            })?;
         Ok(DisposableRunnerTransactionOutcome::CommandCompleted(
             receipt,
         ))

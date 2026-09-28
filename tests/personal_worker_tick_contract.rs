@@ -2,27 +2,27 @@
 
 use std::fs;
 
-pub use smolrunner::{
+pub use glaeda::{
     execution_admission, lima_lifecycle, mac_availability, personal_worker_host_broker,
     personal_worker_queue, personal_worker_store,
 };
 
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     EpochMillis, ExecutionRequestId, ExecutionResourceLimits, HostCapacityObservation,
     ReservationId, RunnerProfileId,
 };
-use smolrunner::lima_lifecycle::{
+use glaeda::lima_lifecycle::{
     LimaCacheDiskId, LimaCacheDiskIdentity, LimaInstanceId, LimaInstanceIdentity,
     LimaLifecycleObservation, LimaLifecycleObservationDefinition, LimaLifecyclePolicy,
     LimaLifecycleState, LimaObservedResources, LimaProfileGeneration, LimaResourceProfile,
 };
-use smolrunner::mac_availability::{
+use glaeda::mac_availability::{
     AvailabilityRequest, EffectiveAvailabilityMode, HostPowerSource, JobActivity,
     MacAvailabilityObservation, MemoryPressure, ObservationFreshness, VmPowerState,
 };
-use smolrunner::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
+use glaeda::personal_worker_queue::{
     PERSONAL_WORKER_QUEUE_SCHEMA_VERSION, PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
     PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES, PersonalWorkerActivityEvidence,
     PersonalWorkerCacheAccessMode, PersonalWorkerCacheLeaseState, PersonalWorkerCacheNamespace,
@@ -30,8 +30,8 @@ use smolrunner::personal_worker_queue::{
     PersonalWorkerProfileObservation, PersonalWorkerQueueDecision, PersonalWorkerQueueEntryState,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueVisibility, PersonalWorkerSelection,
 };
-use smolrunner::personal_worker_store::PersonalWorkerStoreRevision;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::personal_worker_store::PersonalWorkerStoreRevision;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
 
 #[path = "../src/personal_worker_tick.rs"]
 mod personal_worker_tick;

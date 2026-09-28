@@ -1,7 +1,7 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-pub use smolrunner::{
+pub use glaeda::{
     artifact, operator_error, personal_worker_queue, process, verification_profile,
     verification_profile_registry,
 };
@@ -18,16 +18,16 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use glaeda::operator_error::OperatorErrorCode;
+use glaeda::process::{
+    CommandExecutor, CommandSpec, CommandValue, ExecutionRecord, ProcessExecutor,
+    TimedCommandExecutor,
+};
+use glaeda::verification_profile::VerificationProfileId;
 use repository_source_observation::{
     REPOSITORY_SOURCE_COMMAND_TIMEOUT, RepositoryCleanliness, RepositorySourceObservationErrorKind,
     RepositorySourceObserver,
 };
-use smolrunner::operator_error::OperatorErrorCode;
-use smolrunner::process::{
-    CommandExecutor, CommandSpec, CommandValue, ExecutionRecord, ProcessExecutor,
-    TimedCommandExecutor,
-};
-use smolrunner::verification_profile::VerificationProfileId;
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
 const TREE: &str = "2222222222222222222222222222222222222222";

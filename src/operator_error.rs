@@ -53,13 +53,13 @@ pub enum OperatorApprovalClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum OperatorSuggestedCommand {
-    #[serde(rename = "smolrunner status")]
+    #[serde(rename = "glaeda status")]
     Status,
-    #[serde(rename = "smolrunner worker init")]
+    #[serde(rename = "glaeda worker init")]
     WorkerInit,
-    #[serde(rename = "smolrunner worker run-once")]
+    #[serde(rename = "glaeda worker run-once")]
     WorkerRunOnce,
-    #[serde(rename = "smolrunner queue list")]
+    #[serde(rename = "glaeda queue list")]
     QueueList,
 }
 
@@ -74,10 +74,10 @@ impl OperatorSuggestedCommand {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::Status => "smolrunner status",
-            Self::WorkerInit => "smolrunner worker init",
-            Self::WorkerRunOnce => "smolrunner worker run-once",
-            Self::QueueList => "smolrunner queue list",
+            Self::Status => "glaeda status",
+            Self::WorkerInit => "glaeda worker init",
+            Self::WorkerRunOnce => "glaeda worker run-once",
+            Self::QueueList => "glaeda queue list",
         }
     }
 }
@@ -301,10 +301,10 @@ mod tests {
     #[test]
     fn suggested_commands_are_exact_static_allowlist() {
         let expected = [
-            "smolrunner status",
-            "smolrunner worker init",
-            "smolrunner worker run-once",
-            "smolrunner queue list",
+            "glaeda status",
+            "glaeda worker init",
+            "glaeda worker run-once",
+            "glaeda queue list",
         ];
 
         for (command, expected) in ALL_OPERATOR_SUGGESTED_COMMANDS.iter().zip(expected) {
@@ -316,10 +316,7 @@ mod tests {
         }
 
         assert_eq!(ALL_OPERATOR_SUGGESTED_COMMANDS.len(), expected.len());
-        assert_eq!(
-            OperatorSuggestedCommand::Status.as_str(),
-            "smolrunner status"
-        );
+        assert_eq!(OperatorSuggestedCommand::Status.as_str(), "glaeda status");
     }
 
     #[test]
@@ -333,7 +330,7 @@ mod tests {
                 "summary": "Durable personal-worker state is missing.",
                 "retry": "after_repair",
                 "remediation": "repair",
-                "suggested_command": "smolrunner worker init",
+                "suggested_command": "glaeda worker init",
                 "dependency": "durable_state"
             })
         );

@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly glaeda-worktree-reclaim
+
+[Timer]
+# Finished work becomes reclaimable after an hour idle, so a daily run would hold it up to a day.
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

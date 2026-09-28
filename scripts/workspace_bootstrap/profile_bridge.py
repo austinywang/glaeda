@@ -1,6 +1,6 @@
 """Pure mapping from trusted runner context to issue #153 observations.
 
-This module never acquires runner identity. A SmolRunner-owned adapter must open
+This module never acquires runner identity. A Glaeda-owned adapter must open
 protected durable state, validate provenance, and pass the resulting typed
 context directly to :func:`map_validated_runner_context`.
 """
@@ -18,7 +18,7 @@ from .probe import public_issue
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-TRUSTED_SOURCE_KIND = "smolrunner-protected-state-v1"
+TRUSTED_SOURCE_KIND = "glaeda-protected-state-v2"
 
 CAPABILITY_ID_BY_TOOL = {
     "python3": "python3",
@@ -48,7 +48,7 @@ class DescriptorIdentity:
 
 @dataclass(frozen=True)
 class RunnerContextProvenance:
-    """Descriptor-derived provenance facts supplied by SmolRunner-owned code.
+    """Descriptor-derived provenance facts supplied by Glaeda-owned code.
 
     These fields are observations, not a file-path trust mechanism. The future
     producer must derive them while holding descriptors opened below the
@@ -97,7 +97,7 @@ class ValidatedRunnerCacheContext:
 
 @dataclass(frozen=True)
 class ValidatedRunnerContext:
-    """Typed context emitted by a trusted SmolRunner-owned adapter."""
+    """Typed context emitted by a trusted Glaeda-owned adapter."""
 
     installation_id: str
     workspace_id: str
@@ -175,7 +175,7 @@ def _provenance_issues(
         issues.append(
             _issue(
                 "runner_context_untrusted_source",
-                "runner identity must originate in protected SmolRunner state",
+                "runner identity must originate in protected Glaeda state",
             )
         )
     if not provenance.state_root_descriptor_relative or not provenance.installation_descriptor_opened:
@@ -332,7 +332,7 @@ def map_validated_runner_context(
 ) -> dict[str, object]:
     """Map trusted typed context without acquiring or selecting its identity source.
 
-    The return value deliberately has no readiness field. A SmolRunner-owned
+    The return value deliberately has no readiness field. A Glaeda-owned
     adapter may consume ``observation`` only when ``blocking_reasons`` is empty,
     then construct the merged #153 Rust observation types inside the trusted
     process.

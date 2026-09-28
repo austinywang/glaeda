@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+"""Run Glaeda's fast/full-test developer feedback or exact required verification sequence.
+
+This is a repository-local development helper, not the product verification executor. It reduces
+child output to a bounded decision-focused summary by default and can explicitly stream it live.
+Successful logs are discarded; failed raw output remains in a private temporary file at the reported
+path. The helper grants no result-reuse or publication authority and leaves the existing checked-in
+`glaeda.required` command semantics unchanged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import resource
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO
+
+
+SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 1
+SUMMARY_FAILURE_VIEW_BYTES = 16 * 1024
+SUMMARY_FAILURE_EDGE_BYTES = SUMMARY_FAILURE_VIEW_BYTES // 2
+CHILD_FILE_CREATION_UMASK = 0o022
+
+
+@dataclass(frozen=True)
+class Phase:
+    name: str
+    program_kind: str
+    program: str
+    arguments: tuple[str, ...]
+
+    def public_argv(self) -> list[str]:
+        return [self.program, *self.arguments]
+
+
+@dataclass(frozen=True)
+class ChildResources:
+    user_cpu_seconds: float
+    system_cpu_seconds: float
+    process_lifetime_max_rss_kib: int
+
+
+@dataclass(frozen=True)
+class PhaseObservation:
+    name: str
+    argv: list[str]
+    exit_code: int
+    elapsed_seconds: float
+    child_resources: ChildResources
+
+
+@dataclass(frozen=True)
+class PhaseOutputSummary:
+    byte_count: int
+    line_count: int
+    digest: str
+    head: bytes
+    tail: bytes
+
+
+def summarize_phase_output(output: BinaryIO) -> PhaseOutputSummary:
+    digest = hashlib.sha256()
+    byte_count = 0
+    newline_count = 0
+    final_byte: int | None = None
+    head = bytearray()
+    tail = bytearray()
+    output.seek(0)
+    while chunk := output.read(64 * 1024):
+        digest.update(chunk)
+        byte_count += len(chunk)
+        newline_count += chunk.count(b"\n")
+        final_byte = chunk[-1]
+        if len(head) < SUMMARY_FAILURE_VIEW_BYTES:
+            remaining = SUMMARY_FAILURE_VIEW_BYTES - len(head)
+            head.extend(chunk[:remaining])
+        tail.extend(chunk)
+        if len(tail) > SUMMARY_FAILURE_EDGE_BYTES:
+            del tail[:-SUMMARY_FAILURE_EDGE_BYTES]
+    return PhaseOutputSummary(
+        byte_count=byte_count,
+        line_count=newline_count + int(byte_count > 0 and final_byte != ord("\n")),
+        digest=f"sha256:{digest.hexdigest()}",
+        head=bytes(head),
+        tail=bytes(tail),
+    )
+
+
+def execute_phase(
+    program: Path,
+    arguments: tuple[str, ...],
+    root: Path,
+    output_mode: str,
+) -> tuple[int, PhaseOutputSummary | None, Path | None]:
+    argv = [os.fspath(program), *arguments]
+    if output_mode == "stream":
+        result = subprocess.run(
+            argv,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            umask=CHILD_FILE_CREATION_UMASK,
+            check=False,
+        )
+        return result.returncode, None, None
+
+    output_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            prefix="glaeda-verify-failure-",
+            suffix=".log",
+            delete=False,
+        ) as output:
+            output_path = Path(output.name)
+            result = subprocess.run(
+                argv,
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                umask=CHILD_FILE_CREATION_UMASK,
+                check=False,
+            )
+            summary = summarize_phase_output(output)
+        if result.returncode == 0 or summary.byte_count == 0:
+            output_path.unlink()
+            return result.returncode, summary, None
+        os.chmod(output_path, 0o600)
+        return result.returncode, summary, output_path
+    except BaseException:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        raise
+
+
+def print_failure_output(summary: PhaseOutputSummary, raw_output: Path) -> None:
+    if not summary.head:
+        return
+    if summary.byte_count <= SUMMARY_FAILURE_VIEW_BYTES:
+        head = summary.head
+        tail = b""
+    else:
+        head = summary.head[:SUMMARY_FAILURE_EDGE_BYTES]
+        tail = summary.tail
+    omitted = summary.byte_count - len(head) - len(tail)
+    print(
+        f"captured failure output: head_bytes={len(head)} tail_bytes={len(tail)} "
+        f"omitted_bytes={omitted} raw_output={raw_output}",
+        file=sys.stderr,
+    )
+    sys.stderr.flush()
+    sys.stderr.buffer.write(head)
+    if head and not head.endswith(b"\n"):
+        sys.stderr.buffer.write(b"\n")
+    if omitted:
+        sys.stderr.buffer.write(f"... omitted {omitted} bytes ...\n".encode())
+    sys.stderr.buffer.write(tail)
+    if tail and not tail.endswith(b"\n"):
+        sys.stderr.buffer.write(b"\n")
+    sys.stderr.buffer.flush()
+
+
+def required_phases() -> tuple[Phase, ...]:
+    return (
+        Phase("bootstrap", "repository", "scripts/bootstrap", ("--output", "json")),
+        Phase("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+        Phase(
+            "clippy",
+            "capability",
+            "cargo",
+            (
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
+        Phase(
+            "test",
+            "capability",
+            "cargo",
+            ("test", "--locked", "--all-targets", "--all-features"),
+        ),
+        Phase(
+            "doctor",
+            "capability",
+            "cargo",
+            ("run", "--locked", "--quiet", "--", "--output", "json", "doctor"),
+        ),
+        Phase(
+            "plan-quarry",
+            "capability",
+            "cargo",
+            ("run", "--locked", "--quiet", "--", "plan", "--file", "examples/quarry.yml"),
+        ),
+        Phase(
+            "plan-glossless",
+            "capability",
+            "cargo",
+            (
+                "run",
+                "--locked",
+                "--quiet",
+                "--",
+                "--output",
+                "json",
+                "plan",
+                "--file",
+                "examples/glossless.yml",
+            ),
+        ),
+        Phase(
+            "host-plan-quarry",
+            "capability",
+            "cargo",
+            (
+                "run",
+                "--locked",
+                "--quiet",
+                "--",
+                "--output",
+                "json",
+                "host",
+                "plan",
+                "--file",
+                "examples/quarry.yml",
+            ),
+        ),
+    )
+
+
+def fast_phases() -> tuple[Phase, ...]:
+    return (
+        Phase(
+            "unit-and-binary-tests",
+            "capability",
+            "cargo",
+            ("test", "--locked", "--lib", "--bins"),
+        ),
+        Phase("format", "repository", "scripts/verify-changed-rustfmt", ()),
+        Phase("build-cli", "capability", "cargo", ("build", "--locked", "--bin", "glaeda")),
+        Phase("doctor", "built-glaeda", "glaeda", ("--output", "json", "doctor")),
+        Phase(
+            "plan-quarry",
+            "built-glaeda",
+            "glaeda",
+            ("plan", "--file", "examples/quarry.yml"),
+        ),
+        Phase(
+            "plan-glossless",
+            "built-glaeda",
+            "glaeda",
+            ("--output", "json", "plan", "--file", "examples/glossless.yml"),
+        ),
+        Phase(
+            "host-plan-quarry",
+            "built-glaeda",
+            "glaeda",
+            ("--output", "json", "host", "plan", "--file", "examples/quarry.yml"),
+        ),
+    )
+
+
+def focused_phases() -> tuple[Phase, ...]:
+    """Credentialless workstation feedback with no host-administration assumptions."""
+    return (
+        Phase(
+            "compile-all-targets",
+            "capability",
+            "cargo",
+            ("check", "--locked", "--all-targets", "--all-features"),
+        ),
+        Phase("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+        Phase(
+            "repo-query-integration",
+            "capability",
+            "cargo",
+            ("test", "--locked", "--test", "repo_query_cli"),
+        ),
+    )
+
+
+def full_test_phases() -> tuple[Phase, ...]:
+    return (
+        Phase(
+            "full-tests",
+            "capability",
+            "cargo-nextest",
+            (
+                "--color",
+                "never",
+                "--no-pager",
+                "--user-config-file",
+                "none",
+                "nextest",
+                "run",
+                "--profile",
+                "default",
+                "--locked",
+                "--all-targets",
+                "--all-features",
+                "--ignore-default-filter",
+                "--test-threads",
+                "num-cpus",
+                "--retries",
+                "0",
+                "--no-fail-fast",
+                "--failure-output",
+                "immediate-final",
+                "--success-output",
+                "never",
+                "--status-level",
+                "fail",
+                "--final-status-level",
+                "fail",
+            ),
+        ),
+    )
+
+
+def phases_for(profile: str) -> tuple[Phase, ...]:
+    if profile == "focused":
+        return focused_phases()
+    if profile == "fast":
+        return fast_phases()
+    if profile == "full-tests":
+        return full_test_phases()
+    return required_phases()
+
+
+def plan(profile: str) -> dict[str, object]:
+    phases = phases_for(profile)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "document_type": "glaeda-local-verification-plan",
+        "profile": profile,
+        "authority": (
+            "repository_required_checks"
+            if profile == "required"
+            else "developer_feedback_only"
+        ),
+        "source_must_remain_unchanged": True,
+        "retained_logs": False,
+        "execution_environment": {"file_creation_umask": "0022"},
+        "phases": [
+            {"name": phase.name, "argv": phase.public_argv()} for phase in phases
+        ],
+    }
+
+
+def repository_root() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("required capability git is unavailable")
+    result = subprocess.run(
+        [os.path.abspath(git), "rev-parse", "--show-toplevel"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0 or Path(result.stdout.strip()).resolve() != root:
+        raise RuntimeError("scripts/verify must run from its canonical Glaeda worktree")
+    return root
+
+
+def source_state(root: Path) -> bytes:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("required capability git is unavailable")
+    status = subprocess.run(
+        [
+            os.path.abspath(git),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise RuntimeError("Git could not observe the Glaeda worktree")
+    diff = subprocess.run(
+        [os.path.abspath(git), "diff", "--no-ext-diff", "--binary", "HEAD", "--"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if diff.returncode != 0:
+        raise RuntimeError("Git could not inspect Glaeda source changes")
+    untracked = subprocess.run(
+        [
+            os.path.abspath(git),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if untracked.returncode != 0:
+        raise RuntimeError("Git could not inspect untracked Glaeda source")
+
+    digest = hashlib.sha256()
+    digest.update(status.stdout)
+    digest.update(diff.stdout)
+    for encoded_path in filter(None, untracked.stdout.split(b"\0")):
+        path = root / os.fsdecode(encoded_path)
+        digest.update(encoded_path)
+        if path.is_symlink():
+            digest.update(b"symlink\0")
+            digest.update(os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            digest.update(b"file\0")
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            digest.update(b"other\0")
+    return digest.digest()
+
+
+def built_glaeda(root: Path) -> Path:
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    target = Path(configured) if configured else root / "target"
+    if not target.is_absolute():
+        target = root / target
+    suffix = ".exe" if os.name == "nt" else ""
+    return Path(os.path.abspath(target)) / "debug" / f"glaeda{suffix}"
+
+
+def resolve_program(phase: Phase, root: Path) -> Path:
+    if phase.program_kind == "repository":
+        program = root / phase.program
+    elif phase.program_kind == "built-glaeda":
+        program = built_glaeda(root)
+    else:
+        found = shutil.which(phase.program)
+        if found is None:
+            raise RuntimeError(f"required capability {phase.program} is unavailable")
+        program = Path(found)
+    program = Path(os.path.abspath(program))
+    if not program.is_file() or not os.access(program, os.X_OK):
+        raise RuntimeError(f"phase {phase.name} executable is unavailable")
+    return program
+
+
+def git_object_identity(root: Path) -> tuple[str, str]:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("required capability git is unavailable")
+    result = subprocess.run(
+        [os.path.abspath(git), "rev-parse", "HEAD", "HEAD^{tree}"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    values = result.stdout.splitlines()
+    if result.returncode != 0 or len(values) != 2 or any(len(value) != 40 for value in values):
+        raise RuntimeError("Git could not identify the exact Glaeda source")
+    return values[0], values[1]
+
+
+def child_resources() -> ChildResources:
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    max_rss = int(usage.ru_maxrss)
+    if sys.platform == "darwin":
+        max_rss //= 1024
+    return ChildResources(
+        user_cpu_seconds=usage.ru_utime,
+        system_cpu_seconds=usage.ru_stime,
+        process_lifetime_max_rss_kib=max_rss,
+    )
+
+
+def resource_delta(before: ChildResources, after: ChildResources) -> ChildResources:
+    return ChildResources(
+        user_cpu_seconds=max(0.0, after.user_cpu_seconds - before.user_cpu_seconds),
+        system_cpu_seconds=max(0.0, after.system_cpu_seconds - before.system_cpu_seconds),
+        process_lifetime_max_rss_kib=after.process_lifetime_max_rss_kib,
+    )
+
+
+def opaque_path_identity(path: Path) -> str:
+    digest = hashlib.sha256(b"glaeda-local-verification-path-v1\0")
+    digest.update(os.fsencode(path.resolve(strict=False)))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def execution_environment(root: Path) -> dict[str, object]:
+    configured_target = os.environ.get("CARGO_TARGET_DIR")
+    target = Path(configured_target) if configured_target else root / "target"
+    if not target.is_absolute():
+        target = root / target
+    configured_home = os.environ.get("CARGO_HOME")
+    cargo_home = Path(configured_home) if configured_home else Path.home() / ".cargo"
+    if not cargo_home.is_absolute():
+        cargo_home = root / cargo_home
+    configured_jobs = os.environ.get("CARGO_BUILD_JOBS")
+    jobs = (
+        int(configured_jobs)
+        if configured_jobs is not None
+        and configured_jobs.isascii()
+        and configured_jobs.isdigit()
+        else None
+    )
+    return {
+        "logical_cpu_count": os.cpu_count(),
+        "file_creation_umask": "0022",
+        "cargo_build_jobs": {
+            "source": "configured" if configured_jobs is not None else "cargo_default",
+            "value": jobs,
+        },
+        "cargo_target": {
+            "source": "configured" if configured_target else "repository_default",
+            "identity_digest": opaque_path_identity(target),
+        },
+        "cargo_home": {
+            "source": "configured" if configured_home else "user_default",
+            "identity_digest": opaque_path_identity(cargo_home),
+        },
+    }
+
+
+def receipt_document(
+    *,
+    profile: str,
+    source_commit: str,
+    source_tree: str,
+    source_before: bytes,
+    source_after: bytes | None,
+    environment: dict[str, object],
+    observations: list[PhaseObservation],
+    exit_code: int,
+    elapsed_seconds: float,
+    started_at_unix_millis: int,
+    completed_at_unix_millis: int,
+    resources: ChildResources,
+) -> dict[str, object]:
+    planned = plan(profile)
+    plan_bytes = json.dumps(
+        planned, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "document_type": "glaeda-local-verification-receipt",
+        "authority": "performance_observation_only",
+        "profile": profile,
+        "source": {
+            "commit": source_commit,
+            "tree": source_tree,
+            "state_digest_before": f"sha256:{source_before.hex()}",
+            "state_digest_after": (
+                f"sha256:{source_after.hex()}" if source_after is not None else None
+            ),
+            "unchanged": source_after is not None and source_before == source_after,
+        },
+        "environment": environment,
+        "plan": {
+            "digest": f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}",
+            "declared_phase_count": len(planned["phases"]),
+            "executed_phase_count": len(observations),
+        },
+        "phases": [
+            {
+                "name": observation.name,
+                "argv": observation.argv,
+                "exit_code": observation.exit_code,
+                "elapsed_seconds": round(observation.elapsed_seconds, 6),
+                "child_user_cpu_seconds": round(
+                    observation.child_resources.user_cpu_seconds, 6
+                ),
+                "child_system_cpu_seconds": round(
+                    observation.child_resources.system_cpu_seconds, 6
+                ),
+                "process_lifetime_child_max_rss_kib": (
+                    observation.child_resources.process_lifetime_max_rss_kib
+                ),
+            }
+            for observation in observations
+        ],
+        "result": {
+            "exit_code": exit_code,
+            "elapsed_seconds": round(elapsed_seconds, 6),
+            "started_at_unix_millis": started_at_unix_millis,
+            "completed_at_unix_millis": completed_at_unix_millis,
+            "child_user_cpu_seconds": round(resources.user_cpu_seconds, 6),
+            "child_system_cpu_seconds": round(resources.system_cpu_seconds, 6),
+            "process_lifetime_child_max_rss_kib": resources.process_lifetime_max_rss_kib,
+            "resource_scope": "python_process_waited_children",
+            "max_rss_semantics": "maximum_waited_child_not_concurrent_sum",
+            "measurement_scope": "fixed_phases_plus_post_source_observation",
+        },
+    }
+
+
+def write_receipt(path: Path, document: dict[str, object]) -> None:
+    destination = path.absolute()
+    parent = destination.parent
+    if not parent.is_dir():
+        raise RuntimeError("verification receipt parent directory is unavailable")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent,
+            prefix=f".{destination.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(document, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+        os.replace(temporary_path, destination)
+    except OSError as error:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise RuntimeError("verification receipt could not be written") from error
+
+
+def receipt_destination(root: Path, requested: Path) -> Path:
+    try:
+        parent = requested.absolute().parent.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("verification receipt parent directory is unavailable") from error
+    destination = parent / requested.name
+    try:
+        destination.relative_to(root.resolve(strict=True))
+    except ValueError:
+        return destination
+    raise RuntimeError("verification receipt must be outside the source worktree")
+
+
+def run(
+    profile: str,
+    receipt_path: Path | None = None,
+    output_mode: str = "summary",
+) -> int:
+    root = repository_root()
+    if receipt_path is not None:
+        receipt_path = receipt_destination(root, receipt_path)
+    phases = phases_for(profile)
+    before = source_state(root)
+    source_commit, source_tree = git_object_identity(root)
+    environment = execution_environment(root)
+    started = time.monotonic()
+    started_at_unix_millis = time.time_ns() // 1_000_000
+    resources_before = child_resources()
+    observations: list[PhaseObservation] = []
+    exit_code = 0
+
+    print(f"Glaeda local verification: {profile}", file=sys.stderr)
+    if profile != "required":
+        print(
+            "authority: developer feedback only; final required verification is not claimed",
+            file=sys.stderr,
+        )
+    else:
+        print("authority: exact repository-required command sequence", file=sys.stderr)
+
+    try:
+        for index, phase in enumerate(phases, start=1):
+            program = resolve_program(phase, root)
+            phase_started = time.monotonic()
+            phase_resources_before = child_resources()
+            print(f"[{index}/{len(phases)}] {phase.name}: start", file=sys.stderr)
+            returncode, output, raw_output = execute_phase(
+                program, phase.arguments, root, output_mode
+            )
+            elapsed = time.monotonic() - phase_started
+            observations.append(
+                PhaseObservation(
+                    name=phase.name,
+                    argv=phase.public_argv(),
+                    exit_code=returncode,
+                    elapsed_seconds=elapsed,
+                    child_resources=resource_delta(
+                        phase_resources_before, child_resources()
+                    ),
+                )
+            )
+            print(
+                f"[{index}/{len(phases)}] {phase.name}: exit={returncode} elapsed={elapsed:.3f}s"
+                + (
+                    f" output_bytes={output.byte_count} output_lines={output.line_count} "
+                    f"output_digest={output.digest}"
+                    if output is not None
+                    else ""
+                ),
+                file=sys.stderr,
+            )
+            if returncode != 0:
+                if output is not None and raw_output is not None:
+                    print_failure_output(output, raw_output)
+                exit_code = returncode or 1
+                break
+    except KeyboardInterrupt:
+        exit_code = 130
+    except (OSError, RuntimeError) as error:
+        print(f"verification error: {error}", file=sys.stderr)
+        exit_code = 2
+
+    try:
+        after = source_state(root)
+        unchanged = after == before
+    except RuntimeError as error:
+        print(f"verification error: {error}", file=sys.stderr)
+        after = None
+        unchanged = False
+    if not unchanged:
+        print("verification error: source state changed during the run", file=sys.stderr)
+        exit_code = exit_code or 2
+
+    completed_at_unix_millis = time.time_ns() // 1_000_000
+    elapsed_seconds = time.monotonic() - started
+    resources = resource_delta(resources_before, child_resources())
+    print(
+        f"Glaeda local verification complete: exit={exit_code} "
+        f"elapsed={elapsed_seconds:.3f}s source_unchanged={str(unchanged).lower()}",
+        file=sys.stderr,
+    )
+    if receipt_path is not None:
+        try:
+            write_receipt(
+                receipt_path,
+                receipt_document(
+                    profile=profile,
+                    source_commit=source_commit,
+                    source_tree=source_tree,
+                    source_before=before,
+                    source_after=after,
+                    environment=environment,
+                    observations=observations,
+                    exit_code=exit_code,
+                    elapsed_seconds=elapsed_seconds,
+                    started_at_unix_millis=started_at_unix_millis,
+                    completed_at_unix_millis=completed_at_unix_millis,
+                    resources=resources,
+                ),
+            )
+        except RuntimeError as error:
+            print(f"verification error: {error}", file=sys.stderr)
+            exit_code = exit_code or 2
+    return exit_code
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "profile",
+        nargs="?",
+        choices=("focused", "fast", "full-tests", "required"),
+        default="fast",
+    )
+    parser.add_argument(
+        "--plan-json",
+        action="store_true",
+        help="emit the fixed path-free plan without executing commands",
+    )
+    parser.add_argument(
+        "--receipt",
+        type=Path,
+        help="atomically write a path-free performance receipt after execution",
+    )
+    parser.add_argument(
+        "--output-mode",
+        choices=("stream", "summary"),
+        default="summary",
+        help="emit one bounded summary per phase (default) or stream all child output",
+    )
+    args = parser.parse_args()
+    if args.plan_json and args.receipt is not None:
+        parser.error("--receipt cannot be combined with --plan-json")
+    if args.plan_json:
+        print(json.dumps(plan(args.profile), indent=2, sort_keys=True))
+        return 0
+    return run(args.profile, args.receipt, args.output_mode)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

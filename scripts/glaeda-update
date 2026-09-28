@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""glaeda-update: keep this host's glaeda tools on its release channel (over-the-air, #149).
+
+    glaeda-update               plan: which release this host's ring points at, and what would change
+    glaeda-update --apply       download, verify, install, health-check; roll back on failure
+    glaeda-update --status      this host's config and state
+
+A LaunchAgent (macOS) or systemd user timer (Linux) runs `--apply` hourly; glaeda-mini-setup installs
+it. Configuration is ~/.config/glaeda/update.json, written once by setup and never overwritten:
+
+    {"ring": "canary" | "stable", "setupArgs": ["--hygiene-only"], "host": "air-blue",
+     "reportStatus": true, "source": "teamleaderleo/glaeda"}
+
+`source` is where releases and channel files are downloaded from: this repository, or its read-only
+mirror manaflow-ai/glaeda, which the Manaflow minis use (docs/GLAEDA_OTA.md, Fleet mirror). The mirror
+holds byte-identical copies, so every check below still names this repository: release.json must say
+teamleaderleo/glaeda and the attestation must come from its release.yml.
+
+What one run does, and what it refuses:
+
+1. Reads control.json and <ring>.json from the `ota-channels` release (scripts/glaeda_release.py).
+   `paused` stops every host. The ring names one release by tag and by the SHA-256 of its
+   release.json; malformed names are refused.
+2. Downloads release.json and requires that digest, then this platform's glaeda-hygiene archive and
+   requires the size and SHA-256 release.json lists. The archive's build-provenance attestation
+   must come from release.yml on main. A canary refuses to install when it cannot check that (no
+   gh, or gh not signed in); a stable host then relies on the hash chain, since stable only ever
+   names a release canaries verified. Extraction refuses absolute paths, `..`, links and devices.
+3. Installs by running that release's own scripts/glaeda-mini-setup --apply with the configured
+   arguments and its prebuilt reclaim binary. Setup is idempotent and owns every installed file.
+4. Health: the installed glaeda-disk and glaeda-worktree-reclaim must run, and the installed
+   glaeda-update must plan against the live channel. On failure the previous release's setup runs
+   again, or on a first update the snapshot of the tools taken before it is restored, and the failed
+   tag is quarantined on this host, so it is never retried; a newer release is.
+5. On a canary host with reportStatus and an authenticated `gh`, the outcome is posted as the commit
+   status `glaeda-ota/<host>` on the release's source commit. Promotion to stable waits for those.
+
+6. A mini that runs GitHub runners keeps the copy of glaeda-cmux-runner it is re-registered from in
+   ~/glaeda-runner/scripts (glaeda-cmux-runner-fleet stages it). After an update, and on every run that
+   finds the release current, that copy is brought to the installed release's four runner files when
+   it is older, so a relabel never runs from a stale copy. A copy an operator staged (its
+   .glaeda-source.json stamp not written here) dated the release's day or later is kept. Only that
+   directory, and only when it already exists; the runners' installed hooks are not touched.
+
+It never runs two at a time (a lock under the state directory), never touches anything but what
+setup installs (and the runner copy in step 6), and keeps the current and previous release under
+~/.local/state/glaeda/update.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPOSITORY = "teamleaderleo/glaeda"
+# where a host may download releases from: the repository itself, or the fleet's mirror of it
+SOURCES = (REPOSITORY, "manaflow-ai/glaeda")
+CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
+CONTROL_SCHEMA = "glaeda-ota-control/v1"
+SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
+TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+MAX_EXTRACTED = 1024 * 1024 * 1024
+# what setup installs and a first update snapshots, so it can roll back without a previous release
+TOOLS = ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
+         "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
+RELEASE_SCHEMA = "glaeda-release/v1"
+STATUS_PREFIX = "glaeda-ota/"
+MAX_ASSET = 200 * 1024 * 1024
+MAX_META = 1024 * 1024
+TIMEOUT = 60
+SETUP_TIMEOUT = 1800
+
+HOME = Path.home()
+CONFIG = HOME / ".config/glaeda/update.json"
+STATE_DIR = HOME / ".local/state/glaeda/update"
+BIN = HOME / ".local/bin"
+# The runner copy glaeda-cmux-runner-fleet stages (its STAGED and REMOTE_DIR), refreshed in step 6.
+RUNNER_SCRIPTS = HOME / "glaeda-runner/scripts"
+RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+SOURCE_STAMP = ".glaeda-source.json"
+STAMP_BY = "glaeda-update"
+
+
+class UpdateError(RuntimeError):
+    pass
+
+
+def local_target() -> str:
+    system, machine = platform.system(), platform.machine().lower()
+    if system == "Darwin" and machine in ("arm64", "aarch64"):
+        return "aarch64-apple-darwin"
+    if system == "Linux" and machine in ("x86_64", "amd64"):
+        return "x86_64-unknown-linux-gnu"
+    raise UpdateError(f"no glaeda release for {system} {machine}")
+
+
+def sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def fetch(url: str, limit: int) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "glaeda-update"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise UpdateError(f"{url} exceeds {limit} bytes")
+    return raw
+
+
+def load_config(path: Path = CONFIG) -> dict:
+    try:
+        doc = json.loads(path.read_text())
+    except FileNotFoundError:
+        doc = {}
+    ring = doc.get("ring", "stable")
+    if ring not in ("canary", "stable"):
+        raise UpdateError(f"{path}: ring must be canary or stable")
+    args = doc.get("setupArgs", ["--hygiene-only"])
+    if not isinstance(args, list) or not all(isinstance(a, str) and a.startswith("--") for a in args) \
+            or any(a in ("--uninstall", "--reclaim-binary") for a in args):
+        raise UpdateError(f"{path}: setupArgs must be setup flags")
+    host = str(doc.get("host") or platform.node().split(".")[0].lower())
+    source = doc.get("source", REPOSITORY)
+    if source not in SOURCES:
+        raise UpdateError(f"{path}: source must be one of {', '.join(SOURCES)}")
+    return {"ring": ring, "setupArgs": args, "host": host, "source": source,
+            "reportStatus": bool(doc.get("reportStatus", ring == "canary"))}
+
+
+def load_state(state_dir: Path = STATE_DIR) -> dict:
+    empty = {"current": None, "previous": None, "quarantined": []}
+    try:
+        doc = json.loads((state_dir / "state.json").read_text())
+    except FileNotFoundError:
+        return empty
+    except ValueError as e:
+        raise UpdateError(f"state.json is unreadable ({e}); fix or remove it") from e
+    ok = (isinstance(doc, dict) and isinstance(doc.get("quarantined"), list)
+          and all(doc.get(k) is None or (isinstance(doc.get(k), str) and TAG_RE.fullmatch(doc[k]))
+                  for k in ("current", "previous")))
+    if not ok:
+        raise UpdateError("state.json has the wrong shape; fix or remove it")
+    return doc
+
+
+def save_state(state: dict, state_dir: Path = STATE_DIR) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    tmp = state_dir / f"state.json.{os.getpid()}"
+    tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, state_dir / "state.json")
+
+
+def release_url(tag: str, name: str, source: str = REPOSITORY) -> str:
+    return f"https://github.com/{source}/releases/download/{tag}/{name}"
+
+
+def resolve(control_raw: bytes, ring_raw: bytes | None, ring: str) -> dict | None:
+    """The ring's release entry, or None when paused or the ring names nothing yet."""
+    control = json.loads(control_raw)
+    if control.get("schema") != CONTROL_SCHEMA or not isinstance(control.get("paused"), bool):
+        raise UpdateError("control.json is malformed")
+    if control["paused"] or ring_raw is None:
+        return None
+    entry = json.loads(ring_raw)
+    if (entry.get("schema") != CHANNEL_SCHEMA or entry.get("ring") != ring
+            or not TAG_RE.fullmatch(str(entry.get("tag"))) or not SHA_RE.fullmatch(str(entry.get("source")))
+            or not HEX64.fullmatch(str(entry.get("releaseSha256")))):
+        raise UpdateError(f"{ring}.json is malformed")
+    return entry
+
+
+def fetch_channel(ring: str, source: str = REPOSITORY) -> tuple[bytes, bytes | None]:
+    control = fetch(release_url("ota-channels", "control.json", source), MAX_META)
+    try:
+        ring_raw = fetch(release_url("ota-channels", f"{ring}.json", source), MAX_META)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        ring_raw = None  # stable before the first promotion
+    return control, ring_raw
+
+
+def check_release(raw: bytes, entry: dict) -> dict:
+    if sha256(raw) != entry["releaseSha256"]:
+        raise UpdateError("release.json does not match the channel")
+    doc = json.loads(raw)
+    if (doc.get("schema") != RELEASE_SCHEMA or doc.get("repository") != REPOSITORY
+            or doc.get("tag") != entry["tag"] or doc.get("source") != entry["source"]):
+        raise UpdateError("release.json does not describe the channel's release")
+    return doc
+
+
+def check_asset(raw: bytes, meta: dict | None) -> None:
+    if meta is None:
+        raise UpdateError("release has no archive for this platform")
+    if len(raw) != meta.get("size") or sha256(raw) != meta.get("sha256"):
+        raise UpdateError("archive does not match release.json")
+
+
+def safe_extract(archive: Path, destination: Path) -> None:
+    """Regular files and directories only, all inside destination."""
+    root = destination.resolve()
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        if sum(m.size for m in members if m.isfile()) > MAX_EXTRACTED:
+            raise UpdateError("archive expands past the size limit")
+        for member in members:
+            name = member.name
+            if name.startswith("/") or ".." in Path(name).parts or not (member.isfile() or member.isdir()):
+                raise UpdateError(f"archive entry refused: {name!r}")
+            if not (root / name).resolve().is_relative_to(root):
+                raise UpdateError(f"archive entry escapes: {name!r}")
+        for member in members:
+            target = root / member.name
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tar.extractfile(member) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            os.chmod(target, 0o755 if member.mode & 0o111 else 0o644)
+
+
+def find_gh() -> str | None:
+    """gh on PATH, else where Homebrew and distributions put it: a LaunchAgent's PATH is only
+    /usr/bin:/bin:/usr/sbin:/sbin, and a canary that cannot find gh never reports its health."""
+    for candidate in (shutil.which("gh"), str(HOME / ".local/bin/gh"), "/opt/homebrew/bin/gh",
+                      "/usr/local/bin/gh", "/usr/bin/gh"):
+        if candidate and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def attestation_ok(path: Path) -> bool | None:
+    """True/False from `gh attestation verify` pinned to release.yml on main; None when it cannot be
+    asked (no gh, or gh not signed in)."""
+    gh = find_gh()
+    if not gh:
+        return None
+    signed_in = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=60)
+    if signed_in.returncode != 0:
+        return None
+    result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY,
+                             "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"],
+                            capture_output=True, text=True, timeout=120)
+    return result.returncode == 0
+
+
+def generation(state_dir: Path, tag: str) -> Path:
+    return state_dir / "generations" / tag
+
+
+def setup_command(gen: Path, args: list[str]) -> list[str]:
+    return [sys.executable, str(gen / "glaeda/scripts/glaeda-mini-setup"), "--apply", *args,
+            "--reclaim-binary", str(gen / "bin/glaeda-worktree-reclaim")]
+
+
+def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(setup_command(gen, args), capture_output=True, text=True,
+                                timeout=SETUP_TIMEOUT, stdin=subprocess.DEVNULL,
+                                env={**os.environ, "GLAEDA_UPDATE_RUNNING": "1"})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    return result.returncode == 0, (result.stdout + result.stderr)[-2000:]
+
+
+def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
+    """The installed tools run, and the installed glaeda-update plans from the channel files this
+    run already fetched, so a network blip cannot fail (and quarantine) a good release."""
+    checks = [
+        [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
+        [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
+    ]
+    for argv in checks:
+        name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, f"{name}: {e}"
+        if result.returncode != 0:
+            return False, f"{name} exited {result.returncode}"
+        if name == "glaeda-update":
+            try:
+                planned = json.loads(result.stdout.strip().splitlines()[-1])["result"]
+            except (ValueError, KeyError, IndexError):
+                return False, "glaeda-update printed no plan"
+            if planned not in ("plan", "current", "idle", "quarantined"):
+                return False, f"glaeda-update planned {planned}"
+    return True, "tools run"
+
+
+def snapshot(state_dir: Path, bin_dir: Path) -> None:
+    """The installed tools (not agents or config) before a first update, so a failed first update
+    can be undone without a previous release. Rewritten each first attempt, removed on success."""
+    root, tmp = state_dir / "pre-ota", state_dir / "pre-ota.partial"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, mode=0o700)
+    for name in TOOLS:
+        if (bin_dir / name).is_file():
+            (tmp / name).write_bytes((bin_dir / name).read_bytes())
+    shutil.rmtree(root, ignore_errors=True)
+    os.replace(tmp, root)
+
+
+def restore(state_dir: Path, bin_dir: Path) -> bool:
+    root = state_dir / "pre-ota"
+    if not root.is_dir():
+        return False
+    for path in root.iterdir():
+        tmp = bin_dir / f".{path.name}.restore"
+        tmp.write_bytes(path.read_bytes())
+        tmp.chmod(0o755)
+        os.replace(tmp, bin_dir / path.name)
+    return True
+
+
+def report(config: dict, entry: dict, ok: bool, detail: str) -> str:
+    if config["ring"] != "canary" or not config["reportStatus"]:
+        return "not reported (not a reporting canary)"
+    gh = find_gh()
+    if not gh:
+        return "not reported (no gh)"
+    result = subprocess.run(
+        [gh, "api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
+         "-f", f"state={'success' if ok else 'failure'}", "-f", f"context={STATUS_PREFIX}{config['host']}",
+         "-f", f"description={entry['tag']}: {detail}"[:140]],
+        capture_output=True, text=True, timeout=60)
+    return "reported" if result.returncode == 0 else f"not reported (gh exited {result.returncode})"
+
+
+def nudge_promotion(config: dict) -> str:
+    """Ask promote.yml to check now. Its hourly cron can lag for hours, and without a run nothing
+    ever reaches stable; the workflow itself decides, so an extra dispatch is harmless."""
+    if config["ring"] != "canary" or not config["reportStatus"]:
+        return "not a reporting canary"
+    gh = find_gh()
+    if not gh:
+        return "no gh"
+    try:
+        result = subprocess.run([gh, "workflow", "run", "promote.yml", "--repo", REPOSITORY],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"not dispatched ({e})"
+    return "dispatched" if result.returncode == 0 else f"not dispatched (gh exited {result.returncode})"
+
+
+def prune(state_dir: Path, keep: set[str]) -> None:
+    root = state_dir / "generations"
+    if not root.is_dir():
+        return
+    for child in root.iterdir():
+        if child.name not in keep:
+            shutil.rmtree(child, ignore_errors=True)
+
+
+def download(state_dir: Path, entry: dict, target: str, ring: str, source: str = REPOSITORY) -> Path:
+    """Fetch and verify the release into its generation directory; reuse a complete one."""
+    gen = generation(state_dir, entry["tag"])
+    if (gen / ".complete").is_file():
+        return gen
+    release_raw = fetch(release_url(entry["tag"], "release.json", source), MAX_META)
+    release = check_release(release_raw, entry)
+    name = f"glaeda-hygiene-{target}.tar.gz"
+    meta = release.get("assets", {}).get(name)
+    raw = fetch(release_url(entry["tag"], name, source), MAX_ASSET)
+    check_asset(raw, meta)
+    partial = gen.with_name(gen.name + ".partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    partial.mkdir(parents=True, mode=0o700)
+    archive = partial / name
+    archive.write_bytes(raw)
+    attested = attestation_ok(archive)
+    if attested is False or (attested is None and ring == "canary"):
+        shutil.rmtree(partial, ignore_errors=True)
+        raise UpdateError("build-provenance attestation did not verify" if attested is False else
+                          "a canary must verify the attestation: install gh and sign in")
+    safe_extract(archive, partial)
+    archive.unlink()
+    (partial / "release.json").write_bytes(release_raw)
+    (partial / ".complete").write_text(entry["tag"] + "\n")
+    shutil.rmtree(gen, ignore_errors=True)
+    os.replace(partial, gen)
+    return gen
+
+
+def tag_date(tag: str) -> str:
+    day = tag.split("-")[1]
+    return f"{day[:4]}-{day[4:6]}-{day[6:]}"
+
+
+def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS) -> str:
+    """Step 6: bring the staged runner copy to the installed release when it is older. Returns what it did."""
+    if not target.is_dir():
+        return "absent"
+    tag = load_state(state_dir)["current"]
+    gen = generation(state_dir, tag) if tag else None
+    if gen is None or not (gen / ".complete").is_file():
+        return "no installed release"
+    src = gen / "glaeda/scripts"
+    if not all((src / name).is_file() for name in RUNNER_FILES):
+        return f"{tag} has no runner scripts"
+    if all((target / name).is_file() and (target / name).read_bytes() == (src / name).read_bytes()
+           for name in RUNNER_FILES):
+        return "current"
+    try:
+        stamp = json.loads((target / SOURCE_STAMP).read_text())
+    except (OSError, ValueError):
+        stamp = None
+    if (isinstance(stamp, dict) and stamp.get("by") != STAMP_BY
+            and str(stamp.get("date") or "")[:10] >= tag_date(tag)):
+        return f"kept (staged {str(stamp.get('source') or '?')[:12]} on {str(stamp['date'])[:10]}, not older than {tag})"
+    for name in RUNNER_FILES:
+        data, dest = (src / name).read_bytes(), target / name
+        tmp = target / f".{name}.glaeda-update"
+        tmp.write_bytes(data)
+        tmp.chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+        os.replace(tmp, dest)
+    source = json.loads((gen / "release.json").read_text()).get("source")
+    tmp = target / f".{SOURCE_STAMP}.glaeda-update"
+    tmp.write_text(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
+    os.replace(tmp, target / SOURCE_STAMP)
+    return f"refreshed to {tag}"
+
+
+def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
+           channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN) -> dict:
+    state = load_state(state_dir)
+    source = config.get("source", REPOSITORY)
+    control_raw, ring_raw = channel if channel is not None else fetch_channel(config["ring"], source)
+    entry = resolve(control_raw, ring_raw, config["ring"])
+    out = {"ring": config["ring"], "source": source, "current": state["current"]}
+    if entry is None:
+        return {**out, "result": "idle", "why": "paused or nothing on this ring"}
+    out["target"] = entry["tag"]
+    if entry["tag"] == state["current"]:
+        return {**out, "result": "current"}
+    if entry["tag"] in state["quarantined"]:
+        return {**out, "result": "quarantined", "why": "this release failed here before"}
+    if not apply:
+        return {**out, "result": "plan", "why": f"would install {entry['tag']}"}
+    try:
+        gen = download(state_dir, entry, local_target(), config["ring"], source)
+    except UpdateError as e:
+        # The release failed verification (digest, attestation, archive): that is the release's fault
+        # or a real attack, never a blip, so it counts against it. Network errors are not UpdateError
+        # and stay inconclusive: no status, try again next hour.
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+        save_state(state, state_dir)
+        return {**out, "result": "refused", "detail": str(e), "status": report(config, entry, False, str(e))}
+    if state["current"] is None:
+        snapshot(state_dir, bin_dir)
+    ok, log = run_setup(gen, config["setupArgs"])
+    detail = "installed" if ok else "setup failed"
+    if ok:
+        channel_dir = state_dir / "health-channel"
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        (channel_dir / "control.json").write_bytes(control_raw)
+        (channel_dir / f"{config['ring']}.json").write_bytes(ring_raw or b"")
+        ok, detail = health(bin_dir, channel_dir)
+    if ok:
+        state.update(previous=state["current"], current=entry["tag"])
+        save_state(state, state_dir)
+        shutil.rmtree(state_dir / "pre-ota", ignore_errors=True)
+        prune(state_dir, {t for t in (state["current"], state["previous"]) if t})
+        return {**out, "result": "updated", "detail": detail, "status": report(config, entry, True, detail)}
+    state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+    previous = state["current"]
+    if previous and (generation(state_dir, previous) / ".complete").is_file():
+        back, _ = run_setup(generation(state_dir, previous), config["setupArgs"])
+        rolled = f"restored {previous}" if back else f"restoring {previous} failed too"
+    elif restore(state_dir, bin_dir):
+        rolled = "restored the tools installed before the first update"
+    else:
+        rolled = "nothing to restore"
+    save_state(state, state_dir)
+    return {**out, "result": "rolled-back", "detail": detail, "rollback": rolled, "log": log[-600:],
+            "status": report(config, entry, False, detail)}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="install the ring's release if it is new")
+    ap.add_argument("--status", action="store_true", help="print config and state, contact nothing")
+    ap.add_argument("--channel-dir", type=Path, help=argparse.SUPPRESS)  # health check: plan offline
+    a = ap.parse_args(argv)
+    try:
+        config = load_config()
+        if a.status:
+            print(json.dumps({"config": config, "state": load_state()}, indent=1, sort_keys=True))
+            return 0
+        if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)
+            channel = None
+            if a.channel_dir:
+                ring_file = a.channel_dir / f"{config['ring']}.json"
+                ring_raw = ring_file.read_bytes() or None
+                channel = ((a.channel_dir / "control.json").read_bytes(), ring_raw)
+            result = update(False, config, channel=channel)
+        else:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(STATE_DIR / "lock", "w") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
+                    return 0
+                result = update(True, config)
+                if result["result"] in ("updated", "current", "idle"):
+                    result["promotion"] = nudge_promotion(config)
+                if result["result"] in ("updated", "current"):
+                    try:
+                        result["runnerScripts"] = refresh_runner_scripts()
+                    except (OSError, ValueError, UpdateError) as e:  # never fails the update itself
+                        result["runnerScripts"] = f"not refreshed ({type(e).__name__}: {e})"[:300]
+        result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(json.dumps(result, sort_keys=True))
+        return 1 if result["result"] in ("rolled-back", "refused") else 0
+    except Exception as e:  # one JSON line per run, whatever failed
+        print(json.dumps({"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn disposable_noble_packages_use_only_the_admitted_elf_shapes() {
-        if std::env::var("SMOLRUNNER_ELF_PACKAGE_PROBE").as_deref() != Ok("github-hosted-ubuntu") {
+        if std::env::var("GLAEDA_DISPOSABLE_PROBE").as_deref() != Ok("1") {
             return;
         }
         let architecture = match std::env::consts::ARCH {
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[test]
     fn disposable_noble_dynamic_loader_has_the_admitted_object_shape() {
-        if std::env::var("SMOLRUNNER_ELF_PACKAGE_PROBE").as_deref() != Ok("github-hosted-ubuntu") {
+        if std::env::var("GLAEDA_DISPOSABLE_PROBE").as_deref() != Ok("1") {
             return;
         }
         let (architecture, path) = match std::env::consts::ARCH {

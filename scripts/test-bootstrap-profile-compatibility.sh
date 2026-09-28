@@ -25,6 +25,7 @@ import sys
 from dataclasses import replace
 
 from workspace_bootstrap.profile_bridge import (
+    TRUSTED_SOURCE_KIND,
     DescriptorIdentity,
     RunnerContextProvenance,
     ValidatedRunnerCacheContext,
@@ -54,7 +55,7 @@ def digest(label: str) -> str:
 
 def provenance(**changes: object) -> RunnerContextProvenance:
     base = RunnerContextProvenance(
-        source_kind="smolrunner-protected-state-v1",
+        source_kind=TRUSTED_SOURCE_KIND,
         evidence_digest=digest("trusted-context"),
         state_root_descriptor_relative=True,
         installation_descriptor_opened=True,
@@ -160,6 +161,7 @@ def codes(result: dict[str, object]) -> set[str]:
     }
 
 
+assert TRUSTED_SOURCE_KIND == "glaeda-protected-state-v2"
 valid = map_validated_runner_context(receipt(), context())
 assert valid["blocking_reasons"] == []
 observation = valid["observation"]
@@ -190,9 +192,14 @@ assert str(installation) not in public
 ids = [item["capability"] for item in observation["capabilities"]]
 assert len(ids) == len(set(ids))
 
-# Provenance refusal matrix. These are typed facts a future SmolRunner-owned
+# Provenance refusal matrix. These are typed facts a future Glaeda-owned
 # producer must derive while holding protected descriptors.
 refusals: list[tuple[str, ValidatedRunnerContext, str]] = [
+    (
+        "legacy SmolRunner v1 provenance",
+        context(provenance=provenance(source_kind="smolrunner-protected-state-v1")),
+        "runner_context_untrusted_source",
+    ),
     (
         "forged receipt",
         context(provenance=provenance(source_kind="caller-selected-json")),

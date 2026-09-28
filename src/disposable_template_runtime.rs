@@ -49,10 +49,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const GUEST_CACHE_PATH: &str = "/opt/smolrunner/actions-runner/_work";
 const JIT_LAUNCHER: &str = "/opt/smolrunner/bin/smolrunner-jit-launcher";
-const JIT_LAUNCHER_BYTES: &[u8] = include_bytes!("../examples/lima/smolrunner-jit-launcher");
+const JIT_LAUNCHER_BYTES: &[u8] = include_bytes!("../examples/lima/glaeda-jit-launcher");
 const RUNNER_INTEGRITY: &str = "/opt/smolrunner/bin/smolrunner-runner-integrity";
-const RUNNER_INTEGRITY_BYTES: &[u8] =
-    include_bytes!("../examples/lima/smolrunner-runner-integrity");
+const RUNNER_INTEGRITY_BYTES: &[u8] = include_bytes!("../examples/lima/glaeda-runner-integrity");
 const RUNNER_USER: &str = "smolrunner-runner";
 const EXPECTED_RUNNER_GROUPS: &str = "smolrunner-runner\n";
 const EXPECTED_RUNNER_INTEGRITY: &str = "smolrunner-runner-integrity-ok\n";

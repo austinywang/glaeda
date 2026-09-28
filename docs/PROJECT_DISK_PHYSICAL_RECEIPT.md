@@ -3,9 +3,11 @@
 Status: accepted read-only diagnostic/evidence tool for the #565 project-disk programme
 Receipt schema: `smolrunner-project-disk-physical-observation` v1
 
+The receipt schema, `SMOLRUNNER_*` test variables, and scratch filenames below are exact v1/transition identities. They remain unchanged while current product prose uses Glaeda.
+
 ## Purpose
 
-This runbook captures bounded physical evidence from the operator Mac and one Linux guest without granting SmolRunner ownership or mutation authority.
+This runbook captures bounded physical evidence from the operator Mac and one Linux guest without granting Glaeda ownership or mutation authority.
 
 The collector was used by #634 to establish the Lima 2.2.0 detached/attached physical schema. Current consumers include:
 
@@ -22,7 +24,7 @@ The collector performs no Lima mutation and grants no authority to:
 - create, attach, detach, unlock, format, resize, delete, repair, or clean up a disk;
 - start or stop a resident sandbox;
 - mount a project filesystem or OverlayFS task view;
-- bind a physical object to a SmolRunner project-disk generation;
+- bind a physical object to a Glaeda project-disk generation;
 - construct a `TrustedProjectFilesystemCorrelationProof` or another runtime capability.
 
 Disk names, paths, entry names, symlink targets, inventory fields, device numbers, and this receipt are observations only.

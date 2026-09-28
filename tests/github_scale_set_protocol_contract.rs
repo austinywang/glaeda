@@ -1,4 +1,4 @@
-use smolrunner::github_scale_set_protocol::{
+use glaeda::github_scale_set_protocol::{
     GITHUB_SCALE_SET_PROTOCOL_SCHEMA_VERSION, ScaleSetJobEvent, ScaleSetJobId, ScaleSetJobResult,
     ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };

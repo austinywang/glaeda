@@ -6,6 +6,8 @@
 //! inputs, serializes publication with a private lock, atomically publishes complete private bytes,
 //! and uses only bounded fixed-shape `launchctl` calls. Only bounded path-free reports are public.
 
+pub mod upgrade;
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 

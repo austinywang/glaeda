@@ -1,10 +1,12 @@
 # Disposable VZ network-selector physical acceptance
 
-This runbook is the operator-facing evidence sequence for issue #501 under parent #498. It prepares one exact, benign physical observation of the current Lima/VZ guest packet path before SmolRunner chooses any hostile-CI enforcement backend.
+This runbook is the operator-facing evidence sequence for issue #501 under parent #498. It prepares one exact, benign physical observation of the current Lima/VZ guest packet path before Glaeda chooses any hostile-CI enforcement backend.
 
 It is deliberately observation-only on host networking. A successful run identifies a stable worker selector, or proves that the current VZ usernet path does not expose one that is safe enough for host-side enforcement.
 
 This document grants no firewall authority and does not widen the accepted workload boundary.
+
+The `SMOLRUNNER_*` acceptance token and `smolrunner-prepared-template.yaml` filename below are exact existing test/template identities and remain unchanged in this documentation lane.
 
 ## Current source model
 
@@ -26,7 +28,7 @@ The current repository baseline proves:
 
 The pinned upstream source also narrows the expected data path:
 
-1. SmolRunner pins Lima `2.2.0`.
+1. Glaeda pins Lima `2.2.0`.
 2. Lima VZ with no configured usernet starts an **in-process gvisor-tap-vsock** netstack from its VZ driver.
 3. Lima `2.2.0` pins `gvisor-tap-vsock v0.8.9`.
 4. That version installs guest TCP and UDP forwarders whose external sides use ordinary Go `net.Dial("tcp", ...)` and `net.Dial("udp", ...)` host sockets.
@@ -35,7 +37,7 @@ Therefore the working hypothesis is that guest egress may be attributed by macOS
 
 ## Operator gate
 
-Running this acceptance creates and destroys a disposable VM and emits reviewed network probes from that VM. Obtain explicit operator approval for the exact SmolRunner commit and this physical experiment before execution.
+Running this acceptance creates and destroys a disposable VM and emits reviewed network probes from that VM. Obtain explicit operator approval for the exact Glaeda commit and this physical experiment before execution.
 
 The eventual checked-in harness should require exactly:
 
@@ -64,7 +66,7 @@ Any checked-in harness must use fixed absolute child programs and argv shapes. E
 
 Keep only bounded metadata required to choose a selector:
 
-- exact SmolRunner commit;
+- exact Glaeda commit;
 - prepared-template identity and pinned Lima version;
 - exact fresh test namespace identity;
 - retained Lima hostagent process identity needed to correlate this run;
@@ -84,7 +86,7 @@ Do not retain raw process environment, Keychain data, credentials, unrelated soc
 
 Before creating a VM, record:
 
-- exact SmolRunner source commit;
+- exact Glaeda source commit;
 - exact `examples/lima/smolrunner-prepared-template.yaml` identity;
 - prepared-template manifest identity including Lima `2.2.0`;
 - exact acceptance token value;
@@ -217,7 +219,7 @@ If quiescence, VM ownership, process identity, or cleanup authority is ambiguous
 
 The #501 completion comment should contain only:
 
-- exact SmolRunner commit accepted;
+- exact Glaeda commit accepted;
 - prepared-template/Lima identity;
 - acceptance namespace identity in bounded public form;
 - TCP selector observation;

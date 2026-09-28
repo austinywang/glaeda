@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::debian_package_plan::{build_package_plan, parse_os_release};
 use crate::host::Presence;
@@ -18,7 +19,7 @@ use super::support::{
 };
 use super::{
     RootlessPodmanPreflightDisposition, RootlessPodmanPreflightPaths, RootlessPodmanPreflightState,
-    observe_with,
+    observe_with, observe_with_environment,
 };
 
 struct FakeFilesystem {
@@ -106,6 +107,135 @@ fn matching_static_state_is_ready_only_for_later_smoke_verification() {
             && item.path.is_absolute()
             && item.path.as_path() != Path::new("podman")
     }));
+}
+
+#[test]
+fn selected_rust_coreutils_env_is_reverified_and_reported_matching() {
+    let probed = RefCell::new(Vec::new());
+    let report = observe_with_environment(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Matching),
+        &RootlessPodmanPreflightPaths::system_default(),
+        (
+            &FakeFilesystem {
+                observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                    kind: RuntimePathKind::Directory,
+                    uid: 1001,
+                    mode: 0o700,
+                }),
+            },
+            &|path| {
+                probed.borrow_mut().push(path.to_path_buf());
+                matching_executable(path)
+            },
+            &|| Ok(PathBuf::from("/usr/lib/cargo/bin/coreutils/env")),
+        ),
+    );
+
+    let environment = report
+        .executables
+        .iter()
+        .find(|executable| executable.name == "env")
+        .expect("environment observation");
+    assert_eq!(
+        environment.path,
+        Path::new("/usr/lib/cargo/bin/coreutils/env")
+    );
+    assert_eq!(environment.state, RootlessPodmanPreflightState::Matching);
+    assert!(
+        probed
+            .borrow()
+            .contains(&PathBuf::from("/usr/lib/cargo/bin/coreutils/env"))
+    );
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::ReadyForSmokeVerification
+    );
+}
+
+#[test]
+fn unsupported_environment_selection_blocks_without_probing_it() {
+    let probed = RefCell::new(Vec::new());
+    let report = observe_with_environment(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Matching),
+        &RootlessPodmanPreflightPaths::system_default(),
+        (
+            &FakeFilesystem {
+                observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                    kind: RuntimePathKind::Directory,
+                    uid: 1001,
+                    mode: 0o700,
+                }),
+            },
+            &|path| {
+                probed.borrow_mut().push(path.to_path_buf());
+                matching_executable(path)
+            },
+            &|| Ok(PathBuf::from("/tmp/private-env-marker")),
+        ),
+    );
+
+    let environment = report
+        .executables
+        .iter()
+        .find(|executable| executable.name == "env")
+        .expect("environment observation");
+    assert_eq!(environment.path, Path::new("/usr/bin/env"));
+    assert_eq!(environment.state, RootlessPodmanPreflightState::Conflicting);
+    assert_eq!(
+        environment.evidence,
+        ["no supported reviewed environment executable is available"]
+    );
+    assert!(
+        !probed
+            .borrow()
+            .contains(&PathBuf::from("/tmp/private-env-marker"))
+    );
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::Blocked
+    );
+}
+
+#[test]
+fn unavailable_environment_selection_blocks_with_bounded_evidence() {
+    let report = observe_with_environment(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Matching),
+        &RootlessPodmanPreflightPaths::system_default(),
+        (
+            &FakeFilesystem {
+                observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                    kind: RuntimePathKind::Directory,
+                    uid: 1001,
+                    mode: 0o700,
+                }),
+            },
+            &matching_executable,
+            &|| Err(()),
+        ),
+    );
+
+    let environment = report
+        .executables
+        .iter()
+        .find(|executable| executable.name == "env")
+        .expect("environment observation");
+    assert_eq!(
+        environment.evidence,
+        ["no supported reviewed environment executable is available"]
+    );
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::Blocked
+    );
 }
 
 #[test]

@@ -1,0 +1,116 @@
+name: Developer loop benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/developer-loop-benchmark.yml"
+      - "benchmarks/developer-loop-doc-edit.patch"
+      - "scripts/benchmark-developer-loop"
+      - "scripts/test-benchmark-developer-loop.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: developer-loop-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fresh-hosted:
+    name: Fresh hosted control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --no-self-update
+
+      - name: Validate benchmark contract
+        run: python3 scripts/test-benchmark-developer-loop.py
+
+      - name: Apply exact source edit
+        run: git apply benchmarks/developer-loop-doc-edit.patch
+
+      - name: Run fresh hosted workload
+        run: |
+          scripts/benchmark-developer-loop --output /tmp/fresh-hosted.json
+          cat /tmp/fresh-hosted.json
+          cp /tmp/fresh-hosted.json "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload fresh receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fresh-hosted-receipt
+          path: /tmp/fresh-hosted.json
+          if-no-files-found: error
+
+  prepared-hosted:
+    name: Cache-prepared hosted control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --no-self-update
+
+      - name: Restore exact base generation
+        id: base-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: developer-loop-base-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ github.sha }}
+
+      - name: Materialize exact unedited base on cache miss
+        if: ${{ steps.base-cache.outputs.cache-hit != 'true' }}
+        run: scripts/benchmark-developer-loop --output /tmp/base-prime.json
+
+      - name: Save exact unedited base on cache miss
+        if: ${{ steps.base-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: developer-loop-base-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ github.sha }}
+
+      - name: Require prepared base
+        run: test -d target
+
+      - name: Apply exact source edit
+        run: git apply benchmarks/developer-loop-doc-edit.patch
+
+      - name: Run cache-prepared hosted workload
+        run: |
+          scripts/benchmark-developer-loop --output /tmp/prepared-hosted.json
+          cat /tmp/prepared-hosted.json
+          cp /tmp/prepared-hosted.json "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload prepared receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: prepared-hosted-receipt
+          path: /tmp/prepared-hosted.json
+          if-no-files-found: error

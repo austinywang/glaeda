@@ -9,23 +9,23 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smolrunner::artifact::{RepositoryRef, Sha256Digest};
-use smolrunner::execution_receipt::{
+use glaeda::artifact::{RepositoryRef, Sha256Digest};
+use glaeda::execution_receipt::{
     ExecutionReceipt, ExecutionReceiptAction, ExecutionReceiptActionOutcome,
     ExecutionReceiptContinuation, ExecutionReceiptDisposition, ReceiptTimestamp,
     encode_execution_receipt,
 };
-use smolrunner::execution_receipt_store::{
+use glaeda::execution_receipt_store::{
     ExecutionReceiptPublicationDisposition, ExecutionReceiptStoreErrorKind,
     publish_execution_receipt, read_execution_receipt,
 };
-use smolrunner::journal::{ExecutionLane, RollbackClass};
+use glaeda::journal::{ExecutionLane, RollbackClass};
 #[cfg(target_os = "linux")]
-use smolrunner::linux_state::LinuxStateRoot;
+use glaeda::linux_state::LinuxStateRoot;
 #[cfg(target_os = "linux")]
-use smolrunner::linux_state_prepare::prepare_installation;
-use smolrunner::state::{InstallationId, JournalId, StateComponent, StatePath};
-use smolrunner::state_store::{
+use glaeda::linux_state_prepare::prepare_installation;
+use glaeda::state::{InstallationId, JournalId, StateComponent, StatePath};
+use glaeda::state_store::{
     StateRead, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
     StateWriteDisposition, StateWriteReceipt,
 };

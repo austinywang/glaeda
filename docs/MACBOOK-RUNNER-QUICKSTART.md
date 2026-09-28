@@ -1,6 +1,8 @@
 # MacBook runner quickstart
 
-This is the short operator path for the existing `smolrunner` Lima development VM.
+This is the short operator path for the existing legacy-named `smolrunner` Lima development VM.
+
+This runbook intentionally retains existing `smolrunner` VM/session names, `SMOLRUNNER_*` variables, helper filenames, service labels, scheduling labels, and example filenames while their owning migration lanes move those live surfaces. Current product prose uses Glaeda.
 
 ## Trusted Quarry fast lane
 
@@ -108,7 +110,7 @@ This is an explicit trusted-repository optimization, not the hostile-workload
 boundary. Third-party and potentially malicious repositories must continue to
 use the disposable VM lifecycle described in `DISPOSABLE_AUTOSCALING_CI.md`.
 
-Run commands from the SmolRunner checkout on the Mac.
+Run commands from the Glaeda checkout on the Mac.
 
 ## Reviewed resource profiles
 
@@ -194,7 +196,7 @@ SMOLRUNNER_WORK_SESSION=another-session make work-cmux
 
 cmux may trigger the standard macOS Automation permission prompt when the invoking terminal first asks cmux to create or select the workspace. The launcher uses cmux's macOS scripting interface to find or create the human-facing workspace. Commands that rename the workspace and terminal tabs run inside cmux, so the helper leaves socket access unchanged and never enables broad external control.
 
-The Lima guest receives no cmux socket, Mac filesystem mount, SSH agent, or copied credential. cmux provides the vertical workspace sidebar, split panes, session restoration, and attention indicators while remaining a human-facing view over SmolRunner commands.
+The Lima guest receives no cmux socket, Mac filesystem mount, SSH agent, or copied credential. cmux provides the vertical workspace sidebar, split panes, session restoration, and attention indicators while remaining a human-facing view over Glaeda commands.
 
 ## Open only the VM
 
@@ -215,7 +217,7 @@ limactl shell smolrunner
 ```bash
 make vm-status   # Lima state plus host and guest Git branches
 make vm-sync     # clean guest checkout: fetch main, then fast-forward only
-make vm-doctor   # run machine-readable SmolRunner doctor in the guest
+make vm-doctor   # run machine-readable Glaeda doctor in the guest
 make vm-observe  # read-only Mac and guest resource report
 make vm-stop     # graceful VM stop
 ```
@@ -283,4 +285,4 @@ trusted Quarry fast lane:
 - cmux remains a human-facing view and never becomes privileged execution transport;
 - no production deployment authority is implied by these shortcuts.
 
-Repository-specific dependency installation and verification remain repository-owned. SmolRunner will eventually provide the surrounding one-command host, runner, release-channel, rollback, and disposable-execution lifecycle after the reviewed preparation and registration paths exist.
+Repository-specific dependency installation and verification remain repository-owned. Glaeda will eventually provide the surrounding one-command host, runner, release-channel, rollback, and disposable-execution lifecycle after the reviewed preparation and registration paths exist.

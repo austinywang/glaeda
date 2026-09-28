@@ -21,6 +21,15 @@ pub enum HotExecutionPerformanceAuthority {
     ObservationOnly,
 }
 
+impl HotExecutionPerformanceAuthority {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservationOnly => "observation_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HotExecutionMode {
@@ -694,7 +703,8 @@ impl HotExecutionPerformanceReceipt {
     #[must_use]
     pub fn render_human(&self) -> String {
         let mut output = format!(
-            "hot execution performance\nworkload: {}\nproject: {}\nsource: {}\ncandidate: {}\nmode: {}\nbackend: {}\nhost: {}\nresource profile: {}\nresult: {}\ntotal: {} ms\nfirst useful command: {}\nfirst relevant result: {}\nfinal relevant result: {}\n",
+            "hot execution performance\nauthority: {}\nworkload: {}\nproject: {}\nsource: {}\ncandidate: {}\nmode: {}\nbackend: {}\nhost: {}\nresource profile: {}\nresult: {}\ntotal: {} ms\nfirst useful command: {}\nfirst relevant result: {}\nfinal relevant result: {}\n",
+            self.authority.as_str(),
             self.identity.workload_id(),
             self.identity.project_id(),
             self.identity.source_id(),
@@ -918,7 +928,7 @@ mod tests {
         assert_eq!(receipt.total_elapsed_millis(), 2_800);
         assert_eq!(
             receipt.render_human(),
-            "hot execution performance\nworkload: quarry-edit-test\nproject: quarry\nsource: git:c999748e8aeebc8bf622a758d29a936449f63fd5\ncandidate: project-disk-xfs-reflink\nmode: resident_task_loop\nbackend: lima-vz\nhost: apple-silicon-24g\nresource profile: medium-4c-8g\nresult: succeeded\ntotal: 2800 ms\nfirst useful command: 12 ms\nfirst relevant result: 2420 ms\nfinal relevant result: 2760 ms\nheat: sandbox=resident_hit repository=task_fork dependency=environment_hit build=incremental_hit index_service=resident_hit\n"
+            "hot execution performance\nauthority: observation_only\nworkload: quarry-edit-test\nproject: quarry\nsource: git:c999748e8aeebc8bf622a758d29a936449f63fd5\ncandidate: project-disk-xfs-reflink\nmode: resident_task_loop\nbackend: lima-vz\nhost: apple-silicon-24g\nresource profile: medium-4c-8g\nresult: succeeded\ntotal: 2800 ms\nfirst useful command: 12 ms\nfirst relevant result: 2420 ms\nfinal relevant result: 2760 ms\nheat: sandbox=resident_hit repository=task_fork dependency=environment_hit build=incremental_hit index_service=resident_hit\n"
         );
 
         let first = receipt.render_json().expect("receipt serializes");

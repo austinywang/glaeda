@@ -6,51 +6,51 @@ use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smolrunner::debian_package_plan::{DebianPackagePlan, build_package_plan, parse_os_release};
-use smolrunner::durable_lane_execution::LaneCommandRunner;
-use smolrunner::host::Presence;
-use smolrunner::host_preparation_command::{
+use glaeda::debian_package_plan::{DebianPackagePlan, build_package_plan, parse_os_release};
+use glaeda::durable_lane_execution::LaneCommandRunner;
+use glaeda::host::Presence;
+use glaeda::host_preparation_command::{
     HostPreparationCommandDecision, decide_host_preparation, host_preparation_confirmation,
 };
-use smolrunner::host_preparation_plan::{HostPreparationResult, plan_host_preparation};
-use smolrunner::host_readiness::{
+use glaeda::host_preparation_plan::{HostPreparationResult, plan_host_preparation};
+use glaeda::host_readiness::{
     ExactExecutableObservation, HostObservationState, HostReadinessReport, RunnerAccountReadiness,
 };
-use smolrunner::host_rootless_podman::HostRootlessPodmanReadiness;
-use smolrunner::journal::{ActionFailure, ActionReceipt, ExecutionLane};
-use smolrunner::journal_document::{JournalStateDocument, decode_journal_document};
-use smolrunner::lane_command::{LaneCommand, LaneCommandKind, LinuxAccountName};
-use smolrunner::lane_executor::RootLaneExecutor;
-use smolrunner::linux_state::LinuxStateRoot;
-use smolrunner::linux_state_prepare::prepare_installation;
-use smolrunner::manifest::RunnerScope;
-use smolrunner::ownership::ProjectIdentity;
-use smolrunner::process::{CommandExecutor, CommandSpec, ProcessExecutor};
-use smolrunner::rootless_podman_config_observation::{
+use glaeda::host_rootless_podman::HostRootlessPodmanReadiness;
+use glaeda::journal::{ActionFailure, ActionReceipt, ExecutionLane};
+use glaeda::journal_document::{JournalStateDocument, decode_journal_document};
+use glaeda::lane_command::{LaneCommand, LaneCommandKind, LinuxAccountName};
+use glaeda::lane_executor::RootLaneExecutor;
+use glaeda::linux_state::LinuxStateRoot;
+use glaeda::linux_state_prepare::prepare_installation;
+use glaeda::manifest::RunnerScope;
+use glaeda::ownership::ProjectIdentity;
+use glaeda::process::{CommandExecutor, CommandSpec, ProcessExecutor};
+use glaeda::rootless_podman_config_observation::{
     ROOTLESS_PODMAN_CONFIG_OBSERVATION_SCHEMA_VERSION, RootlessPodmanConfigObservationReport,
 };
-use smolrunner::rootless_podman_config_resolution::{
+use glaeda::rootless_podman_config_resolution::{
     ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION, RootlessPodmanConfigAssessment,
     RootlessPodmanConfigAssessmentState,
 };
-use smolrunner::rootless_podman_preflight::{
+use glaeda::rootless_podman_preflight::{
     ROOTLESS_PODMAN_PREFLIGHT_SCHEMA_VERSION, RootlessPodmanExecutableObservation,
     RootlessPodmanPreflightDisposition, RootlessPodmanPreflightObservation,
     RootlessPodmanPreflightState, RootlessPodmanStaticPreflightReport,
 };
-use smolrunner::runner_account_observation::{
+use glaeda::runner_account_observation::{
     RunnerAccountObservationPaths, RunnerAccountObservationReport, observe_runner_account,
 };
-use smolrunner::runner_account_plan::{
+use glaeda::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, PreparationObservation,
     PreparationObservationState, RunnerAccountObservations, RunnerAccountResourceKind,
     build_runner_account_plan,
 };
-use smolrunner::runner_user::VerifiedRunnerUser;
-use smolrunner::state::{InstallationId, JournalId, StateLayout};
-use smolrunner::state_document::ProjectStateDocument;
-use smolrunner::state_store::{StateRead, StateRecord};
-use smolrunner::subordinate_id::{PodmanMigrationPlan, build_exact_subordinate_id_plan};
+use glaeda::runner_user::VerifiedRunnerUser;
+use glaeda::state::{InstallationId, JournalId, StateLayout};
+use glaeda::state_document::ProjectStateDocument;
+use glaeda::state_store::{StateRead, StateRecord};
+use glaeda::subordinate_id::{PodmanMigrationPlan, build_exact_subordinate_id_plan};
 
 pub(super) const HOME: &str = "/var/lib/smolrunner-acceptance";
 pub(super) const PRIVATE_SENTINEL: &str = "private-observation-token-never-public";
@@ -385,7 +385,7 @@ fn readiness_report(
         subordinate_ids.podman_migration = migration;
     }
     HostReadinessReport {
-        schema_version: smolrunner::host_readiness::HOST_READINESS_SCHEMA_VERSION,
+        schema_version: glaeda::host_readiness::HOST_READINESS_SCHEMA_VERSION,
         repository: REPOSITORY.to_owned(),
         executables: exact_executables(),
         package_plan: package_plan(),

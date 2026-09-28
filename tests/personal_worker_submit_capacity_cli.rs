@@ -7,21 +7,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     EpochMillis, ExecutionAdmissionIdentity, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, RunnerProfileId,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     MAX_PERSONAL_WORKER_QUEUE_ENTRIES, PersonalWorkerActivityEvidence,
     PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
     PersonalWorkerJobRequest, PersonalWorkerPriority, PersonalWorkerProfile,
     PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
     PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{PersonalWorkerStore, PersonalWorkerStoreDocument};
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::personal_worker_store::{PersonalWorkerStore, PersonalWorkerStoreDocument};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE: u64 = 20_000_000;
@@ -163,11 +163,11 @@ fn submit_arguments(root: &TempRoot, output: &str) -> Vec<OsString> {
     ]
 }
 
-fn run_smolrunner(arguments: &[OsString]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_smolrunner"))
+fn run_glaeda(arguments: &[OsString]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_glaeda"))
         .args(arguments)
         .output()
-        .expect("run installed smolrunner binary")
+        .expect("run installed glaeda binary")
 }
 
 fn current_bytes(root: &TempRoot) -> Vec<u8> {
@@ -188,7 +188,7 @@ fn full_queue_rejects_submission_without_publication_or_private_disclosure() {
     create_store(&root);
     let before = current_bytes(&root);
 
-    let json_output = run_smolrunner(&submit_arguments(&root, "json"));
+    let json_output = run_glaeda(&submit_arguments(&root, "json"));
     assert!(!json_output.status.success());
     let json: serde_json::Value =
         serde_json::from_slice(&json_output.stdout).expect("bounded JSON error");
@@ -198,7 +198,7 @@ fn full_queue_rejects_submission_without_publication_or_private_disclosure() {
     assert!(!json_public.contains("private-capacity-request-sentinel"));
     assert!(!json_public.contains(root.path().to_string_lossy().as_ref()));
 
-    let human_output = run_smolrunner(&submit_arguments(&root, "human"));
+    let human_output = run_glaeda(&submit_arguments(&root, "human"));
     assert!(!human_output.status.success());
     assert_eq!(current_bytes(&root), before);
     let human_public = public_output(&human_output);

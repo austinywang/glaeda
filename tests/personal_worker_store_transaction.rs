@@ -1,27 +1,27 @@
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
     ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
     PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPriority,
     PersonalWorkerProfile, PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration,
     PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
     PersonalWorkerStoreError, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRecovery,
     PersonalWorkerStoreRecoveryDisposition, PersonalWorkerStoreRevision,
     PersonalWorkerStoreWriteDisposition, PersonalWorkerStoreWriteReceipt,
 };
-use smolrunner::personal_worker_store_transaction::{
+use glaeda::personal_worker_store_transaction::{
     PersonalWorkerStoreMutation, PersonalWorkerStoreMutationDisposition,
     PersonalWorkerStoreMutationErrorKind, apply_personal_worker_store_mutation,
 };
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE: u64 = 1_000_000;

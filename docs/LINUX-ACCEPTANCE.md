@@ -1,6 +1,6 @@
 # Linux acceptance testing
 
-SmolRunner keeps ordinary unit tests rootless and host-independent. This acceptance layer adds two explicit test classes without exposing a mutation CLI or treating a container as a systemd virtual machine.
+Glaeda keeps ordinary unit tests rootless and host-independent. This acceptance layer adds two explicit test classes without exposing a mutation CLI or treating a container as a systemd virtual machine.
 
 ## Test classes
 
@@ -94,7 +94,7 @@ The following checks require a booted Debian or Ubuntu VM with systemd, root pri
 7. Run the harness inside the Apple-silicon MacBook VM to cover the ARM64 guest path.
 8. Suspend and resume the Mac while the VM is idle, then repeat read-only observations before starting another job.
 
-A privileged container must not be used as evidence for these checks. Record the exact SmolRunner commit, guest image, architecture, commands, and journal files for every VM run.
+A privileged container must not be used as evidence for these checks. Record the exact Glaeda commit, guest image, architecture, commands, and journal files for every VM run.
 
 ## Failure interpretation
 

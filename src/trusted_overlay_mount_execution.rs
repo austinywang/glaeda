@@ -683,9 +683,7 @@ mod tests {
         ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
         ResidentSandboxGeneration, ResidentSandboxId,
     };
-    use crate::trusted_overlay_mount_plan::{
-        TrustedOverlayMountPaths, observe_trusted_overlay_mount_plan,
-    };
+    use crate::trusted_overlay_mount_plan::{TrustedOverlayMountPaths, descriptor_test_plan};
     use crate::trusted_overlay_task_view::{
         OverlayGitProofObservation, OverlayGitWorktreeObservation, OverlayIndexObservation,
         OverlayMountObservation, OverlaySourceAnchorBinding, OverlaySourceAnchorGeneration,
@@ -931,7 +929,7 @@ mod tests {
         TrustedProjectFilesystemCorrelationProof,
     ) {
         let (anchor, task) = authority();
-        let plan = observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths()).unwrap();
+        let plan = descriptor_test_plan(&anchor, &task, fixture.paths()).unwrap();
         let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();
         let device = fs::metadata(fixture.root.join("lower")).unwrap().dev();
         let proof = correlation(&anchor, device);

@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Run one shard of a unittest file: `unittest-shard FILE INDEX COUNT`.
+
+Verify splits its slowest test files (scripts/test-glaeda-cmux-runner.py: about 300 s of a 760 s job) across
+parallel jobs. The file is loaded like `python3 FILE` would run it, its test ids are sorted, and this shard
+runs every COUNT-th one starting at INDEX, so the COUNT shards together run each test exactly once. Tests that
+need a fixture shared across a class (setUpClass) or module are refused: a shard could split them apart.
+Exits 0 when the shard passes, 1 on a failure, 2 on bad arguments.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+
+
+def tests_of(suite: unittest.TestSuite) -> list[unittest.TestCase]:
+    found: list[unittest.TestCase] = []
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            found.extend(tests_of(item))
+        else:
+            found.append(item)
+    return found
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3 or not argv[1].isdigit() or not argv[2].isdigit():
+        print("usage: unittest-shard FILE INDEX COUNT", file=sys.stderr)
+        return 2
+    path, index, count = Path(argv[0]), int(argv[1]), int(argv[2])
+    if count < 1 or index >= count or not path.is_file():
+        print(f"unittest-shard: need an existing FILE and 0 <= INDEX < COUNT (got {index}/{count})", file=sys.stderr)
+        return 2
+    sys.path.insert(0, str(path.resolve().parent))  # as `python3 FILE` would
+    name = "unittest_shard_" + "".join(c if c.isalnum() else "_" for c in path.stem)
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    if hasattr(module, "setUpModule"):
+        print(f"unittest-shard: {path} has setUpModule; run it whole", file=sys.stderr)
+        return 2
+    tests = sorted(tests_of(unittest.defaultTestLoader.loadTestsFromModule(module)), key=lambda t: t.id())
+    shared = sorted({type(t).__name__ for t in tests
+                     if "setUpClass" in vars(type(t)) or "tearDownClass" in vars(type(t))})
+    if shared:
+        print(f"unittest-shard: {', '.join(shared)} share a class fixture; run {path} whole", file=sys.stderr)
+        return 2
+    if not tests:  # every shard of an empty file would pass and hide that nothing ran
+        print(f"unittest-shard: {path} defines no tests", file=sys.stderr)
+        return 1
+    mine = tests[index::count]
+    print(f"unittest-shard: {path} shard {index + 1}/{count}: {len(mine)} of {len(tests)} tests", flush=True)
+    result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite(mine))
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

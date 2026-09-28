@@ -1,0 +1,142 @@
+name: Mirror
+
+# Runs only in manaflow-ai/glaeda, the read-only copy of this repository that the Manaflow minis
+# clone and update from (docs/GLAEDA_OTA.md, Fleet mirror). Every 15 minutes it copies main, the
+# releases and the ota-channels files from teamleaderleo/glaeda byte for byte, and keeps every other
+# workflow in the copy disabled: releases are built, attested and promoted only upstream.
+
+on:
+  schedule:
+    - cron: "4,19,34,49 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # releases
+  actions: write   # disable the copy's other workflows
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'manaflow-ai/glaeda'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: teamleaderleo/glaeda
+      MIRROR: ${{ github.repository }}
+    steps:
+      - name: Keep the copy's other workflows disabled
+        # before main moves, so a push from here does not start them (a deploy-key push does)
+        run: |
+          gh api "repos/$MIRROR/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/"))
+                  and .path != ".github/workflows/mirror.yml") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            gh api -X PUT "repos/$MIRROR/actions/workflows/$id/disable"
+            echo "disabled $path" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Read upstream channels, then releases
+        # Before main, so every commit they name is in the main pushed below (main only grows). The
+        # releases to copy are the newest 30 plus whatever the rings name, however old.
+        run: |
+          mkdir -p work/channels work/upstream-channels
+          gh release download ota-channels -R "$UPSTREAM" -p '*.json' -D work/upstream-channels
+          {
+            gh release list -R "$UPSTREAM" -L 30 --json tagName --jq '.[].tagName'
+            for ring in work/upstream-channels/canary.json work/upstream-channels/stable.json; do
+              [ ! -f "$ring" ] || python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["tag"])' "$ring"
+            done
+          } | grep -E '^r-[0-9]{8}-[0-9a-f]{12}$' | sort -u > work/upstream.txt
+      - name: Mirror main and the release tags
+        env:
+          DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
+        run: |
+          up=$(git ls-remote "https://github.com/$UPSTREAM.git" refs/heads/main | cut -f1)
+          here=$(git ls-remote "https://github.com/$MIRROR.git" refs/heads/main | cut -f1)
+          echo "upstream main ${up:0:12}, mirror main ${here:0:12}" >> "$GITHUB_STEP_SUMMARY"
+          git init -q --bare work/main.git
+          git -C work/main.git fetch -q "https://github.com/$UPSTREAM.git" +refs/heads/main:refs/heads/main \
+            '+refs/tags/r-*:refs/tags/r-*'
+          refs=()
+          [ "$up" = "$here" ] || refs+=(+refs/heads/main:refs/heads/main)
+          git ls-remote --tags "https://github.com/$MIRROR.git" 'refs/tags/r-*' | cut -f2 > work/mirror-tags.txt
+          while read -r tag; do
+            grep -qx "refs/tags/$tag" work/mirror-tags.txt && continue
+            # a tag deleted upstream since the listing would fail the whole push, main included
+            if git -C work/main.git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              refs+=("refs/tags/$tag:refs/tags/$tag")
+            else
+              echo "upstream has no tag $tag" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < work/upstream.txt
+          [ ${#refs[@]} -gt 0 ] || exit 0
+          # A deploy key of this repository, not the job token: the token cannot push commits that
+          # change workflow files, nor create a tag (or a release's tag) on a commit whose workflow
+          # files differ from main's.
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror
+          chmod 600 ~/.ssh/mirror
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/mirror -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          git -C work/main.git push "git@github.com:$MIRROR.git" "${refs[@]}"
+          rm -f ~/.ssh/mirror
+      - name: Mirror control.json
+        # the pause switch never waits on a release copy
+        if: always()
+        run: |
+          if ! gh release view ota-channels -R "$MIRROR" >/dev/null 2>&1; then
+            gh release create ota-channels -R "$MIRROR" --target main --prerelease --latest=false --title "OTA channels" \
+              --notes "Mirror of https://github.com/$UPSTREAM/releases/tag/ota-channels (docs/GLAEDA_OTA.md)."
+          fi
+          gh release download ota-channels -R "$MIRROR" -p '*.json' -D work/channels || true
+          if ! cmp -s work/upstream-channels/control.json work/channels/control.json; then
+            gh release upload ota-channels work/upstream-channels/control.json -R "$MIRROR" --clobber
+            echo "updated control.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Mirror releases
+        run: |
+          # A draft is a copy an earlier run did not finish: start it over. One failed copy does not
+          # stop the others; the rings below skip a release that is missing here.
+          gh release list -R "$MIRROR" -L 100 --json tagName,isDraft \
+            --jq '.[] | "\(.tagName) \(.isDraft)"' > work/mirror.txt
+          failed=0
+          while read -r tag; do
+            if grep -qx "$tag false" work/mirror.txt; then continue; fi
+            state=$(gh release view "$tag" -R "$MIRROR" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+            if [ "$state" = false ]; then continue; fi
+            if [ "$state" = true ]; then gh release delete "$tag" -R "$MIRROR" --yes; fi
+            rm -rf work/rel && mkdir work/rel
+            if gh release download "$tag" -R "$UPSTREAM" -D work/rel \
+              && source=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' work/rel/release.json) \
+              && gh release create "$tag" work/rel/* -R "$MIRROR" --draft --verify-tag --prerelease --latest=false \
+                   --title "$tag" --notes "Mirror of https://github.com/$UPSTREAM/releases/tag/$tag (glaeda $source)." \
+              && gh release edit "$tag" -R "$MIRROR" --draft=false; then
+              echo "copied $tag" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "FAILED to copy $tag" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done < work/upstream.txt
+          exit $failed
+      - name: Mirror the rings
+        # after the releases, and only a ring whose release is published here
+        if: always()
+        run: |
+          failed=0
+          for name in canary.json stable.json; do
+            file=work/upstream-channels/$name
+            [ -f "$file" ] || continue
+            cmp -s "$file" "work/channels/$name" && continue
+            tag=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["tag"])' "$file")
+            if gh release view "$tag" -R "$MIRROR" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx false; then
+              gh release upload ota-channels "$file" -R "$MIRROR" --clobber
+              echo "updated $name to $tag" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "kept $name: $tag is not published here" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done
+          exit $failed

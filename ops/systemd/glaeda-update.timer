@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly glaeda-update
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+# spread hosts so a new release is not fetched by the whole fleet in the same second
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

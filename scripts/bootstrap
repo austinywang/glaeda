@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical repository-owned SmolRunner workspace bootstrap preflight."""
+"""Canonical repository-owned Glaeda workspace bootstrap preflight."""
 
 import sys
 

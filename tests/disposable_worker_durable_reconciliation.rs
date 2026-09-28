@@ -6,29 +6,29 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smolrunner::disposable_attempt_catalog::{
+use glaeda::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
     DisposableAttemptReservation, decode_disposable_attempt_catalog,
     encode_disposable_attempt_catalog,
 };
-use smolrunner::disposable_attempt_state::{
+use glaeda::disposable_attempt_state::{
     DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
-use smolrunner::disposable_prepared_template::{
+use glaeda::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
 };
-use smolrunner::disposable_worker_reconciler::{
+use glaeda::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
     DisposableVmIdentity, DisposableVmObservation, DisposableWorkerAction,
     DisposableWorkerReconcileInput, DisposableWorkerResources, ScaleSetRunnerObservation,
     reconcile_attempt,
 };
-use smolrunner::execution_admission::EpochMillis;
-use smolrunner::github_scale_set_protocol::{
+use glaeda::execution_admission::EpochMillis;
+use glaeda::github_scale_set_protocol::{
     ScaleSetJobEvent, ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
     ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -535,7 +535,7 @@ fn lost_reserved_capacity_completes_without_acquiring_vm_cleanup_authority() {
     assert!(matches!(
         action,
         DisposableWorkerAction::Persist {
-            transition: smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction::CompleteUnprovisioned
+            transition: glaeda::disposable_attempt_catalog::DisposableAttemptCatalogAction::CompleteUnprovisioned
         }
     ));
     let attempt = catalog.find_active(&attempt_id()).unwrap().attempt();
@@ -585,7 +585,7 @@ fn reserved_cancellation_survives_restart_before_capacity_release() {
     assert!(matches!(
         checkpoint,
         DisposableWorkerAction::Persist {
-            transition: smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginUnprovisionedRelease
+            transition: glaeda::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginUnprovisionedRelease
         }
     ));
     assert_eq!(
@@ -671,7 +671,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
         action,
         DisposableWorkerAction::Persist {
             transition:
-                smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRegistration(_)
+                glaeda::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRegistration(_)
         }
     ));
     assert_eq!(

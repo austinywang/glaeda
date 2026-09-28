@@ -3,7 +3,9 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
-session="${SMOLRUNNER_WORK_SESSION:-smolrunner}"
+glaeda_session="${GLAEDA_WORK_SESSION:-}"
+legacy_session="${SMOLRUNNER_WORK_SESSION:-}"
+session="${glaeda_session:-${legacy_session:-glaeda}}"
 vm_helper="${repo_root}/scripts/macbook-runner-vm.sh"
 command="${1:-tmux}"
 
@@ -19,7 +21,8 @@ Commands:
               Emit a fixed cmux notification for a completed doctor run.
 
 Environment:
-  SMOLRUNNER_WORK_SESSION  Workspace/session name (default: smolrunner)
+  GLAEDA_WORK_SESSION      Workspace/session name (default: glaeda)
+  SMOLRUNNER_WORK_SESSION  Legacy workspace/session alias; conflicting values are refused
 USAGE
 }
 
@@ -29,9 +32,13 @@ die() {
 }
 
 validate_session() {
+  if [ -n "${glaeda_session}" ] && [ -n "${legacy_session}" ] && \
+     [ "${glaeda_session}" != "${legacy_session}" ]; then
+    die 'GLAEDA_WORK_SESSION conflicts with legacy SMOLRUNNER_WORK_SESSION'
+  fi
   case "${session}" in
     ''|*[!A-Za-z0-9_.-]*)
-      die 'SMOLRUNNER_WORK_SESSION must contain only letters, digits, dot, underscore, or dash'
+      die 'GLAEDA_WORK_SESSION must contain only letters, digits, dot, underscore, or dash'
       ;;
   esac
 }
@@ -133,7 +140,7 @@ on run argv
         set targetTab to new tab in targetWindow
       end if
       set hostTerminal to focused terminal of targetTab
-      set pullsURL to "https://github.com/teamleaderleo/smolrunner/pulls"
+      set pullsURL to "https://github.com/teamleaderleo/glaeda/pulls"
       set hostCommand to "cd -- " & quoted form of repoPath & " && " & quoted form of cmuxPath & " rename-workspace --workspace \"$CMUX_WORKSPACE_ID\" -- " & quoted form of workspaceName & " && " & quoted form of cmuxPath & " rename-tab --surface \"$CMUX_SURFACE_ID\" -- \"Mac host\" && " & quoted form of cmuxPath & " set-status lima \"running\" --workspace \"$CMUX_WORKSPACE_ID\" --icon \"server.rack\" --color \"#30d158\" && " & quoted form of cmuxPath & " log --workspace \"$CMUX_WORKSPACE_ID\" --level info -- " & quoted form of ("Mac checkout: " & repoPath) & " && " & quoted form of cmuxPath & " log --workspace \"$CMUX_WORKSPACE_ID\" --level info -- " & quoted form of ("Pull requests: " & pullsURL)
       input text (hostCommand & linefeed) to hostTerminal
 
@@ -163,7 +170,7 @@ notify_doctor() {
 
   [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 0
   cmux_cli="$(find_cmux_cli)" || return 0
-  "${cmux_cli}" notify --title 'SmolRunner doctor' --body "${body}" >/dev/null
+  "${cmux_cli}" notify --title 'Glaeda doctor' --body "${body}" >/dev/null
 }
 
 launch_tmux() {

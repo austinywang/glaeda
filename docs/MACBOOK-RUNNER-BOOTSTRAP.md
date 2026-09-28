@@ -1,8 +1,8 @@
 # MacBook runner development bootstrap
 
-This note records the manual Ubuntu 24.04 ARM64 bootstrap used to validate the Lima profiles before `smolrunner host prepare` exists.
+This note records the manual Ubuntu 24.04 ARM64 bootstrap used to validate the Lima profiles before `glaeda host prepare` exists.
 
-It is a development procedure, not the final runner-account design. The Lima administrator account is `lima`; the eventual GitHub Actions listener and rootless Podman runtime must use a separate dedicated account reconciled and owned by SmolRunner.
+It is a development procedure, not the final runner-account design. The Lima administrator account is `lima`; the eventual GitHub Actions listener and rootless Podman runtime must use a separate dedicated account reconciled and owned by Glaeda.
 
 ## Proven environment
 
@@ -94,7 +94,7 @@ aarch64
 
 Do not use `ignore_chown_errors`; it changes image ownership semantics rather than fixing the user namespace.
 
-## Validate SmolRunner
+## Validate Glaeda
 
 From the checked-out repository inside the guest:
 

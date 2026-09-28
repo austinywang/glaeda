@@ -1,0 +1,51 @@
+name: Fleet candidate bundles
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/fleet-candidate.yml
+      - scripts/fleet_bundle.py
+      - scripts/test-fleet-bundle.py
+      - tests/fleet_bundle_contract.rs
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+      - name: Test bundle verification
+        run: python3 scripts/test-fleet-bundle.py
+      - name: Build exact-source candidate
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        run: |
+          python3 scripts/fleet_bundle.py build \
+            --source "$(git rev-parse HEAD)" --target "$CANDIDATE_TARGET" \
+            --output target/fleet-bundles > "$RUNNER_TEMP/fleet-candidate.json"
+          cat "$RUNNER_TEMP/fleet-candidate.json" >> "$GITHUB_STEP_SUMMARY"
+          cp "$RUNNER_TEMP/fleet-candidate.json" target/fleet-bundles/receipt.json
+      - name: Upload candidate and receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: glaeda-candidate-${{ matrix.target }}
+          path: target/fleet-bundles/
+          if-no-files-found: error
+          retention-days: 30

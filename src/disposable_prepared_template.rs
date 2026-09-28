@@ -16,9 +16,9 @@ pub const MAX_DISPOSABLE_PREPARED_TEMPLATE_BYTES: usize = 16_384;
 pub const MAX_DISPOSABLE_LIMA_TEMPLATE_BYTES: usize = 64 * 1_024;
 const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v3\0";
 const CURRENT_MANIFEST_BYTES: &[u8] =
-    include_bytes!("../examples/lima/smolrunner-prepared-template.json");
+    include_bytes!("../examples/lima/glaeda-prepared-template.json");
 const CURRENT_LIMA_TEMPLATE_BYTES: &[u8] =
-    include_bytes!("../examples/lima/smolrunner-prepared-template.yaml");
+    include_bytes!("../examples/lima/glaeda-prepared-template.yaml");
 const MAX_DOWNLOAD_LOCATION_BYTES: usize = 512;
 const MAX_RUNNER_ARCHIVE_BYTES: u64 = 1 << 30;
 

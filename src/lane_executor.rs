@@ -22,7 +22,6 @@ const USERMOD: &str = "/usr/sbin/usermod";
 const INSTALL: &str = "/usr/bin/install";
 const LOGINCTL: &str = "/usr/bin/loginctl";
 const RUNUSER: &str = "/usr/sbin/runuser";
-const ENV: &str = "/usr/bin/env";
 const PODMAN: &str = "/usr/bin/podman";
 const GIT: &str = "/usr/bin/git";
 const NOLOGIN: &str = "/usr/sbin/nologin";
@@ -550,7 +549,16 @@ fn validate_runner_command(
         "--user".to_owned(),
         runner.username().as_str().to_owned(),
         "--".to_owned(),
-        ENV.to_owned(),
+        command
+            .runner_environment_program()
+            .ok_or_else(|| {
+                invalid_command("runner-user command lacks a reviewed environment program")
+            })?
+            .to_str()
+            .ok_or_else(|| {
+                invalid_command("runner-user environment program is not a canonical path")
+            })?
+            .to_owned(),
         "--ignore-environment".to_owned(),
         format!("HOME={}", runner.home()),
         format!("USER={}", runner.username().as_str()),
@@ -658,7 +666,7 @@ mod tests {
     use crate::runner_user::MIN_SUBORDINATE_ID_COUNT;
 
     use super::{
-        ENV, GIT, LaneExecutionError, LaneExecutionErrorKind, PODMAN, PrivilegeProbe,
+        GIT, LaneExecutionError, LaneExecutionErrorKind, PODMAN, PrivilegeProbe,
         ReviewedExecutableVerifier, RunnerEvidence, execute_root_lane, execute_runner_user_lane,
         parse_effective_uid, validate_root_command,
     };
@@ -879,6 +887,11 @@ mod tests {
             &context,
         )
         .expect("runner command");
+        let environment_program = command
+            .runner_environment_program()
+            .expect("reviewed environment program")
+            .to_str()
+            .expect("fixed reviewed path");
 
         let record =
             execute_runner_user_lane(&process, &executables, &privilege, &command, &runner)
@@ -894,7 +907,7 @@ mod tests {
                 "--user",
                 "project-runner",
                 "--",
-                ENV,
+                environment_program,
                 "--ignore-environment",
                 "HOME=/srv/project-runner",
                 "USER=project-runner",
@@ -1053,7 +1066,6 @@ mod tests {
 
     #[test]
     fn runner_command_constants_remain_absolute_reviewed_paths() {
-        assert_eq!(ENV, "/usr/bin/env");
         assert_eq!(PODMAN, "/usr/bin/podman");
         assert_eq!(GIT, "/usr/bin/git");
     }

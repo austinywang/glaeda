@@ -1,12 +1,12 @@
-use serde_json::Value;
-use smolrunner::artifact::{RepositoryRef, Sha256Digest};
-use smolrunner::execution_receipt::{
+use glaeda::artifact::{RepositoryRef, Sha256Digest};
+use glaeda::execution_receipt::{
     ExecutionReceipt, ExecutionReceiptAction, ExecutionReceiptActionOutcome,
     ExecutionReceiptContinuation, ExecutionReceiptDisposition, ExecutionReceiptOperation,
     ReceiptTimestamp, decode_execution_receipt, encode_execution_receipt,
 };
-use smolrunner::journal::{ExecutionLane, RollbackClass};
-use smolrunner::state::JournalId;
+use glaeda::journal::{ExecutionLane, RollbackClass};
+use glaeda::state::JournalId;
+use serde_json::Value;
 
 fn receipt() -> ExecutionReceipt {
     ExecutionReceipt::new_host_preparation(

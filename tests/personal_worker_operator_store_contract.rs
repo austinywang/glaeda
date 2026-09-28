@@ -7,23 +7,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::execution_admission::EpochMillis;
-use smolrunner::lima_observation::LimaInstanceName;
-use smolrunner::mac_availability::AvailabilityRequest;
-use smolrunner::operator_config::{
+use glaeda::execution_admission::EpochMillis;
+use glaeda::lima_observation::LimaInstanceName;
+use glaeda::mac_availability::AvailabilityRequest;
+use glaeda::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
-use smolrunner::operator_error::OperatorErrorCode;
-use smolrunner::personal_worker_operator_store::{
+use glaeda::operator_error::OperatorErrorCode;
+use glaeda::personal_worker_operator_store::{
     PersonalWorkerInitializationDisposition, PersonalWorkerInitializationInput,
     PersonalWorkerOperatorStore, PersonalWorkerOperatorStoreErrorKind,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActivityEvidence, PersonalWorkerProfileObservation,
 };
-use smolrunner::verification_profile::VerificationProfileId;
+use glaeda::verification_profile::VerificationProfileId;
+use rustix::fs::{FlockOperation, flock};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 

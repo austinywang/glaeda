@@ -6,16 +6,30 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
 
-pub const LOCAL_INSTALL_PLAN_SCHEMA_VERSION: u8 = 1;
+pub const LOCAL_INSTALL_PLAN_SCHEMA_VERSION: u8 = 2;
 pub const MAX_RETAINED_LOCAL_INSTALL_GENERATIONS: usize = 1;
 pub const MAX_LOCAL_INSTALL_TOOLCHAIN_BYTES: usize = 128;
 pub const MAX_LOCAL_INSTALL_VERSION_BYTES: usize = 128;
 pub const MAX_LAUNCHER_OBSERVATIONS: usize = 4;
 
-const SOURCE_DIGEST_DOMAIN: &[u8] = b"smolrunner-local-install-source-v1\0";
-const GENERATION_DIGEST_DOMAIN: &[u8] = b"smolrunner-local-install-generation-v1\0";
+const SMOLRUNNER_SOURCE_DIGEST_DOMAIN_V1: &[u8] = b"smolrunner-local-install-source-v1\0";
+const GLAEDA_SOURCE_DIGEST_DOMAIN_V2: &[u8] = b"glaeda-local-install-source-v2\0";
+const SMOLRUNNER_GENERATION_DIGEST_DOMAIN_V1: &[u8] = b"smolrunner-local-install-generation-v1\0";
+const GLAEDA_GENERATION_DIGEST_DOMAIN_V2: &[u8] = b"glaeda-local-install-generation-v2\0";
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Closed identity generation for local self-install source, build, and installed evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalInstallIdentityGeneration {
+    SmolrunnerV1,
+    GlaedaV2,
+}
+
+impl LocalInstallIdentityGeneration {
+    pub const CURRENT: Self = Self::GlaedaV2;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -52,6 +66,7 @@ impl LocalInstallToolchainIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalInstallSourceIdentity {
+    identity_generation: LocalInstallIdentityGeneration,
     commit: CommitId,
     tree: GitTreeId,
     cargo_lock_digest: Sha256Digest,
@@ -71,29 +86,81 @@ impl LocalInstallSourceIdentity {
         cargo_lock_digest: Sha256Digest,
         toolchain: LocalInstallToolchainIdentity,
     ) -> Result<Self, LocalInstallPlanError> {
+        Self::with_identity_generation(
+            LocalInstallIdentityGeneration::CURRENT,
+            commit,
+            tree,
+            cargo_lock_digest,
+            toolchain,
+        )
+    }
+
+    /// Reproduce one exact retained local-install source identity generation.
+    ///
+    /// Fresh planning uses [`Self::new`]. The legacy generation exists only for exact historical
+    /// recovery evidence and cannot be inferred from a repository name or existing digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when canonical identity encoding fails.
+    pub fn with_identity_generation(
+        identity_generation: LocalInstallIdentityGeneration,
+        commit: CommitId,
+        tree: GitTreeId,
+        cargo_lock_digest: Sha256Digest,
+        toolchain: LocalInstallToolchainIdentity,
+    ) -> Result<Self, LocalInstallPlanError> {
         #[derive(Serialize)]
-        struct Document<'a> {
+        struct LegacyDocument<'a> {
             commit: &'a CommitId,
             tree: &'a GitTreeId,
             cargo_lock_digest: &'a Sha256Digest,
             toolchain: &'a LocalInstallToolchainIdentity,
         }
-        let digest = canonical_digest(
-            SOURCE_DIGEST_DOMAIN,
-            &Document {
-                commit: &commit,
-                tree: &tree,
-                cargo_lock_digest: &cargo_lock_digest,
-                toolchain: &toolchain,
-            },
-        )?;
+        #[derive(Serialize)]
+        struct CurrentDocument<'a> {
+            schema_version: u8,
+            identity_generation: LocalInstallIdentityGeneration,
+            commit: &'a CommitId,
+            tree: &'a GitTreeId,
+            cargo_lock_digest: &'a Sha256Digest,
+            toolchain: &'a LocalInstallToolchainIdentity,
+        }
+        let digest = match identity_generation {
+            LocalInstallIdentityGeneration::SmolrunnerV1 => canonical_digest(
+                SMOLRUNNER_SOURCE_DIGEST_DOMAIN_V1,
+                &LegacyDocument {
+                    commit: &commit,
+                    tree: &tree,
+                    cargo_lock_digest: &cargo_lock_digest,
+                    toolchain: &toolchain,
+                },
+            )?,
+            LocalInstallIdentityGeneration::GlaedaV2 => canonical_digest(
+                GLAEDA_SOURCE_DIGEST_DOMAIN_V2,
+                &CurrentDocument {
+                    schema_version: LOCAL_INSTALL_PLAN_SCHEMA_VERSION,
+                    identity_generation,
+                    commit: &commit,
+                    tree: &tree,
+                    cargo_lock_digest: &cargo_lock_digest,
+                    toolchain: &toolchain,
+                },
+            )?,
+        };
         Ok(Self {
+            identity_generation,
             commit,
             tree,
             cargo_lock_digest,
             toolchain,
             digest,
         })
+    }
+
+    #[must_use]
+    pub const fn identity_generation(&self) -> LocalInstallIdentityGeneration {
+        self.identity_generation
     }
 
     #[must_use]
@@ -443,25 +510,63 @@ pub fn complete_local_install_build(
         ));
     }
     #[derive(Serialize)]
-    struct Document<'a> {
+    struct LegacySourceDocument<'a> {
+        commit: &'a CommitId,
+        tree: &'a GitTreeId,
+        cargo_lock_digest: &'a Sha256Digest,
+        toolchain: &'a LocalInstallToolchainIdentity,
+        digest: &'a Sha256Digest,
+    }
+    #[derive(Serialize)]
+    struct LegacyDocument<'a> {
         schema_version: u8,
+        number: u64,
+        predecessor: &'a Option<LocalInstallGenerationIdentity>,
+        source: LegacySourceDocument<'a>,
+        binary_digest: &'a Sha256Digest,
+        binary_version: &'a str,
+    }
+    #[derive(Serialize)]
+    struct CurrentDocument<'a> {
+        schema_version: u8,
+        identity_generation: LocalInstallIdentityGeneration,
         number: u64,
         predecessor: &'a Option<LocalInstallGenerationIdentity>,
         source: &'a LocalInstallSourceIdentity,
         binary_digest: &'a Sha256Digest,
         binary_version: &'a str,
     }
-    let digest = canonical_digest(
-        GENERATION_DIGEST_DOMAIN,
-        &Document {
-            schema_version: LOCAL_INSTALL_PLAN_SCHEMA_VERSION,
-            number: plan.target_generation,
-            predecessor: &plan.expected_predecessor,
-            source: &plan.source,
-            binary_digest: &evidence.binary_digest,
-            binary_version: &evidence.binary_version,
-        },
-    )?;
+    let digest = match plan.source.identity_generation {
+        LocalInstallIdentityGeneration::SmolrunnerV1 => canonical_digest(
+            SMOLRUNNER_GENERATION_DIGEST_DOMAIN_V1,
+            &LegacyDocument {
+                schema_version: 1,
+                number: plan.target_generation,
+                predecessor: &plan.expected_predecessor,
+                source: LegacySourceDocument {
+                    commit: &plan.source.commit,
+                    tree: &plan.source.tree,
+                    cargo_lock_digest: &plan.source.cargo_lock_digest,
+                    toolchain: &plan.source.toolchain,
+                    digest: &plan.source.digest,
+                },
+                binary_digest: &evidence.binary_digest,
+                binary_version: &evidence.binary_version,
+            },
+        )?,
+        LocalInstallIdentityGeneration::GlaedaV2 => canonical_digest(
+            GLAEDA_GENERATION_DIGEST_DOMAIN_V2,
+            &CurrentDocument {
+                schema_version: LOCAL_INSTALL_PLAN_SCHEMA_VERSION,
+                identity_generation: plan.source.identity_generation,
+                number: plan.target_generation,
+                predecessor: &plan.expected_predecessor,
+                source: &plan.source,
+                binary_digest: &evidence.binary_digest,
+                binary_version: &evidence.binary_version,
+            },
+        )?,
+    };
     Ok(InstalledLocalBinaryGeneration {
         identity: LocalInstallGenerationIdentity {
             number: plan.target_generation,
@@ -474,7 +579,7 @@ pub fn complete_local_install_build(
     })
 }
 
-/// Plan only the stable `smol` launcher for one already-accepted or candidate generation.
+/// Plan only the stable canonical `glaeda` launcher for one accepted or candidate generation.
 ///
 /// The first existing launcher entry in PATH controls command resolution. A stale owned launcher at
 /// an earlier elevation-requiring location therefore produces an elevation barrier immediately;
@@ -499,14 +604,14 @@ pub fn plan_launcher_for_generation(
                 return Err(error(
                     LocalInstallPlanErrorKind::ForeignLauncher,
                     "foreign_launcher",
-                    "an earlier approved PATH location contains a foreign smol launcher",
+                    "an earlier approved PATH location contains a foreign glaeda launcher",
                 ));
             }
             LauncherEntryDisposition::Unknown => {
                 return Err(error(
                     LocalInstallPlanErrorKind::UnknownLauncher,
                     "unknown_launcher",
-                    "an earlier approved PATH location contains an unclassified smol launcher",
+                    "an earlier approved PATH location contains an unclassified glaeda launcher",
                 ));
             }
             LauncherEntryDisposition::Owned { generation_digest } => {
@@ -753,6 +858,18 @@ mod tests {
         .expect("source")
     }
 
+    fn legacy_source(ch: char) -> LocalInstallSourceIdentity {
+        LocalInstallSourceIdentity::with_identity_generation(
+            LocalInstallIdentityGeneration::SmolrunnerV1,
+            commit(ch),
+            tree(ch),
+            digest(ch),
+            LocalInstallToolchainIdentity::parse("rust-1.97.1-aarch64-apple-darwin")
+                .expect("toolchain"),
+        )
+        .expect("legacy source")
+    }
+
     fn build_generation(
         plan: &LocalInstallBuildPlan,
         binary: char,
@@ -763,7 +880,7 @@ mod tests {
                 plan.source.digest.clone(),
                 plan.expected_predecessor.clone(),
                 digest(binary),
-                "smolrunner 0.1.0",
+                "glaeda 0.1.0",
             )
             .expect("build evidence"),
         )
@@ -785,6 +902,10 @@ mod tests {
         let first_source = source('a');
         let second_source = source('a');
         assert_eq!(first_source, second_source);
+        assert_eq!(
+            first_source.digest().as_str(),
+            "sha256:d3cdbc0c7f38a5899698897e7d703e2dcceb69f9e2a5cef50cb76309e1504093"
+        );
 
         let state = LocalInstallState::new(None, Vec::new()).expect("state");
         let LocalInstallDecision::BuildRequired { plan } =
@@ -797,6 +918,55 @@ mod tests {
         let second = build_generation(&plan, 'b');
         assert_eq!(first, second);
         assert_eq!(first.identity.number, 1);
+        assert_eq!(
+            first.identity.digest.as_str(),
+            "sha256:7a26d60f3a04ea9d12c3ac9b3a8faefdeebc692ed3929030b3cdf31d83d228f3"
+        );
+        assert_eq!(
+            first.source.identity_generation(),
+            LocalInstallIdentityGeneration::GlaedaV2
+        );
+    }
+
+    #[test]
+    fn legacy_source_and_installed_generation_vectors_remain_exact() {
+        let source = legacy_source('a');
+        assert_eq!(
+            source.digest().as_str(),
+            "sha256:7ae71e7bd75c0b5f8da6a951774c25887b7c740f34435cd3acc1297da547a9b7"
+        );
+        let plan = LocalInstallBuildPlan {
+            target_generation: 1,
+            expected_predecessor: None,
+            source: source.clone(),
+        };
+        let installed = complete_local_install_build(
+            &plan,
+            BuiltLocalBinaryEvidence::new(
+                source.digest().clone(),
+                None,
+                digest('b'),
+                "smolrunner 0.1.0",
+            )
+            .expect("legacy evidence"),
+        )
+        .expect("legacy generation");
+
+        assert_eq!(
+            installed.identity.digest.as_str(),
+            "sha256:e508ca7a23235e7ef522ef4c213d54d16c8d6db9b931a902ea7ab237b1d7c331"
+        );
+        assert_ne!(
+            source,
+            LocalInstallSourceIdentity::new(
+                commit('a'),
+                tree('a'),
+                digest('a'),
+                LocalInstallToolchainIdentity::parse("rust-1.97.1-aarch64-apple-darwin")
+                    .expect("toolchain"),
+            )
+            .expect("current source")
+        );
     }
 
     #[test]
@@ -824,7 +994,7 @@ mod tests {
             digest('f'),
             plan.expected_predecessor.clone(),
             digest('d'),
-            "smolrunner 0.1.0",
+            "glaeda 0.1.0",
         )
         .expect("bad evidence");
         assert_eq!(
@@ -1111,7 +1281,7 @@ mod tests {
             predecessor: None,
             source: source('c'),
             binary_digest: digest('d'),
-            binary_version: "smolrunner 0.1.0".to_owned(),
+            binary_version: "glaeda 0.1.0".to_owned(),
         };
         let state = LocalInstallState::new(Some(accepted), Vec::new()).expect("state");
         assert_eq!(
@@ -1129,7 +1299,7 @@ mod tests {
             predecessor: None,
             source: wanted.clone(),
             binary_digest: digest('f'),
-            binary_version: "smolrunner 0.1.0".to_owned(),
+            binary_version: "glaeda 0.1.0".to_owned(),
         };
         assert_eq!(
             LocalInstallState::new(None, vec![retained.clone(), retained])

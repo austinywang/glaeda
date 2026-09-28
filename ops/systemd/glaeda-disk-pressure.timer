@@ -1,0 +1,10 @@
+[Unit]
+Description=Check disk pressure every 15 minutes (glaeda-disk)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

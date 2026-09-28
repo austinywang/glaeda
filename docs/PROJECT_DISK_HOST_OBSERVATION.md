@@ -19,7 +19,7 @@ On macOS, `/var/...` is accepted only through the specifically proven root-owned
 
 The caller supplies bounded pre-captured JSON-lines output from the installed Lima 2.2.0 read-only disk inventory operation. The parser accepts only the field set physically established by #634, selects one exact disk locator, and checks the reported directory, raw format/size, and detached or attached instance fields.
 
-Inventory, disk names, instance names, attachment symlinks, and paths are correlation/locator evidence only. They never establish SmolRunner ownership.
+Inventory, disk names, instance names, attachment symlinks, and paths are correlation/locator evidence only. They never establish Glaeda ownership.
 
 ## Public authority boundary
 
@@ -80,4 +80,4 @@ inside one short-lived boundary before P1 publishes `Attached`. P2 itself never 
 
 ## Excluded authority
 
-P2 adds no create, format, attach, detach, start, stop, unlock, resize, delete, repair, cleanup, guest mount, OverlayFS, P1 transition, or `TrustedProjectFilesystemCorrelationProof` constructor. The #634 fixture remains unbound research evidence and can never become a SmolRunner project-disk generation by observation alone.
+P2 adds no create, format, attach, detach, start, stop, unlock, resize, delete, repair, cleanup, guest mount, OverlayFS, P1 transition, or `TrustedProjectFilesystemCorrelationProof` constructor. The #634 fixture remains unbound research evidence and can never become a Glaeda project-disk generation by observation alone.

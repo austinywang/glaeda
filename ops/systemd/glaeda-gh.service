@@ -1,0 +1,19 @@
+[Unit]
+Description=Shared GitHub CI watcher: the one process that polls GitHub for this user (glaeda-gh)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Nice=5
+# gh supplies the token (gh auth token); it lives in /usr/bin or ~/.local/bin on Linux
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 %h/.local/bin/glaeda-gh serve
+# the daemon re-executes itself when glaeda-gh changes; this covers crashes
+Restart=always
+RestartSec=30
+StandardOutput=append:%h/.local/state/glaeda-gh.jsonl
+StandardError=append:%h/.local/state/glaeda-gh.err
+
+[Install]
+WantedBy=default.target

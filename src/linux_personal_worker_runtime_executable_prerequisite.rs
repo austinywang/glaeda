@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn disposable_noble_executables_are_descriptor_bound_prerequisites() {
-        if std::env::var("SMOLRUNNER_ELF_PACKAGE_PROBE").as_deref() != Ok("github-hosted-ubuntu") {
+        if std::env::var("GLAEDA_DISPOSABLE_PROBE").as_deref() != Ok("1") {
             return;
         }
         let architecture = host_architecture().expect("supported hosted architecture");
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn source_package_modes_are_the_expected_noble_modes() {
-        if std::env::var("SMOLRUNNER_ELF_PACKAGE_PROBE").as_deref() != Ok("github-hosted-ubuntu") {
+        if std::env::var("GLAEDA_DISPOSABLE_PROBE").as_deref() != Ok("1") {
             return;
         }
         for kind in ExecutableKind::ALL {

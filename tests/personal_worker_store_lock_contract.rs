@@ -5,17 +5,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::execution_admission::EpochMillis;
-use smolrunner::personal_worker_queue::{
+use glaeda::execution_admission::EpochMillis;
+use glaeda::personal_worker_queue::{
     PersonalWorkerActivityEvidence, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
     encode_personal_worker_store_document,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use rustix::fs::{FlockOperation, flock};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 

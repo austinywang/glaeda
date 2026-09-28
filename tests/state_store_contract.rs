@@ -1,5 +1,5 @@
-use smolrunner::state::{InstallationId, StateLayout, StatePath};
-use smolrunner::state_store::{
+use glaeda::state::{InstallationId, StateLayout, StatePath};
+use glaeda::state_store::{
     StateRead, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
     StateWriteDisposition, StateWriteReceipt,
 };

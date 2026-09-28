@@ -1,0 +1,85 @@
+name: Promote
+
+# Moves stable to the newest release that has soaked, that canary hosts reported healthy on
+# (commit statuses glaeda-ota/<host>) and that descends from stable. stable.json has this one
+# writer. Canary hosts also dispatch this after each run, since GitHub's cron can lag for hours.
+# docs/GLAEDA_OTA.md
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  statuses: read
+
+concurrency:
+  group: ota-stable
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+          fetch-depth: 0  # stable only moves forward: the ancestry check needs history
+      - name: Promote the newest healthy soaked release
+        env:
+          SOAK_HOURS: "6"
+        run: |
+          mkdir -p channels
+          stable=()
+          stable_tag=""
+          stable_source=""
+          if gh release download ota-channels --pattern stable.json --dir channels 2>channels/err; then
+            stable=(--stable channels/stable.json)
+            stable_tag=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["tag"])')
+            stable_source=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["source"])')
+          elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
+            cat channels/err; exit 1
+          fi
+          # releases newest first, down to stable; soaking ones count too, since their canary failures
+          # block promoting anything older
+          gh release list --limit 40 --json tagName,createdAt \
+            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.createdAt)"' \
+            > channels/releases.txt
+          : > channels/candidates.jsonl
+          considered=0
+          while read -r tag created; do
+            gh release download "$tag" --pattern release.json --output channels/release.json --clobber
+            source=$(python3 -c 'import json;print(json.load(open("channels/release.json"))["source"])')
+            # newest first; one page holds every canary host's latest status
+            gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
+            descends=true
+            if [ -n "$stable_source" ]; then
+              set +e
+              git merge-base --is-ancestor "$stable_source" "$source"
+              code=$?
+              set -e
+              case "$code" in 0) ;; 1) descends=false ;; *) echo "stable $stable_source is not in main's history" >&2; exit 1 ;; esac
+            fi
+            python3 scripts/glaeda_release.py candidate --release channels/release.json --published "$created" \
+              --statuses channels/statuses.json --descends "$descends" >> channels/candidates.jsonl
+            considered=$((considered + 1))
+            if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 20 ]; then break; fi
+          done < channels/releases.txt
+          set +e
+          python3 scripts/glaeda_release.py promote --candidates channels/candidates.jsonl "${stable[@]}" \
+            --soak-hours "$SOAK_HOURS" > channels/next.json 2> channels/why.txt
+          code=$?
+          set -e
+          cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" = 3 ]; then exit 0; fi
+          [ "$code" = 0 ] || exit "$code"
+          mv channels/next.json channels/stable.json
+          gh release upload ota-channels channels/stable.json --clobber
+          cat channels/stable.json >> "$GITHUB_STEP_SUMMARY"

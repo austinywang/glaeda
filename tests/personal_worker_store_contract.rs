@@ -5,29 +5,29 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput, ExecutionAdmissionRecord,
     ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
     PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
     PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     MAX_PERSONAL_WORKER_HISTORY_ENTRIES, PersonalWorkerDurableCacheLease, PersonalWorkerStore,
     PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
     PersonalWorkerStoreRecoveryDisposition, PersonalWorkerStoreRevision,
     PersonalWorkerStoreWriteDisposition, decode_personal_worker_store_document,
     encode_personal_worker_store_document,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use rustix::fs::{FlockOperation, flock};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);

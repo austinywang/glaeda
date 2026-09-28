@@ -4,23 +4,44 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
-
 use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
 use crate::process::{CommandSpec, ExecutionRecord, TimedCommandExecutor};
 use crate::project_catalog::{GitHubProjectSource, ProjectIdentity};
+use crate::project_workspace_identity::{
+    ProjectWorkspaceFilesystemIdentityKind, ProjectWorkspaceIdentityGeneration,
+    project_workspace_filesystem_identity,
+};
+use serde::Serialize;
 
-pub const PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION: u8 = 1;
+pub const PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION: u8 = 2;
 pub const PROJECT_CHECKOUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the reads whose cost scales with the working tree: `status` and `ls-files`.
+///
+/// `status` stats every tracked file and walks every non-ignored directory. On a Mac with a load
+/// average above 100, an 18,000-file checkout's status spent under a second of CPU but 10 to 54
+/// seconds of wall time, so the general deadline refused most of a 144-worktree repository as
+/// unobservable. A hung Git still fails closed, just later.
+pub const PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT: Duration = Duration::from_secs(180);
+const _: () = assert!(
+    PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT.as_secs() > PROJECT_CHECKOUT_COMMAND_TIMEOUT.as_secs()
+);
 pub const MAX_PROJECT_CHECKOUT_OUTPUT_BYTES: usize = 65_536;
+/// Bound for the one read that scales with index size: one mode line per tracked file.
+///
+/// At seven bytes per entry the general bound stops at roughly 9,000 tracked files, which refuses
+/// ordinary large repositories outright. This matches the process executor's capture ceiling, the
+/// real limit, so roughly 150,000 tracked files still observe and larger indexes fail closed. Each
+/// line is still validated strictly, so the larger bound buys coverage without loosening what is
+/// accepted.
+pub const MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES: usize = crate::process::MAX_CAPTURED_STREAM_BYTES;
+const _: () = assert!(MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES);
+/// Bound for `status`, which prints one record per changed or untracked path. A checkout with a
+/// few hundred untracked files is an ordinary refusal, not an unobservable one, so this matches
+/// the capture ceiling too.
+pub const MAX_PROJECT_STATUS_OUTPUT_BYTES: usize = crate::process::MAX_CAPTURED_STREAM_BYTES;
 pub const MAX_PROJECT_REMOTES: usize = 16;
 pub const MAX_REMOTE_NAME_BYTES: usize = 100;
 pub const MAX_BRANCH_NAME_BYTES: usize = 512;
-
-const MATERIALIZATION_ID_DOMAIN: &[u8] = b"smolrunner-project-materialization-v1\0";
-const SHA256_PREFIX: &str = "sha256:";
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProjectCheckoutLocationIdentity {
@@ -45,20 +66,18 @@ impl ProjectCheckoutLocationIdentity {
             && metadata.uid() == self.owner
     }
 
-    fn materialization_id(&self) -> Result<Sha256Digest, ProjectCheckoutObservationError> {
-        let mut hasher = Sha256::new();
-        hasher.update(MATERIALIZATION_ID_DOMAIN);
-        hasher.update(self.device.to_be_bytes());
-        hasher.update(self.inode.to_be_bytes());
-        hasher.update(self.owner.to_be_bytes());
-        let digest = hasher.finalize();
-        let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
-        value.push_str(SHA256_PREFIX);
-        for byte in digest {
-            value.push(char::from(HEX[usize::from(byte >> 4)]));
-            value.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        Sha256Digest::parse(&value).map_err(|_| invalid_output())
+    fn materialization_id(
+        &self,
+        generation: ProjectWorkspaceIdentityGeneration,
+    ) -> Result<Sha256Digest, ProjectCheckoutObservationError> {
+        project_workspace_filesystem_identity(
+            generation,
+            ProjectWorkspaceFilesystemIdentityKind::Materialization,
+            self.device,
+            self.inode,
+            self.owner,
+        )
+        .map_err(|_| invalid_output())
     }
 }
 
@@ -91,6 +110,7 @@ pub enum RemoteFreshness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectCheckoutObservation {
     schema_version: u8,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     materialization_id: Sha256Digest,
     #[serde(skip_serializing_if = "Option::is_none")]
     primary_project: Option<ProjectIdentity>,
@@ -113,6 +133,11 @@ pub struct ProjectCheckoutObservation {
 }
 
 impl ProjectCheckoutObservation {
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
+    }
+
     #[must_use]
     pub const fn materialization_id(&self) -> &Sha256Digest {
         &self.materialization_id
@@ -218,6 +243,8 @@ impl std::error::Error for ProjectCheckoutObservationError {}
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProjectCheckoutObserver {
     git_program: PathBuf,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
+    command_timeout: Duration,
 }
 
 impl fmt::Debug for ProjectCheckoutObserver {
@@ -225,6 +252,8 @@ impl fmt::Debug for ProjectCheckoutObserver {
         formatter
             .debug_struct("ProjectCheckoutObserver")
             .field("git_program", &"<reviewed-absolute-git-program>")
+            .field("identity_generation", &self.identity_generation)
+            .field("command_timeout", &self.command_timeout)
             .finish()
     }
 }
@@ -236,11 +265,50 @@ impl ProjectCheckoutObserver {
     ///
     /// Returns a bounded error for a relative or aliased executable path.
     pub fn new(git_program: impl Into<PathBuf>) -> Result<Self, ProjectCheckoutObservationError> {
+        Self::with_identity_generation(git_program, ProjectWorkspaceIdentityGeneration::CURRENT)
+    }
+
+    /// Create one observer for an explicit retained identity generation.
+    ///
+    /// Fresh observations use [`Self::new`]. The legacy generation exists only to interpret or
+    /// reproduce exact historical evidence and grants no adoption or mutation authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for a relative or aliased executable path.
+    pub fn with_identity_generation(
+        git_program: impl Into<PathBuf>,
+        identity_generation: ProjectWorkspaceIdentityGeneration,
+    ) -> Result<Self, ProjectCheckoutObservationError> {
         let git_program = git_program.into();
         if !is_normalized_absolute_path(&git_program) {
             return Err(unsafe_path());
         }
-        Ok(Self { git_program })
+        Ok(Self {
+            git_program,
+            identity_generation,
+            command_timeout: PROJECT_CHECKOUT_COMMAND_TIMEOUT,
+        })
+    }
+
+    /// Give every constant-cost read `timeout` instead of [`PROJECT_CHECKOUT_COMMAND_TIMEOUT`].
+    ///
+    /// For background sweeps, where a slow answer is still useful and a refusal is not: on a host
+    /// with a load average above 100 even `rev-list` against a 9,000-ref repository ran past ten
+    /// seconds. Tree-scaled reads keep at least [`PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT`].
+    #[must_use]
+    pub const fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
+    }
+
+    fn tree_scan_timeout(&self) -> Duration {
+        self.command_timeout.max(PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT)
+    }
+
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
     }
 
     /// Observe one exact checkout without network access or repository mutation.
@@ -274,7 +342,7 @@ impl ProjectCheckoutObserver {
         let parent_metadata = std::fs::metadata(parent).map_err(|_| unavailable())?;
         let owner_matches_parent = metadata.uid() == parent_metadata.uid();
         let location_identity = ProjectCheckoutLocationIdentity::from_metadata(&metadata);
-        let materialization_id = location_identity.materialization_id()?;
+        let materialization_id = location_identity.materialization_id(self.identity_generation)?;
 
         let bare = self.git(&checkout, &["rev-parse", "--is-bare-repository"], executor)?;
         if !bare.success {
@@ -299,12 +367,13 @@ impl ProjectCheckoutObserver {
         let first = self.snapshot(&checkout, executor)?;
         let second = self.snapshot(&checkout, executor)?;
         let final_metadata = std::fs::metadata(&checkout).map_err(|_| source_changed())?;
-        if first != second || !location_identity.matches(&final_metadata) {
+        if !first.same_checkout(&second) || !location_identity.matches(&final_metadata) {
             return Err(source_changed());
         }
 
         Ok(ProjectCheckoutObservation {
             schema_version: PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION,
+            identity_generation: self.identity_generation,
             materialization_id,
             primary_project: second.primary_project,
             remotes: second.remotes,
@@ -346,7 +415,13 @@ impl ProjectCheckoutObserver {
         let (primary_project, source_ambiguous) = select_primary_project(&remotes);
         let raw_status = self.read_status(checkout, executor)?;
         let status = parse_status(&raw_status)?;
-        let modes = self.git(checkout, &["ls-files", "--format=%(objectmode)"], executor)?;
+        let modes = self.git_with_limits(
+            checkout,
+            &["ls-files", "--format=%(objectmode)"],
+            MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES,
+            self.tree_scan_timeout(),
+            executor,
+        )?;
         require_success(&modes)?;
         let submodules_present = parse_submodule_presence(&modes.stdout)?;
         let worktrees = self.git(
@@ -421,7 +496,7 @@ impl ProjectCheckoutObserver {
             return Err(unavailable());
         }
 
-        let record = self.git(
+        let record = self.git_with_limits(
             checkout,
             &[
                 "status",
@@ -431,16 +506,57 @@ impl ProjectCheckoutObserver {
                 "--untracked-files=all",
                 "--ignore-submodules=all",
             ],
+            MAX_PROJECT_STATUS_OUTPUT_BYTES,
+            self.tree_scan_timeout(),
             executor,
         )?;
         require_success(&record)?;
         Ok(record.stdout)
     }
 
-    fn git(
+    /// Run one hardened, credentialless, lock-free Git command beneath `checkout`.
+    ///
+    /// Shared with sibling read-only observers so every Git read uses the same environment and
+    /// output bounds.
+    pub(crate) fn git(
         &self,
         checkout: &Path,
         arguments: &[&str],
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<ExecutionRecord, ProjectCheckoutObservationError> {
+        self.git_bounded(
+            checkout,
+            arguments,
+            MAX_PROJECT_CHECKOUT_OUTPUT_BYTES,
+            executor,
+        )
+    }
+
+    /// Like [`Self::git`] with an explicit stdout bound for reads that scale with repository size.
+    pub(crate) fn git_bounded(
+        &self,
+        checkout: &Path,
+        arguments: &[&str],
+        max_stdout_bytes: usize,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<ExecutionRecord, ProjectCheckoutObservationError> {
+        self.git_with_limits(
+            checkout,
+            arguments,
+            max_stdout_bytes,
+            self.command_timeout,
+            executor,
+        )
+    }
+
+    /// Like [`Self::git_bounded`] with an explicit deadline, for reviewed commands whose runtime
+    /// scales with the size of the tree they act on.
+    pub(crate) fn git_with_limits(
+        &self,
+        checkout: &Path,
+        arguments: &[&str],
+        max_stdout_bytes: usize,
+        timeout: Duration,
         executor: &impl TimedCommandExecutor,
     ) -> Result<ExecutionRecord, ProjectCheckoutObservationError> {
         let checkout = checkout.to_str().ok_or_else(unsafe_path)?;
@@ -472,11 +588,17 @@ impl ProjectCheckoutObserver {
         let expected_argv = spec.displayed_argv();
         let expected_environment_keys = spec.environment.keys().cloned().collect::<Vec<_>>();
         let record = executor
-            .execute_with_timeout(&spec, PROJECT_CHECKOUT_COMMAND_TIMEOUT)
-            .map_err(|_| unavailable())?;
+            .execute_with_timeout(&spec, timeout)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    timed_out()
+                } else {
+                    unavailable()
+                }
+            })?;
         if record.argv != expected_argv
             || record.environment_keys != expected_environment_keys
-            || record.stdout.len() > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES
+            || record.stdout.len() > max_stdout_bytes
             || record.stderr.len() > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES
             || record.stdout.contains('\u{fffd}')
             || record.stderr.contains('\u{fffd}')
@@ -499,6 +621,34 @@ struct ProjectCheckoutSnapshot {
     raw_status: String,
     linked_worktree_count: u16,
     submodules_present: bool,
+}
+
+impl ProjectCheckoutSnapshot {
+    /// Whether two snapshots saw the same checkout.
+    ///
+    /// Repository-wide facts are left out: another session adding or removing a worktree changes
+    /// the worktree count, and any fetch moves the upstream and with it the ahead/behind line.
+    /// Neither changes this checkout, and during a long sweep both happen between snapshots.
+    fn same_checkout(&self, other: &Self) -> bool {
+        self.commit == other.commit
+            && self.tree == other.tree
+            && self.remotes == other.remotes
+            && self.primary_project == other.primary_project
+            && self.source_ambiguous == other.source_ambiguous
+            && self.submodules_present == other.submodules_present
+            && self.status.branch == other.status.branch
+            && self.status.tracked_changes_present == other.status.tracked_changes_present
+            && self.status.untracked_entry_count == other.status.untracked_entry_count
+            && self.status.upstream_configured == other.status.upstream_configured
+            && local_status_records(&self.raw_status).eq(local_status_records(&other.raw_status))
+    }
+}
+
+/// Status records without the ahead/behind line, which only an upstream move changes.
+fn local_status_records(raw_status: &str) -> impl Iterator<Item = &str> {
+    raw_status
+        .split('\0')
+        .filter(|record| !record.starts_with("# branch.ab "))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -620,7 +770,7 @@ fn parse_status(value: &str) -> Result<ParsedStatus, ProjectCheckoutObservationE
         }
     }
     let branch = branch.ok_or_else(invalid_output)?;
-    if upstream_configured != local_commits_ahead.is_some() {
+    if !upstream_configured && local_commits_ahead.is_some() {
         return Err(invalid_output());
     }
     Ok(ParsedStatus {
@@ -762,6 +912,29 @@ fn unavailable() -> ProjectCheckoutObservationError {
     )
 }
 
+/// Kept under the `Unavailable` kind, since callers treat both alike; the code tells them apart.
+fn timed_out() -> ProjectCheckoutObservationError {
+    error(
+        ProjectCheckoutObservationErrorKind::Unavailable,
+        "observation_timed_out",
+        "a Git read did not finish before its deadline",
+    )
+}
+
+/// The deadline [`ProjectCheckoutObserver`] gives the Git command `spec`, for scripted executors.
+#[cfg(test)]
+pub(crate) fn expected_git_timeout(spec: &CommandSpec) -> Duration {
+    let argv = spec.displayed_argv();
+    if argv
+        .iter()
+        .any(|argument| argument == "status" || argument == "ls-files")
+    {
+        PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT
+    } else {
+        PROJECT_CHECKOUT_COMMAND_TIMEOUT
+    }
+}
+
 fn invalid_output() -> ProjectCheckoutObservationError {
     error(
         ProjectCheckoutObservationErrorKind::InvalidOutput,
@@ -780,10 +953,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+    use crate::project_workspace_identity::ProjectWorkspaceIdentityGeneration;
 
     use super::{
-        PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectBranchState, ProjectCheckoutObservationErrorKind,
-        ProjectCheckoutObserver,
+        ProjectBranchState, ProjectCheckoutObservationErrorKind, ProjectCheckoutObserver,
+        expected_git_timeout,
     };
 
     const COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -865,7 +1039,7 @@ mod tests {
             spec: &CommandSpec,
             timeout: std::time::Duration,
         ) -> io::Result<ExecutionRecord> {
-            assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
+            assert_eq!(timeout, expected_git_timeout(spec));
             self.commands.borrow_mut().push(spec.clone());
             let response = self
                 .responses
@@ -921,6 +1095,34 @@ mod tests {
         responses
     }
 
+    struct TimingOutExecutor;
+
+    impl CommandExecutor for TimingOutExecutor {
+        fn execute(&self, _spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+            panic!("checkout observation must use the timed executor")
+        }
+    }
+
+    impl TimedCommandExecutor for TimingOutExecutor {
+        fn execute_with_timeout(
+            &self,
+            _spec: &CommandSpec,
+            _timeout: std::time::Duration,
+        ) -> io::Result<ExecutionRecord> {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+
+    #[test]
+    fn deadline_is_reported_apart_from_other_failures() {
+        let checkout = TempDirectory::new("deadline");
+        let error = observer()
+            .git(checkout.path(), &["status"], &TimingOutExecutor)
+            .expect_err("timed out");
+        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::Unavailable);
+        assert_eq!(error.code, "observation_timed_out");
+    }
+
     #[test]
     fn clean_checkout_reports_project_without_private_path() {
         let checkout = TempDirectory::new("clean");
@@ -953,13 +1155,50 @@ mod tests {
         assert!(!observation.tracked_changes_present());
         assert_eq!(observation.local_commits_ahead(), Some(0));
         assert_eq!(observation.linked_worktree_count(), 1);
+        assert_eq!(
+            observation.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::GlaedaV2
+        );
         let json = serde_json::to_string(&observation).expect("public JSON");
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"identity_generation\":\"glaeda_v2\""));
         assert!(!json.contains(checkout.path().to_string_lossy().as_ref()));
         assert!(
             !format!("{:?}", observation.location_identity())
                 .contains(checkout.path().to_string_lossy().as_ref())
         );
         assert_eq!(executor.commands.borrow().len(), 16);
+    }
+
+    #[test]
+    fn explicit_legacy_generation_reproduces_a_distinct_materialization_identity() {
+        let checkout = TempDirectory::new("generation");
+        let status = format!("# branch.oid {COMMIT}\0# branch.head main\0");
+        let worktrees = format!("worktree {}\0HEAD {COMMIT}\0\0", checkout.path().display());
+        let responses = script(checkout.path(), "", &status, "100644\n", &worktrees);
+        let current = observer()
+            .observe(checkout.path(), &ScriptedExecutor::new(responses.clone()))
+            .expect("current observation");
+        let legacy_observer = ProjectCheckoutObserver::with_identity_generation(
+            "/usr/bin/git",
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+        )
+        .expect("legacy observer");
+        let legacy = legacy_observer
+            .observe(checkout.path(), &ScriptedExecutor::new(responses))
+            .expect("legacy observation");
+
+        assert_eq!(
+            current.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::GlaedaV2
+        );
+        assert_eq!(
+            legacy.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+        );
+        assert_ne!(current.materialization_id(), legacy.materialization_id());
+        let json = serde_json::to_string(&legacy).expect("legacy JSON");
+        assert!(json.contains("\"identity_generation\":\"smolrunner_v1\""));
     }
 
     #[test]
@@ -1004,6 +1243,32 @@ mod tests {
         assert!(!json.contains("file.txt"));
         assert!(!json.contains("secret.txt"));
         assert!(!json.contains("/private/path"));
+    }
+
+    #[test]
+    fn configured_upstream_without_tracking_ref_has_unknown_ahead_count() {
+        let checkout = TempDirectory::new("missing-upstream-ref");
+        let status = format!(
+            "# branch.oid {COMMIT}\0# branch.head retained/topic\0# branch.upstream origin/removed-topic\0"
+        );
+        let executor = ScriptedExecutor::new(script(
+            checkout.path(),
+            "remote.origin.url\nhttps://github.com/example/project.git\0",
+            &status,
+            "100644\n",
+            "worktree /private/path\0HEAD 1111111111111111111111111111111111111111\0\0",
+        ));
+
+        let observation = observer()
+            .observe(checkout.path(), &executor)
+            .expect("configured upstream without a tracking ref remains observable");
+
+        assert!(observation.upstream_configured());
+        assert_eq!(observation.local_commits_ahead(), None);
+        assert!(matches!(
+            observation.branch(),
+            ProjectBranchState::Attached { name } if name == "retained/topic"
+        ));
     }
 
     #[test]
@@ -1098,6 +1363,41 @@ mod tests {
             .expect_err("ancestor symlink refused");
         assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::UnsafePath);
         assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn repository_wide_drift_between_snapshots_is_not_a_checkout_change() {
+        let checkout = TempDirectory::new("repository-drift");
+        let remotes = "remote.origin.url\nhttps://github.com/example/project.git\0";
+        let status = |behind: u32| {
+            format!(
+                "# branch.oid {COMMIT}\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +0 -{behind}\0"
+            )
+        };
+        let one = "worktree /private/main\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0";
+        let two = format!("{one}worktree /private/other\0HEAD {COMMIT}\0detached\0\0");
+        let mut responses = vec![
+            Response::success("false\n"),
+            Response::success(format!("{}\n", checkout.path().display())),
+        ];
+        // Between the snapshots another session adds a worktree and a fetch moves the upstream.
+        responses.extend(snapshot_responses(remotes, &status(0), "100644\n", one));
+        responses.extend(snapshot_responses(remotes, &status(3), "100644\n", &two));
+        let executor = ScriptedExecutor::new(responses);
+        let observation = observer()
+            .observe(checkout.path(), &executor)
+            .expect("stable checkout");
+        assert_eq!(observation.linked_worktree_count(), 2);
+    }
+
+    #[test]
+    fn sweep_deadline_raises_constant_cost_reads_only_up_to_tree_scans() {
+        let observer = observer().with_command_timeout(std::time::Duration::from_secs(60));
+        assert_eq!(observer.command_timeout, std::time::Duration::from_secs(60));
+        assert_eq!(
+            observer.tree_scan_timeout(),
+            super::PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT
+        );
     }
 
     #[test]

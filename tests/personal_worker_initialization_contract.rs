@@ -7,19 +7,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::execution_admission::EpochMillis;
-use smolrunner::personal_worker_queue::{
+use glaeda::execution_admission::EpochMillis;
+use glaeda::personal_worker_queue::{
     PersonalWorkerActivityEvidence, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
     PersonalWorkerStoreInitializationDisposition, PersonalWorkerStoreMigrationDisposition,
     decode_personal_worker_store_document, encode_personal_worker_store_document,
     migrate_personal_worker_store_v1_document,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use rustix::fs::{FlockOperation, flock};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -169,7 +169,7 @@ fn v1_mapping_preserves_revision_generation_history_and_exact_observed_values() 
     assert_eq!(migrated.queue().observed_at, time(1_900_000));
     assert_eq!(
         migrated.queue().profile_observation.profile(),
-        Some(smolrunner::personal_worker_queue::PersonalWorkerProfile::Work)
+        Some(glaeda::personal_worker_queue::PersonalWorkerProfile::Work)
     );
     assert_eq!(
         migrated.queue().activity_evidence.last_activity_at(),
@@ -216,7 +216,7 @@ fn explicit_v1_migration_preserves_evidence_and_replays_without_writes() {
         decode_personal_worker_store_document(&migrated_bytes).expect("decode migrated current");
     assert_eq!(
         migrated.queue().profile_observation.profile(),
-        Some(smolrunner::personal_worker_queue::PersonalWorkerProfile::Interactive)
+        Some(glaeda::personal_worker_queue::PersonalWorkerProfile::Interactive)
     );
     assert_eq!(
         migrated.queue().activity_evidence.last_activity_at(),

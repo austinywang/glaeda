@@ -11,10 +11,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use glaeda::process::{CommandSpec, ExecutionRecord, ProcessExecutor, TimedCommandExecutor};
 use rustix::fs::{self as rustix_fs, Mode, OFlags};
 use rustix::process::{Gid, Pid, getegid, geteuid, test_kill_process};
 use sha2::{Digest as _, Sha256};
-use smolrunner::process::{CommandSpec, ExecutionRecord, ProcessExecutor, TimedCommandExecutor};
 
 const OPT_IN_ENV: &str = "SMOLRUNNER_PHYSICAL_LAUNCHD_EXECUTION_ACCEPTANCE";
 const OPT_IN_TOKEN: &str = "transient-register-before-start-v1";

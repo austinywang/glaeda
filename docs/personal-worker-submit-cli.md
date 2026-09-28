@@ -1,9 +1,9 @@
 # Exact personal-worker queue submission CLI
 
-`smolrunner queue submit` publishes one exact queued request through the durable personal-worker transaction layer.
+`glaeda queue submit` publishes one exact queued request through the durable personal-worker transaction layer.
 
 ```text
-smolrunner queue submit \
+glaeda queue submit \
   --store-root /absolute/state/root \
   --revision REVISION \
   --generation GENERATION \

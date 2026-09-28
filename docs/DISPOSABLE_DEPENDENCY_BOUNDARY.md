@@ -2,21 +2,21 @@
 
 Status: decision candidate for [#368](https://github.com/teamleaderleo/smolrunner/issues/368), source-reviewed 2026-08-11.
 
-SmolRunner should stay small by owning the lifecycle facts that make an operator-owned Mac safe to use as hostile CI capacity and delegating mature protocol, VM, OS, networking, caching, and supervision primitives to projects that already do those jobs well.
+Glaeda should stay small by owning the lifecycle facts that make an operator-owned Mac safe to use as hostile CI capacity and delegating mature protocol, VM, OS, networking, caching, and supervision primitives to projects that already do those jobs well.
 
 This note records the M2–M4 dependency boundary after comparing nearby runner managers and Apple-silicon VM backends. It also records why the current direct `actions/scaleset` + Lima/VZ path remains the default.
 
 ## Decision
 
-1. **SmolRunner remains the durable lifecycle authority.** It owns host-wide admission, attempt identity, job/runner/worker binding, crash recovery, cleanup authority, capacity release, trust policy, and bounded status/recovery debt.
-2. **Keep GitHub's pinned official `actions/scaleset` client behind `tools/scaleset-bridge`.** GitHub owns scale-set sessions, long polling, acknowledgement/acquisition semantics, JIT generation, and runner service APIs. SmolRunner persists and reconciles a polled message before explicitly acknowledging it.
-3. **Keep Lima/VZ as the first disposable VM backend.** Backend-specific commands and filesystem details stay private to the adapter. The durable core reasons in SmolRunner attempt/worker identities.
+1. **Glaeda remains the durable lifecycle authority.** It owns host-wide admission, attempt identity, job/runner/worker binding, crash recovery, cleanup authority, capacity release, trust policy, and bounded status/recovery debt.
+2. **Keep GitHub's pinned official `actions/scaleset` client behind `tools/scaleset-bridge`.** GitHub owns scale-set sessions, long polling, acknowledgement/acquisition semantics, JIT generation, and runner service APIs. Glaeda persists and reconciles a polled message before explicitly acknowledging it.
+3. **Keep Lima/VZ as the first disposable VM backend.** Backend-specific commands and filesystem details stay private to the adapter. The durable core reasons in Glaeda attempt/worker identities.
 4. **Use a tiny exec-only guest JIT handoff when the runner's supported startup interface would expose the secret in argv.** The helper receives one bounded one-time value over a controller-only channel and starts the exact pinned runner. It has no general command or shell surface.
 5. **Keep hostile-CI network policy intent backend-independent.** Required policy is inbound deny plus egress denial to the Mac host, private/LAN, link-local, metadata, controller, and peer-worker destinations while preserving explicit DNS and ordinary public CI traffic across IPv4 and IPv6.
 6. **Treat Tart/Softnet as the first serious alternative backend/network benchmark, not an automatic switch.** Their capabilities are relevant; their FSL licensing and current Lima investment make adoption an explicit product decision.
-7. **Prefer mature cache and supervision components.** GitHub Actions cache/artifacts, `sccache`, BuildKit cache backends, and `launchd` should carry their existing responsibilities before SmolRunner grows another cache protocol, CAS, package manager, VM monitor, or supervisor.
+7. **Prefer mature cache and supervision components.** GitHub Actions cache/artifacts, `sccache`, BuildKit cache backends, and `launchd` should carry their existing responsibilities before Glaeda grows another cache protocol, CAS, package manager, VM monitor, or supervisor.
 
-The result is deliberately asymmetric: SmolRunner owns fewer mechanisms than neighboring runner managers while keeping the exact lifecycle facts that determine safe cleanup and resource release.
+The result is deliberately asymmetric: Glaeda owns fewer mechanisms than neighboring runner managers while keeping the exact lifecycle facts that determine safe cleanup and resource release.
 
 ## Source, version, and license matrix
 
@@ -25,8 +25,8 @@ These are the source-review points used for this decision. Any component promote
 | Component | Source reviewed | License observed | Useful responsibility | Decision |
 |---|---|---|---|---|
 | GitHub `actions/scaleset` | commit `cb0405b2d874500e75ae34eff8d582ab75956b45` | GitHub upstream | Scale-set sessions, polling, acknowledgement/acquisition, JIT and runner APIs | **Direct dependency through the existing pinned bridge** |
-| GARM | v0.2.1; scale-set path stable from v0.2.0 | Apache-2.0 | Full runner manager, providers, durable controller state, scale-to-zero | Borrow provider/recovery ideas; keep SmolRunner as outer controller |
-| GHA Outrunner | v1.2.0 | MIT | Direct scale-set controller with small Docker/libvirt/Tart provisioners | Borrow the thin provisioner idea; keep SmolRunner lifecycle ownership |
+| GARM | v0.2.1; scale-set path stable from v0.2.0 | Apache-2.0 | Full runner manager, providers, durable controller state, scale-to-zero | Borrow provider/recovery ideas; keep Glaeda as outer controller |
+| GHA Outrunner | v1.2.0 | MIT | Direct scale-set controller with small Docker/libvirt/Tart provisioners | Borrow the thin provisioner idea; keep Glaeda lifecycle ownership |
 | Graftery | `main` inspected 2026-08-11 | Apache-2.0 | Mac-native scale-set controller, Tart clones, prepared images, warm pools | Strong design prior art; too young to become a core dependency today |
 | Lima | v2.2.0 | Apache-2.0 | Apple VZ lifecycle, templates, cloning, guest provisioning/control | **First VM backend** |
 | Tart | v2.34.0 | FSL-1.1-ALv2 | Apple VZ lifecycle, OCI image distribution, automation | Benchmark alternative; explicit licensing/product decision before adoption |
@@ -47,11 +47,11 @@ The existing `tools/scaleset-bridge` is the preferred boundary. It pins the offi
 ```text
 poll through official client
 -> return one bounded normalized message to Rust
--> persist/reconcile under the SmolRunner durable lock
+-> persist/reconcile under the Glaeda durable lock
 -> explicitly acknowledge/acquire the exact persisted message
 ```
 
-That ordering preserves SmolRunner's recovery model. GitHub owns wire/session behavior; SmolRunner owns the durable meaning of each message for local capacity.
+That ordering preserves Glaeda's recovery model. GitHub owns wire/session behavior; Glaeda owns the durable meaning of each message for local capacity.
 
 The narrow M3 adapter should expose only capabilities equivalent to:
 
@@ -64,23 +64,23 @@ observe_runner(exact numeric id/name/scale-set identity)
 remove_runner(exact observed runner identity)
 ```
 
-Keychain access, durable attempt state, capacity reservation, worker creation, actual-job binding, JIT guest delivery, teardown, and capacity release remain SmolRunner responsibilities.
+Keychain access, durable attempt state, capacity reservation, worker creation, actual-job binding, JIT guest delivery, teardown, and capacity release remain Glaeda responsibilities.
 
 ### GARM — borrow interfaces, keep outside the control path
 
 GARM is a complete runner manager. Its stable v0.2 scale-set path already owns GitHub polling, JIT generation, providers, durable controller state, cleanup, and scale-to-zero. Its external provider boundary is valuable prior art.
 
-Putting GARM above SmolRunner would create two durable authorities: GARM's controller/database would own runner lifecycle while SmolRunner's catalog owns admission, worker identity, cleanup proof, and capacity release. Ambiguous registration or teardown would then require a cross-controller recovery protocol at the exact seams SmolRunner already models directly.
+Putting GARM above Glaeda would create two durable authorities: GARM's controller/database would own runner lifecycle while Glaeda's catalog owns admission, worker identity, cleanup proof, and capacity release. Ambiguous registration or teardown would then require a cross-controller recovery protocol at the exact seams Glaeda already models directly.
 
-GARM agent mode also includes broader administration such as remote-shell access. That serves GARM's product and exceeds SmolRunner's intended authority surface.
+GARM agent mode also includes broader administration such as remote-shell access. That serves GARM's product and exceeds Glaeda's intended authority surface.
 
 **Decision:** borrow provider timeout/recovery ideas and retain the direct official Scale Set client.
 
 ### GHA Outrunner — borrow the thin provisioner model
 
-Outrunner provisions a fresh container or VM per job using the Scale Set API and has small Docker, libvirt, and Tart provisioners. It is strong evidence that a future SmolRunner backend interface should stay tiny.
+Outrunner provisions a fresh container or VM per job using the Scale Set API and has small Docker, libvirt, and Tart provisioners. It is strong evidence that a future Glaeda backend interface should stay tiny.
 
-Outrunner still owns the overall controller/provisioner lifecycle. Replacing SmolRunner's reconciler with it would discard the host-global reservation ledger and exact crash/replay joins already implemented.
+Outrunner still owns the overall controller/provisioner lifecycle. Replacing Glaeda's reconciler with it would discard the host-global reservation ledger and exact crash/replay joins already implemented.
 
 **Decision:** borrow the small provisioner idea, especially for backend benchmarks.
 
@@ -88,9 +88,9 @@ Outrunner still owns the overall controller/provisioner lifecycle. Replacing Smo
 
 Graftery is the closest product comparison: Mac-native scale-set integration, a fresh Tart VM per job, JIT injection, content-keyed prepared images, warm pools, orphan cleanup, and scale-to-zero. Those ideas are useful for M6 image preparation and latency work.
 
-The project remains young at this review point, so it is stronger as design evidence than as a dependency SmolRunner should build around.
+The project remains young at this review point, so it is stronger as design evidence than as a dependency Glaeda should build around.
 
-**Decision:** study prepared-image identity, warm-pool accounting, metrics, and orphan cleanup; retain SmolRunner's controller and Lima backend.
+**Decision:** study prepared-image identity, warm-pool accounting, metrics, and orphan cleanup; retain Glaeda's controller and Lima backend.
 
 ## Disposable VM backend boundary
 
@@ -122,7 +122,7 @@ Important semantics live above the backend:
 
 Lima supplies mature Apple VZ and guest lifecycle primitives, and M2 now has pinned template inputs, clone recovery, durable mutation checkpoints, same-lock execution, and ambiguous-outcome handling around it.
 
-Plain mode also gives SmolRunner a useful starting point for disabling host mounts, forwarding, built-in containerd, and guest-agent conveniences while retaining reviewed provisioning.
+Plain mode also gives Glaeda a useful starting point for disabling host mounts, forwarding, built-in containerd, and guest-agent conveniences while retaining reviewed provisioning.
 
 **Decision:** finish M2 and physical acceptance on Lima before benchmarking a replacement.
 
@@ -130,25 +130,25 @@ Plain mode also gives SmolRunner a useful starting point for disabling host moun
 
 Tart is built for automated Apple VZ workloads and supports OCI-distributed VM images. Nearby runner projects demonstrate strong CI ergonomics around it. Current release 2.34.0 also passes Softnet's policy-control file descriptor through Tart, tightening their integration.
 
-Its FSL-1.1-ALv2 license and SmolRunner's accepted Lima recovery work make an immediate switch expensive. Tart becomes compelling when M4 enforcement or M6 measurements show a Lima limitation that changes the product outcome.
+Its FSL-1.1-ALv2 license and Glaeda's accepted Lima recovery work make an immediate switch expensive. Tart becomes compelling when M4 enforcement or M6 measurements show a Lima limitation that changes the product outcome.
 
 **Decision:** retain as the first serious alternative benchmark with an explicit license gate before becoming required.
 
 ### Lume
 
-Lume v0.4.0 provides a higher-level Apple VZ surface for macOS and Linux guests. It is closer to the abstraction SmolRunner wants than vfkit, while Lima and Tart currently have stronger CI lifecycle prior art.
+Lume v0.4.0 provides a higher-level Apple VZ surface for macOS and Linux guests. It is closer to the abstraction Glaeda wants than vfkit, while Lima and Tart currently have stronger CI lifecycle prior art.
 
 **Decision:** benchmark after a measured Lima gap. Pin and re-review the exact Lume release/license before any switch.
 
 ### vfkit
 
-vfkit is a useful low-level Virtualization.framework tool and permissively licensed. Choosing it would push image acquisition, provisioning, clone/snapshot conventions, guest control, and more recovery semantics into SmolRunner.
+vfkit is a useful low-level Virtualization.framework tool and permissively licensed. Choosing it would push image acquisition, provisioning, clone/snapshot conventions, guest control, and more recovery semantics into Glaeda.
 
 **Decision:** keep it as a low-level fallback/research tool; mature higher-level backends are a better first choice.
 
 ## Guest JIT control channel
 
-GitHub's supported JIT startup documentation passes encoded JIT configuration as a `--jitconfig` command-line argument to the runner startup path. SmolRunner's product boundary keeps one-time JIT material out of argv, public logs, durable public state, and reusable guest storage.
+GitHub's supported JIT startup documentation passes encoded JIT configuration as a `--jitconfig` command-line argument to the runner startup path. Glaeda's product boundary keeps one-time JIT material out of argv, public logs, durable public state, and reusable guest storage.
 
 That makes a tiny controller-owned handoff appropriate unless the exact pinned runner exposes an equally narrow secret-input mechanism during implementation.
 
@@ -168,14 +168,14 @@ Required properties:
 - one attempt/runner generation per invocation;
 - bounded input and output;
 - controller-only transport, preferably the existing private Lima control path or a narrowly reviewed vsock path;
-- secret absent from process-list-visible argv, inherited long-lived environment, durable SmolRunner documents, and reusable guest state;
+- secret absent from process-list-visible argv, inherited long-lived environment, durable Glaeda documents, and reusable guest state;
 - helper version/identity bound into the prepared-template identity.
 
 A general guest agent adds authority the product does not need.
 
 ## Hostile-CI network enforcement
 
-The policy contract belongs in SmolRunner even if enforcement changes backend later.
+The policy contract belongs in Glaeda even if enforcement changes backend later.
 
 ### Required policy intent
 
@@ -197,13 +197,13 @@ For a hostile disposable worker:
 
 Softnet 0.22.1 is interesting because it provides per-Tart-VM userspace packet filtering, bounded stateful flow authorization, and an atomic local Unix-socket JSON-RPC policy API. Its documented policy supports default-deny IPv4 egress with specific allows.
 
-Current gaps for SmolRunner M4:
+Current gaps for Glaeda M4:
 
 - Tart coupling;
 - FSL-1.1-ALv2 product/distribution gate;
 - elevated host authority during initialization before privilege drop;
 - dynamic policy is documented as IPv4-focused;
-- default behavior allows the vmnet gateway and incoming traffic, while SmolRunner requires explicit inbound denial plus controller/LAN isolation;
+- default behavior allows the vmnet gateway and incoming traffic, while Glaeda requires explicit inbound denial plus controller/LAN isolation;
 - closing the policy control socket leaves the last accepted policy active, so controller-loss semantics need separate proof;
 - M4 still needs a complete IPv6 policy and bypass test story.
 
@@ -224,11 +224,11 @@ Any later host-local writable cache needs an explicit namespace, quota, producer
 
 ### GARM as outer controller
 
-It reduces custom GitHub code but creates split durable lifecycle ownership at SmolRunner's most important crash boundaries. Keep the direct official client.
+It reduces custom GitHub code but creates split durable lifecycle ownership at Glaeda's most important crash boundaries. Keep the direct official client.
 
 ### Official convenience listener unchanged
 
-Its handler/ack ordering does not provide SmolRunner's persistence-before-ack boundary. The checked-in bridge already provides explicit acknowledgement after durable reconciliation.
+Its handler/ack ordering does not provide Glaeda's persistence-before-ack boundary. The checked-in bridge already provides explicit acknowledgement after durable reconciliation.
 
 ### Immediate Tart switch
 
@@ -236,7 +236,7 @@ Current M2 Lima work closes difficult clone/recovery/ownership seams. Switch fro
 
 ### Direct vfkit integration
 
-That trades one dependency for a much larger custom image/provisioning/guest-lifecycle surface. SmolRunner should stay above mature VM lifecycle tools.
+That trades one dependency for a much larger custom image/provisioning/guest-lifecycle surface. Glaeda should stay above mature VM lifecycle tools.
 
 ### General guest agent
 
@@ -244,7 +244,7 @@ M3 needs one secret-bearing runner startup handoff and bounded observations. A g
 
 ### Custom generic firewall
 
-SmolRunner should define network intent and bind enforcement evidence. Packet filtering belongs to a mature backend when one satisfies the policy.
+Glaeda should define network intent and bind enforcement evidence. Packet filtering belongs to a mature backend when one satisfies the policy.
 
 ## Benchmark and acceptance probes before dependency switches
 
@@ -264,7 +264,7 @@ Run the same pinned ARM64 guest/template intent through Lima, Tart, and any seri
 - same-name foreign VM protection;
 - cleanup proof before capacity release.
 
-vfkit needs separate accounting for the image/provisioning lifecycle it would force SmolRunner to own.
+vfkit needs separate accounting for the image/provisioning lifecycle it would force Glaeda to own.
 
 ### JIT secrecy probes
 
@@ -272,7 +272,7 @@ For one generated JIT configuration, prove the secret is absent from:
 
 - host and guest process listings/argv;
 - inherited environment visible to unrelated guest processes;
-- SmolRunner human/JSON output;
+- Glaeda human/JSON output;
 - durable attempt/template documents and journals;
 - controller/bridge diagnostics;
 - reusable guest files after the attempt;

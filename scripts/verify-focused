@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Credentialless fixed-profile source verification entry point."""
+
+from verify_focused_impl import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

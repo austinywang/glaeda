@@ -93,6 +93,18 @@ impl UnixPersonalWorkerStore {
                 DisposableAttemptCatalogAction::BeginCleanup,
             );
         }
+        if matches!(
+            phase,
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) && reservation.attempt().runner_id().is_some()
+            && !reservation.attempt().runner_start_started()
+        {
+            return self.publish_cleanup_action(
+                &current,
+                attempt_id,
+                DisposableAttemptCatalogAction::BeginCleanup,
+            );
+        }
         if !matches!(
             phase,
             DisposableAttemptPhase::Destroying

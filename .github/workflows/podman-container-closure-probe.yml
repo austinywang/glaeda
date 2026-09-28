@@ -7,6 +7,7 @@ on:
       - scripts/test-podman-container-closure.sh
       - docs/PODMAN_EXECUTION_CLOSURE.md
       - docs/PODMAN_CONTAINER_CLOSURE_EVIDENCE.md
+      - docs/PODMAN_CURRENT_EXECUTION_CLOSURE_AUDIT.md
   workflow_dispatch:
 
 permissions:
@@ -21,6 +22,8 @@ jobs:
     name: Ubuntu 24.04 ${{ matrix.architecture }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    env:
+      GLAEDA_PROBE_PROVIDER: github-hosted-ubuntu
     strategy:
       fail-fast: false
       matrix:
@@ -32,15 +35,54 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           show-progress: false
 
+      - name: Refuse provider identity as probe admission
+        run: |
+          set -euo pipefail
+          for assignment in \
+            GLAEDA_PROBE_PROVIDER=github-hosted-ubuntu \
+            SMOLRUNNER_DISPOSABLE_PROBE=github-hosted-ubuntu; do
+            if sudo /usr/bin/env -i \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              LC_ALL=C \
+              "$assignment" \
+              /usr/bin/bash scripts/test-podman-container-closure.sh \
+              >provider-admission.out 2>provider-admission.err; then
+              printf 'error: provider identity unexpectedly admitted container probe\n' >&2
+              exit 1
+            fi
+            grep -Fx \
+              'error: disposable container probe requires the explicit dangerous integration gate' \
+              provider-admission.err
+          done
+
+          for mode in --image-install-probe --user-probe; do
+            for assignment in \
+              GLAEDA_PROBE_PROVIDER=github-hosted-ubuntu \
+              SMOLRUNNER_DISPOSABLE_PROBE=github-hosted-ubuntu; do
+              if sudo /usr/bin/env -i \
+                PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+                LC_ALL=C \
+                "$assignment" \
+                /usr/bin/bash scripts/test-podman-container-closure.sh "$mode" \
+                >submode-admission.out 2>submode-admission.err; then
+                printf 'error: provider identity unexpectedly admitted container submode: %s\n' "$mode" >&2
+                exit 1
+              fi
+              grep -Fx \
+                'error: disposable container probe requires the explicit dangerous integration gate' \
+                submode-admission.err
+            done
+          done
+
       - name: Install Ubuntu closure packages
         run: |
           while IFS= read -r source; do
-            sudo mv -- "$source" "$source.smolrunner-disabled"
+            sudo mv -- "$source" "$source.glaeda-disabled"
           done < <(sudo grep -rl 'ppa.launchpadcontent.net/git-core/ppa' /etc/apt/sources.list.d || true)
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
@@ -55,9 +97,58 @@ jobs:
             uidmap
 
       - name: Probe offline stopped-container closure
-        run: >-
-          sudo /usr/bin/env -i
-          PATH=/usr/sbin:/usr/bin:/sbin:/bin
-          LC_ALL=C
-          SMOLRUNNER_DISPOSABLE_PROBE=github-hosted-ubuntu
-          /usr/bin/bash scripts/test-podman-container-closure.sh
+        run: |
+          set -euo pipefail
+
+          run_probe() {
+            sudo /usr/bin/env -i \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              LC_ALL=C \
+              GLAEDA_DISPOSABLE_PROBE=1 \
+              GLAEDA_PROBE_PROVIDER=github-hosted-ubuntu \
+              /usr/bin/bash scripts/test-podman-container-closure.sh
+          }
+
+          set +e
+          run_probe >container-probe.out 2>container-probe.err
+          probe_status=$?
+          set -e
+          cat container-probe.out
+          cat container-probe.err >&2
+          if (( probe_status == 0 )); then
+            exit 0
+          fi
+
+          if [[ $(grep -c '^hostile_log_bytes=' container-probe.err) -ne 1 ]] ||
+            ! grep -Fxq \
+              'error: hostile payload did not reach every bounded pressure signal' \
+              container-probe.err; then
+            exit "$probe_status"
+          fi
+
+          read -r log_token pids_token memory_baseline_token memory_current_token \
+            shmem_baseline_token shmem_current_token free_blocks_token free_inodes_token \
+            < <(grep '^hostile_log_bytes=' container-probe.err)
+          log_size=${log_token#*=}
+          pids_max_events=${pids_token#*=}
+          memory_baseline=${memory_baseline_token#*=}
+          memory_current=${memory_current_token#*=}
+          shmem_baseline=${shmem_baseline_token#*=}
+          shmem_current=${shmem_current_token#*=}
+          free_blocks=${free_blocks_token#*=}
+          free_inodes=${free_inodes_token#*=}
+
+          for value in \
+            "$log_size" "$pids_max_events" "$memory_baseline" "$memory_current" \
+            "$shmem_baseline" "$shmem_current" "$free_blocks" "$free_inodes"; do
+            [[ $value =~ ^[0-9]+$ ]] || exit "$probe_status"
+          done
+          if (( log_size >= 65536 || pids_max_events == 0 ||
+            memory_current < memory_baseline + 7340032 ||
+            shmem_current < shmem_baseline + 7340032 ||
+            free_blocks != 0 || free_inodes != 0 )); then
+            exit "$probe_status"
+          fi
+
+          printf 'retrying exact hosted arm64 hostile-log lag once\n' >&2
+          run_probe

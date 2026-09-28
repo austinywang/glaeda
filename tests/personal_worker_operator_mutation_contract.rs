@@ -7,38 +7,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     EpochMillis, ExecutionAdmissionIdentity, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, RunnerProfileId,
 };
-use smolrunner::lima_observation::LimaInstanceName;
-use smolrunner::mac_availability::AvailabilityRequest;
-use smolrunner::operator_config::{
+use glaeda::lima_observation::LimaInstanceName;
+use glaeda::mac_availability::AvailabilityRequest;
+use glaeda::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
-use smolrunner::operator_error::OperatorErrorCode;
-use smolrunner::personal_worker_operator_mutation::{
+use glaeda::operator_error::OperatorErrorCode;
+use glaeda::personal_worker_operator_mutation::{
     PersonalWorkerMutationExpectation, PersonalWorkerOperatorMutationErrorKind,
     PersonalWorkerOperatorMutationService, PersonalWorkerSubmissionInput,
 };
-use smolrunner::personal_worker_operator_read::PersonalWorkerOperatorReadService;
-use smolrunner::personal_worker_operator_store::{
+use glaeda::personal_worker_operator_read::PersonalWorkerOperatorReadService;
+use glaeda::personal_worker_operator_store::{
     PersonalWorkerInitializationInput, PersonalWorkerOperatorStore,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     MAX_PERSONAL_WORKER_QUEUE_ENTRIES, PersonalWorkerActivityEvidence,
     PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
     PersonalWorkerJobRequest, PersonalWorkerPriority, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_read_model::PersonalWorkerJobReadRequest;
-use smolrunner::personal_worker_store::{PersonalWorkerStoreDocument, PersonalWorkerStoreRevision};
-use smolrunner::personal_worker_store_transaction::PersonalWorkerStoreMutationDisposition;
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::personal_worker_read_model::PersonalWorkerJobReadRequest;
+use glaeda::personal_worker_store::{PersonalWorkerStoreDocument, PersonalWorkerStoreRevision};
+use glaeda::personal_worker_store_transaction::PersonalWorkerStoreMutationDisposition;
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use rustix::fs::{FlockOperation, flock};
 
 const BASE: u64 = 1_000_000;
 const GIB: u64 = 1_024 * 1_024 * 1_024;

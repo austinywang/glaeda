@@ -2,14 +2,14 @@ use std::error::Error;
 use std::fmt;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
-use smolrunner::artifact::{CommitId, GitTreeId, Sha256Digest};
-use smolrunner::hot_execution_performance::{
+use glaeda::artifact::{CommitId, GitTreeId, Sha256Digest};
+use glaeda::hot_execution_performance::{
     HotBuildState, HotDependencyState, HotExecutionHeat, HotExecutionMilestones, HotExecutionMode,
     HotExecutionPerformanceIdentity, HotExecutionPerformanceReceipt,
     HotExecutionResourceObservation, HotExecutionResultClass, HotExecutionStorageObservation,
     HotIndexServiceState, HotRepositoryState, HotSandboxState,
 };
+use serde::Serialize;
 
 const WORKLOAD_ID: &str = "quarry-agent-brief-edit-test-v1";
 const PROJECT_ID: &str = "quarry";

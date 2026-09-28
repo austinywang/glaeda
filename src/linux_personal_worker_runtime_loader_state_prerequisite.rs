@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn disposable_noble_loader_state_is_descriptor_bound() {
-        if std::env::var("SMOLRUNNER_ELF_PACKAGE_PROBE").as_deref() != Ok("github-hosted-ubuntu") {
+        if std::env::var("GLAEDA_DISPOSABLE_PROBE").as_deref() != Ok("1") {
             return;
         }
         let architecture = host_architecture().expect("supported package-probe architecture");

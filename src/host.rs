@@ -164,7 +164,7 @@ pub fn build_plan(manifest: &Manifest, current: CurrentHostState) -> HostPlan {
 #[must_use]
 pub fn render_human(plan: &HostPlan) -> String {
     let mut output = format!(
-        "SmolRunner host plan\n\nRepository: {}\nRunner user: {}\n\n",
+        "Glaeda host plan\n\nRepository: {}\nRunner user: {}\n\n",
         plan.desired.repository, plan.desired.runner_user
     );
 

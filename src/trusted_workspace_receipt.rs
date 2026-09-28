@@ -6,16 +6,17 @@ use std::io::Read as _;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
-use rustix::io::Errno;
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
-
 use crate::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 use crate::ownership::{OwnershipMarker, ProjectIdentity, ResourceIdentity, ResourceKind};
+use crate::project_workspace_identity::{
+    ProjectWorkspaceIdentityGeneration, TrustedWorkspaceIdentityKind, trusted_workspace_identity,
+};
 use crate::repository_source_observation::RepositoryWorkspaceLocationIdentity;
-use crate::state::{InstallationId, STATE_ROOT};
+use crate::state::InstallationId;
 use crate::state_document::{ProjectStateDocument, StateDocument, decode_state_document};
+use crate::state_root_generation::{
+    SelectedStateRoot, StateRootGeneration, StateRootSelection, select_state_root,
+};
 use crate::state_store::MAX_STATE_DOCUMENT_BYTES;
 use crate::verification_profile::{
     CacheId, CapabilityObservation, HostResourceObservation, RepositoryCommandIdentity,
@@ -25,8 +26,11 @@ use crate::verification_profile_preflight_adapter::{
     TrustedRunnerPrivateEvidence, TrustedRunnerWorkspaceReceipt,
     TrustedRunnerWorkspaceReceiptDefinition,
 };
+use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::io::Errno;
+use serde::Serialize;
 
-pub const TRUSTED_WORKSPACE_RECEIPT_SCHEMA_VERSION: u8 = 1;
+pub const TRUSTED_WORKSPACE_RECEIPT_SCHEMA_VERSION: u8 = 2;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -110,10 +114,11 @@ impl fmt::Display for TrustedWorkspaceReceiptError {
 
 impl std::error::Error for TrustedWorkspaceReceiptError {}
 
-/// Descriptor-bound workspace and cache identity derived only from protected SmolRunner state.
+/// Descriptor-bound workspace and cache identity derived only from protected versioned state.
 #[derive(Serialize)]
 pub struct TrustedWorkspaceCacheReceipt {
     schema_version: u8,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     installation_id: RunnerInstallationId,
     workspace_id: RunnerWorkspaceId,
     repository: RepositoryRef,
@@ -131,6 +136,11 @@ pub struct TrustedWorkspaceCacheReceipt {
 }
 
 impl TrustedWorkspaceCacheReceipt {
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
+    }
+
     #[must_use]
     pub const fn installation_id(&self) -> &RunnerInstallationId {
         &self.installation_id
@@ -179,6 +189,7 @@ impl TrustedWorkspaceCacheReceipt {
     ) -> Self {
         Self {
             schema_version: TRUSTED_WORKSPACE_RECEIPT_SCHEMA_VERSION,
+            identity_generation: ProjectWorkspaceIdentityGeneration::CURRENT,
             installation_id,
             workspace_id: workspace_id.clone(),
             repository,
@@ -241,6 +252,7 @@ impl fmt::Debug for TrustedWorkspaceCacheReceipt {
         formatter
             .debug_struct("TrustedWorkspaceCacheReceipt")
             .field("schema_version", &self.schema_version)
+            .field("identity_generation", &self.identity_generation)
             .field("installation_id", &self.installation_id)
             .field("workspace_id", &self.workspace_id)
             .field("repository", &self.repository)
@@ -267,6 +279,24 @@ pub struct TrustedRunnerPreflightEvidence {
     pub requested_authorities: BTreeSet<RequestedAuthority>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrustedWorkspaceRootBinding {
+    root: SelectedStateRoot,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
+}
+
+fn select_trusted_workspace_root(selection: StateRootSelection) -> TrustedWorkspaceRootBinding {
+    let root = select_state_root(selection);
+    let identity_generation = match root.generation() {
+        StateRootGeneration::SmolrunnerLegacyV1 => ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+        StateRootGeneration::GlaedaCurrentV1 => ProjectWorkspaceIdentityGeneration::GlaedaV2,
+    };
+    TrustedWorkspaceRootBinding {
+        root,
+        identity_generation,
+    }
+}
+
 /// Produce one trusted workspace/cache receipt from the canonical protected state root.
 ///
 /// The project identity is only a lookup key. Installation, workspace, cache, paths, ownership, and
@@ -282,19 +312,54 @@ pub struct TrustedRunnerPreflightEvidence {
 pub fn produce_default_trusted_workspace_cache_receipt(
     project: &ProjectIdentity,
 ) -> Result<TrustedWorkspaceCacheReceipt, TrustedWorkspaceReceiptError> {
-    produce_trusted_workspace_cache_receipt(Path::new(STATE_ROOT), project)
+    let binding = select_trusted_workspace_root(StateRootSelection::Current);
+    produce_with_hook_for_generation(
+        binding.root.fixed_path(),
+        project,
+        binding.identity_generation,
+        || {},
+    )
 }
 
+#[cfg(test)]
 fn produce_trusted_workspace_cache_receipt(
     root_path: &Path,
     project: &ProjectIdentity,
 ) -> Result<TrustedWorkspaceCacheReceipt, TrustedWorkspaceReceiptError> {
-    produce_with_hook(root_path, project, || {})
+    produce_trusted_workspace_cache_receipt_for_generation(
+        root_path,
+        project,
+        ProjectWorkspaceIdentityGeneration::CURRENT,
+    )
 }
 
+#[cfg(test)]
+fn produce_trusted_workspace_cache_receipt_for_generation(
+    root_path: &Path,
+    project: &ProjectIdentity,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
+) -> Result<TrustedWorkspaceCacheReceipt, TrustedWorkspaceReceiptError> {
+    produce_with_hook_for_generation(root_path, project, identity_generation, || {})
+}
+
+#[cfg(test)]
 fn produce_with_hook(
     root_path: &Path,
     project: &ProjectIdentity,
+    after_open: impl FnOnce(),
+) -> Result<TrustedWorkspaceCacheReceipt, TrustedWorkspaceReceiptError> {
+    produce_with_hook_for_generation(
+        root_path,
+        project,
+        ProjectWorkspaceIdentityGeneration::CURRENT,
+        after_open,
+    )
+}
+
+fn produce_with_hook_for_generation(
+    root_path: &Path,
+    project: &ProjectIdentity,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     after_open: impl FnOnce(),
 ) -> Result<TrustedWorkspaceCacheReceipt, TrustedWorkspaceReceiptError> {
     let root = open_root(root_path)?;
@@ -412,36 +477,41 @@ fn produce_with_hook(
                 "workspace identity could not be encoded",
             )
         })?;
-    let workspace_id_digest = digest_fields(
-        b"smolrunner-trusted-workspace-id-v1",
+    let workspace_id_digest = trusted_workspace_identity(
+        identity_generation,
+        TrustedWorkspaceIdentityKind::WorkspaceId,
         [
             installation.id.as_str().as_bytes(),
             workspace_identity_material.as_slice(),
         ],
-    );
-    let workspace_id = RunnerWorkspaceId::parse(&format!(
-        "workspace-{}",
-        &hex_digest(&workspace_id_digest)[..40]
-    ))
+    )
     .map_err(|_| corrupt_error("workspace_record", "derived workspace ID is invalid"))?;
+    let workspace_id_hex = workspace_id_digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| corrupt_error("workspace_record", "derived workspace ID is invalid"))?;
+    let workspace_id = RunnerWorkspaceId::parse(&format!("workspace-{}", &workspace_id_hex[..40]))
+        .map_err(|_| corrupt_error("workspace_record", "derived workspace ID is invalid"))?;
     let cache_id = CacheId::parse(CACHE_ID)
         .map_err(|_| corrupt_error("cache_record", "fixed cache ID is invalid"))?;
     let cache_identity_material = serde_json::to_vec(&cache_record.marker.resource)
         .map_err(|_| corrupt_error("cache_record", "cache identity could not be encoded"))?;
-    let namespace_bytes = digest_fields(
-        b"smolrunner-trusted-cache-namespace-v1",
+    let cache_namespace_digest = trusted_workspace_identity(
+        identity_generation,
+        TrustedWorkspaceIdentityKind::CacheNamespace,
         [
             installation.id.as_str().as_bytes(),
             workspace_id.as_str().as_bytes(),
             cache_identity_material.as_slice(),
         ],
-    );
-    let cache_namespace_digest = parse_digest(namespace_bytes, "cache_record")?;
+    )
+    .map_err(|_| corrupt_error("cache_record", "cache identity could not be encoded"))?;
 
     let workspace_stat_evidence = stat_evidence(&workspace.stat);
     let cache_stat_evidence = stat_evidence(&cache.stat);
-    let evidence_bytes = digest_fields(
-        b"smolrunner-trusted-workspace-evidence-v1",
+    let trusted_evidence_digest = trusted_workspace_identity(
+        identity_generation,
+        TrustedWorkspaceIdentityKind::Evidence,
         [
             installation.project.bytes.as_slice(),
             workspace_record.bytes.as_slice(),
@@ -449,8 +519,8 @@ fn produce_with_hook(
             workspace_stat_evidence.as_slice(),
             cache_stat_evidence.as_slice(),
         ],
-    );
-    let trusted_evidence_digest = parse_digest(evidence_bytes, "evidence")?;
+    )
+    .map_err(|_| corrupt_error("evidence", "workspace evidence could not be encoded"))?;
     let workspace_location_identity = RepositoryWorkspaceLocationIdentity::from_validated(
         workspace_path.clone(),
         workspace.stat.st_dev,
@@ -459,6 +529,7 @@ fn produce_with_hook(
 
     Ok(TrustedWorkspaceCacheReceipt {
         schema_version: TRUSTED_WORKSPACE_RECEIPT_SCHEMA_VERSION,
+        identity_generation,
         installation_id,
         workspace_id: workspace_id.clone(),
         repository,
@@ -1031,29 +1102,6 @@ fn normal_components(path: &Path) -> Result<Vec<OsString>, TrustedWorkspaceRecei
     } else {
         Ok(components)
     }
-}
-
-fn digest_fields<'a>(domain: &[u8], fields: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(domain);
-    digest.update([0]);
-    for field in fields {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field);
-    }
-    digest.finalize().into()
-}
-
-fn hex_digest(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn parse_digest(
-    bytes: [u8; 32],
-    stage: &'static str,
-) -> Result<Sha256Digest, TrustedWorkspaceReceiptError> {
-    Sha256Digest::parse(&format!("sha256:{}", hex_digest(&bytes)))
-        .map_err(|_| corrupt_error(stage, "derived digest is invalid"))
 }
 
 fn stat_evidence(stat: &rustix::fs::Stat) -> Vec<u8> {

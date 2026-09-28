@@ -1,0 +1,1476 @@
+#!/usr/bin/env python3
+"""Measure exact Glaeda verification throughput across fixed linker/concurrency arms.
+
+This is an explicit local physical benchmark. It creates only one caller-selected private
+experiment root, writes one caller-selected path-free aggregate receipt, and never deletes either.
+It grants no verification reuse, linker selection, cache lifecycle, scheduling, or cleanup
+authority.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import json
+import math
+import os
+import platform
+import pwd
+import re
+import secrets
+import signal
+import shutil
+import stat
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+BUILD_JOBS = 4
+MIN_EXPERIMENT_AVAILABLE_BYTES = 48 * 1024**3
+OVERLAP_QUIET_SECONDS = 1.0
+OVERLAP_WAIT_SECONDS = 30.0
+OVERLAP_RETRY_LIMIT = 3
+SCOPE_ADMISSION_SECONDS = 2.0
+SCOPE_TERMINATION_SECONDS = 2.0
+MAX_CGROUP_OBSERVATION_BYTES = 64 * 1024
+INTERNAL_SCOPE_ENTRY = "--glaeda-linker-benchmark-scope-entry-v1"
+INTERNAL_NESTED_FIXTURE = "--glaeda-linker-benchmark-nested-fixture-v1"
+WIDTHS = (1, 2, 4)
+LINKERS = ("gnu", "lld", "mold")
+FAST_PHASES = (
+    "unit-and-binary-tests",
+    "format",
+    "build-cli",
+    "doctor",
+    "plan-quarry",
+    "plan-glossless",
+    "host-plan-quarry",
+)
+KNOWN_BUILD_EXECUTABLES = {
+    "cargo",
+    "rustc",
+    "rustdoc",
+    "clang",
+    "clang-21",
+    "cc",
+    "ld",
+    "ld.lld",
+    "mold",
+    "go",
+    "compile",
+    "link",
+    "cgo",
+    "cc1",
+    "cc1plus",
+    "collect2",
+}
+BUILD_EXECUTABLE_PATTERN = re.compile(
+    r"(?:^|-)"
+    r"(?:gcc|g\+\+|clang|clang\+\+|ld(?:\.bfd|\.gold|\.lld)?|lld)"
+    r"(?:-\d+)?$"
+)
+
+
+class BenchmarkError(RuntimeError):
+    """One bounded benchmark invariant failed."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    commit: str
+    tree: str
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    paths: dict[str, Path]
+    versions: dict[str, str]
+    build_executables: frozenset[str]
+    path_identity_sha256: str
+
+
+@dataclass(frozen=True)
+class Worker:
+    process: subprocess.Popen[bytes]
+    receipt: Path
+    log: Path
+    target: Path
+    scope: "OwnedScope"
+
+
+@dataclass
+class OwnedScope:
+    unit: str
+    cgroup_fd: int
+    kill_fd: int
+    entry_pidfd: int
+    entry_pid: int
+
+    def close(self) -> None:
+        for descriptor in (self.entry_pidfd, self.kill_fd, self.cgroup_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+        self.entry_pidfd = -1
+        self.kill_fd = -1
+        self.cgroup_fd = -1
+
+
+class DeferredRegistrationInterrupt:
+    def __init__(self) -> None:
+        self.previous: Any = None
+        self.frame: Any = None
+        self.pending = False
+        self.installed = False
+
+    def defer(self, _signal_number: int, frame: Any) -> None:
+        self.pending = True
+        self.frame = frame
+
+    def __enter__(self) -> "DeferredRegistrationInterrupt":
+        self.previous = signal.getsignal(signal.SIGINT)
+        if callable(self.previous):
+            signal.signal(signal.SIGINT, self.defer)
+            self.installed = True
+        return self
+
+    def __exit__(self, _kind: Any, _value: Any, _traceback: Any) -> bool:
+        if self.installed:
+            signal.signal(signal.SIGINT, self.previous)
+        if self.pending:
+            self.previous(signal.SIGINT, self.frame)
+        return False
+
+
+def closed_child_environment() -> dict[str, str]:
+    return {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
+def run_text(argv: list[str], *, cwd: Path, timeout: float = 10.0) -> str:
+    result = subprocess.run(
+        argv,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=closed_child_environment(),
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BenchmarkError("capability_unavailable", "a required capability failed")
+    return result.stdout.strip()
+
+
+def repository_root() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    observed = run_text(["/usr/bin/git", "rev-parse", "--show-toplevel"], cwd=root)
+    if Path(observed).resolve(strict=True) != root:
+        raise BenchmarkError("wrong_repository", "the benchmark is outside its repository root")
+    return root
+
+
+def source_identity(root: Path) -> SourceIdentity:
+    values = run_text(
+        ["/usr/bin/git", "rev-parse", "HEAD", "HEAD^{tree}"], cwd=root
+    ).splitlines()
+    if len(values) != 2 or any(len(value) != 40 for value in values):
+        raise BenchmarkError("source_identity", "the exact source identity is unavailable")
+    dirty = subprocess.run(
+        ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=closed_child_environment(),
+        check=False,
+    )
+    if dirty.returncode != 0 or dirty.stdout:
+        raise BenchmarkError("dirty_source", "the benchmark source must be clean")
+    return SourceIdentity(*values)
+
+
+def first_line(argv: list[str], root: Path) -> str:
+    output = run_text(argv, cwd=root)
+    line = output.splitlines()[0] if output else ""
+    if not line or len(line.encode("utf-8")) > 256:
+        raise BenchmarkError("invalid_version", "a capability version is invalid")
+    return line
+
+
+def require_capabilities(root: Path) -> Capabilities:
+    discovered = {
+        "git": "/usr/bin/git",
+        "python": sys.executable,
+        "cargo": shutil.which("cargo"),
+        "rustc": shutil.which("rustc"),
+        "clang": shutil.which("clang"),
+        "mold": shutil.which("mold"),
+        "gnu_ld": shutil.which("ld.bfd") or shutil.which("ld"),
+        "lld": shutil.which("ld.lld") or shutil.which("lld"),
+        "cc": shutil.which("cc"),
+    }
+    if any(value is None or not Path(value).is_absolute() for value in discovered.values()):
+        raise BenchmarkError("capability_unavailable", "a required capability is unavailable")
+    paths = {name: Path(value) for name, value in discovered.items() if value is not None}
+    versions = {
+        "git": first_line([str(paths["git"]), "--version"], root),
+        "python": platform.python_version(),
+        "cargo": first_line([str(paths["cargo"]), "--version"], root),
+        "rustc": first_line([str(paths["rustc"]), "--version"], root),
+        "clang": first_line([str(paths["clang"]), "--version"], root),
+        "mold": first_line([str(paths["mold"]), "--version"], root),
+        "gnu_ld": first_line([str(paths["gnu_ld"]), "--version"], root),
+        "lld": first_line([str(paths["lld"]), "--version"], root),
+        "cc": first_line([str(paths["cc"]), "--version"], root),
+    }
+    path_identity = hashlib.sha256(b"glaeda-linker-benchmark-paths-v1\0")
+    build_executables = set(KNOWN_BUILD_EXECUTABLES)
+    for name in sorted(paths):
+        resolved = paths[name].resolve(strict=True)
+        path_identity.update(name.encode("ascii") + b"\0")
+        path_identity.update(os.fsencode(resolved) + b"\0")
+        if name not in {"git", "python"}:
+            build_executables.add(paths[name].name)
+            build_executables.add(resolved.name)
+    return Capabilities(
+        paths=paths,
+        versions=versions,
+        build_executables=frozenset(build_executables),
+        path_identity_sha256=f"sha256:{path_identity.hexdigest()}",
+    )
+
+
+def ensure_external_new_path(root: Path, path: Path, label: str) -> Path:
+    absolute = path.absolute()
+    parent = absolute.parent.resolve(strict=True)
+    destination = parent / absolute.name
+    if destination.is_relative_to(root):
+        raise BenchmarkError("unsafe_path", f"{label} must be outside the source worktree")
+    if destination.exists() or destination.is_symlink():
+        raise BenchmarkError("path_exists", f"{label} already exists")
+    return destination
+
+
+def create_experiment_root(path: Path) -> None:
+    path.mkdir(mode=0o700)
+    for name in ("targets", "receipts", "logs"):
+        (path / name).mkdir(mode=0o700)
+
+
+def filesystem_available_bytes(path: Path) -> int:
+    observed = os.statvfs(path)
+    return observed.f_bavail * observed.f_frsize
+
+
+def require_experiment_storage(path: Path) -> int:
+    available = filesystem_available_bytes(path)
+    if available < MIN_EXPERIMENT_AVAILABLE_BYTES:
+        raise BenchmarkError(
+            "insufficient_storage",
+            "the experiment filesystem lacks the measured target-generation envelope",
+        )
+    return available
+
+
+def encoded_rustflags(linker: str, clang: Path = Path("/usr/bin/clang")) -> str:
+    if linker not in {"gnu", "lld", "mold"}:
+        raise BenchmarkError("invalid_linker", "the linker arm is invalid")
+    driver = "bfd" if linker == "gnu" else linker
+    return "\x1f".join(
+        (f"-Clinker={clang.resolve(strict=True)}", f"-Clink-arg=-fuse-ld={driver}")
+    )
+
+
+def capability_search_path(capabilities: Capabilities) -> str:
+    entries: list[str] = []
+    capability_directories = {
+        os.fspath(path if path.is_dir() else path.parent)
+        for path in capabilities.paths.values()
+    }
+    ambient_order = os.environ.get("PATH", "").split(os.pathsep)
+    ordered_paths = [Path(value) for value in ambient_order if value in capability_directories]
+    for path in [*ordered_paths, *capabilities.paths.values(), Path("/usr/bin"), Path("/bin")]:
+        parent = path if path.is_dir() else path.parent
+        value = os.fspath(parent)
+        if value not in entries:
+            entries.append(value)
+    return os.pathsep.join(entries)
+
+
+def worker_environment(
+    root: Path, target: Path, linker: str, capabilities: Capabilities
+) -> dict[str, str]:
+    home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)
+    if not home.is_dir():
+        raise BenchmarkError("invalid_environment", "the effective-user home is unavailable")
+    cargo_home = home / ".cargo"
+    for name in ("config", "config.toml"):
+        candidate = cargo_home / name
+        if candidate.exists() or candidate.is_symlink():
+            raise BenchmarkError(
+                "ambient_cargo_config",
+                "an ambient Cargo configuration would change the experiment identity",
+            )
+    return {
+        "HOME": os.fspath(home),
+        "PATH": capability_search_path(capabilities),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "CARGO_TERM_COLOR": "never",
+        "CARGO_BUILD_JOBS": str(BUILD_JOBS),
+        "CARGO_TARGET_DIR": os.fspath(target),
+        "CARGO_ENCODED_RUSTFLAGS": encoded_rustflags(
+            linker, capabilities.paths["clang"]
+        ),
+    }
+
+
+def systemd_control_environment() -> dict[str, str]:
+    runtime = Path(f"/run/user/{os.geteuid()}")
+    bus = runtime / "bus"
+    if not runtime.is_dir() or not bus.exists():
+        raise BenchmarkError(
+            "scope_unavailable", "the effective-user systemd control socket is unavailable"
+        )
+    return {
+        **closed_child_environment(),
+        "XDG_RUNTIME_DIR": os.fspath(runtime),
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
+    }
+
+
+def unique_scope_unit() -> str:
+    return f"glaeda-linker-benchmark-{os.getpid()}-{secrets.token_hex(16)}.scope"
+
+
+def scope_control_group(unit: str, deadline: float) -> str:
+    environment = systemd_control_environment()
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=ControlGroup",
+                "--value",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            timeout=1,
+            check=False,
+        )
+        raw = result.stdout.decode("utf-8", errors="strict").strip()
+        if result.returncode == 0 and raw:
+            path = Path(raw)
+            if (
+                not path.is_absolute()
+                or path.name != unit
+                or any(part in {"", ".", ".."} for part in path.parts[1:])
+                or len(raw.encode("utf-8")) > 4096
+            ):
+                raise BenchmarkError(
+                    "scope_identity", "the admitted worker scope identity is invalid"
+                )
+            return raw
+        time.sleep(0.01)
+    raise BenchmarkError("scope_admission", "the worker scope was not admitted")
+
+
+def read_bounded_fd(descriptor: int, limit: int = MAX_CGROUP_OBSERVATION_BYTES) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    observed = 0
+    while True:
+        value = os.read(descriptor, min(4096, limit + 1 - observed))
+        if not value:
+            return b"".join(chunks)
+        chunks.append(value)
+        observed += len(value)
+        if observed > limit:
+            raise BenchmarkError("scope_observation", "a worker scope observation is too large")
+
+
+def open_scope_file(scope: OwnedScope, name: str, flags: int) -> int:
+    return os.open(name, flags | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=scope.cgroup_fd)
+
+
+def scope_processes(scope: OwnedScope) -> set[int]:
+    try:
+        descriptor = open_scope_file(scope, "cgroup.procs", os.O_RDONLY)
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ENODEV}:
+            return set()
+        raise
+    try:
+        try:
+            raw = read_bounded_fd(descriptor).decode("ascii", errors="strict")
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ENODEV}:
+                return set()
+            raise
+    finally:
+        os.close(descriptor)
+    values = raw.splitlines()
+    if any(not value.isdigit() or int(value) <= 1 for value in values):
+        raise BenchmarkError("scope_observation", "worker scope processes are invalid")
+    return {int(value) for value in values}
+
+
+def scope_is_populated(scope: OwnedScope) -> bool:
+    try:
+        descriptor = open_scope_file(scope, "cgroup.events", os.O_RDONLY)
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ENODEV}:
+            return False
+        raise
+    try:
+        raw = read_bounded_fd(descriptor).decode("ascii", errors="strict")
+    except OSError as error:
+        if error.errno in {errno.ENODEV, errno.ENOENT}:
+            return False
+        raise
+    finally:
+        os.close(descriptor)
+    values = [line.removeprefix("populated ") for line in raw.splitlines() if line.startswith("populated ")]
+    if len(values) != 1 or values[0] not in {"0", "1"}:
+        raise BenchmarkError("scope_observation", "worker scope population is invalid")
+    return values[0] == "1"
+
+
+def wait_scope_empty(scope: OwnedScope, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if not scope_is_populated(scope):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def kill_scope(scope: OwnedScope) -> None:
+    try:
+        os.write(scope.kill_fd, b"1")
+    except OSError as error:
+        if error.errno not in {errno.ENOENT, errno.ENODEV}:
+            raise BenchmarkError(
+                "worker_cleanup_incomplete", "the owned worker scope could not be killed"
+            ) from error
+
+
+def signal_scope(scope: OwnedScope, sent_signal: signal.Signals) -> None:
+    for pid in scope_processes(scope):
+        try:
+            pidfd = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            continue
+        try:
+            signal.pidfd_send_signal(pidfd, sent_signal)
+        except ProcessLookupError:
+            pass
+        finally:
+            os.close(pidfd)
+
+
+def stopped_process(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return False
+    fields = raw[raw.rfind(")") + 2 :].split()
+    return bool(fields) and fields[0] in {"T", "t"}
+
+
+def admit_scope(unit: str, process: subprocess.Popen[bytes]) -> OwnedScope:
+    deadline = time.monotonic() + SCOPE_ADMISSION_SECONDS
+    relative = scope_control_group(unit, deadline)
+    cgroup = Path("/sys/fs/cgroup") / relative.removeprefix("/")
+    cgroup_fd = os.open(
+        cgroup,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    scope: OwnedScope | None = None
+    try:
+        kill_fd = os.open(
+            "cgroup.kill",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=cgroup_fd,
+        )
+        scope = OwnedScope(unit, cgroup_fd, kill_fd, -1, -1)
+        while time.monotonic() < deadline:
+            processes = scope_processes(scope)
+            if len(processes) == 1:
+                entry_pid = next(iter(processes))
+                if stopped_process(entry_pid):
+                    pidfd = os.pidfd_open(entry_pid, 0)
+                    scope.entry_pid = entry_pid
+                    scope.entry_pidfd = pidfd
+                    if scope_processes(scope) != {entry_pid} or not stopped_process(entry_pid):
+                        raise BenchmarkError(
+                            "scope_identity", "the worker scope entry identity changed"
+                        )
+                    signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                    return scope
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+        raise BenchmarkError("scope_admission", "the worker scope entry did not stop")
+    except BaseException:
+        if scope is not None:
+            try:
+                kill_scope(scope)
+            finally:
+                scope.close()
+        else:
+            os.close(cgroup_fd)
+        raise
+
+
+def stop_transient_unit(unit: str, process: subprocess.Popen[bytes]) -> None:
+    result = subprocess.run(
+        ["/usr/bin/systemctl", "--user", "stop", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=systemd_control_environment(),
+        timeout=3,
+        check=False,
+    )
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=3)
+    deadline = time.monotonic() + SCOPE_TERMINATION_SECONDS
+    while time.monotonic() < deadline:
+        observed = subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=ControlGroup",
+                "--value",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=systemd_control_environment(),
+            timeout=1,
+            check=False,
+        )
+        if observed.returncode != 0 or not observed.stdout.strip():
+            return
+        time.sleep(0.01)
+    if result.returncode != 0:
+        raise BenchmarkError(
+            "worker_cleanup_incomplete", "an unbound worker scope could not be stopped"
+        )
+    raise BenchmarkError(
+        "worker_cleanup_incomplete", "an unbound worker scope remained observable"
+    )
+
+
+def start_owned_scope(
+    entry_argv: list[os.PathLike[str] | str],
+    runtime_seconds: float,
+    stream: Any,
+) -> tuple[subprocess.Popen[bytes], OwnedScope]:
+    unit = unique_scope_unit()
+    command = [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--expand-environment=no",
+        f"--unit={unit}",
+        "--property=KillMode=control-group",
+        "--property=SendSIGKILL=yes",
+        f"--property=RuntimeMaxSec={math.ceil(runtime_seconds + 5)}s",
+        f"--property=TimeoutStopSec={math.ceil(SCOPE_TERMINATION_SECONDS)}s",
+        *[os.fspath(value) for value in entry_argv],
+    ]
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            env=systemd_control_environment(),
+            start_new_session=True,
+        )
+        scope = admit_scope(unit, process)
+    except BaseException:
+        if process is not None:
+            stop_transient_unit(unit, process)
+        raise
+    return process, scope
+
+
+def run_scope_entry(arguments: list[str]) -> int:
+    if len(arguments) != 6 or arguments[0] != "--":
+        return 126
+    _, root_raw, target_raw, linker, receipt_raw, search_path = arguments
+    os.kill(os.getpid(), signal.SIGSTOP)
+    try:
+        root = Path(root_raw).resolve(strict=True)
+        target = Path(target_raw)
+        receipt = Path(receipt_raw)
+        path_entries = search_path.split(os.pathsep)
+        if (
+            linker not in LINKERS
+            or not target.is_absolute()
+            or not receipt.is_absolute()
+            or not path_entries
+            or any(not Path(value).is_absolute() or not Path(value).is_dir() for value in path_entries)
+        ):
+            return 126
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)
+        os.environ.clear()
+        os.environ.update(
+            {
+                "HOME": os.fspath(home),
+                "PATH": search_path,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            }
+        )
+        capabilities = require_capabilities(root)
+        environment = worker_environment(root, target, linker, capabilities)
+        verify = root / "scripts/verify"
+        os.execve(
+            verify,
+            [os.fspath(verify), "fast", "--receipt", os.fspath(receipt)],
+            environment,
+        )
+    except (BenchmarkError, OSError):
+        return 126
+    return 126
+
+
+def run_nested_fixture(arguments: list[str]) -> int:
+    if len(arguments) != 2 or arguments[0] != "--":
+        return 126
+    output = Path(arguments[1])
+    os.kill(os.getpid(), signal.SIGSTOP)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=closed_child_environment(),
+        start_new_session=True,
+    )
+    output.write_text(f"{os.getpid()} {child.pid}\n", encoding="ascii")
+    return child.wait()
+
+
+ProcessRecord = tuple[int, int, str, int]
+
+
+def process_table() -> dict[int, ProcessRecord]:
+    observed: dict[int, ProcessRecord] = {}
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text(encoding="utf-8")
+            fields = raw[raw.rfind(")") + 2 :].split()
+            parent = int(fields[1])
+            process_group = int(fields[2])
+            executable = (entry / "exe").resolve(strict=True).name
+            resident_pages = int((entry / "statm").read_text(encoding="ascii").split()[1])
+        except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
+            continue
+        observed[int(entry.name)] = (
+            parent,
+            process_group,
+            executable,
+            resident_pages * page_size,
+        )
+    return observed
+
+
+def is_descendant(pid: int, roots: set[int], table: dict[int, ProcessRecord]) -> bool:
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        if pid in roots:
+            return True
+        seen.add(pid)
+        record = table.get(pid)
+        if record is None:
+            return False
+        pid = record[0]
+    return False
+
+
+def is_worker_owned(pid: int, roots: set[int], table: dict[int, ProcessRecord]) -> bool:
+    record = table.get(pid)
+    return record is not None and (record[1] in roots or is_descendant(pid, roots, table))
+
+
+def foreign_build_count(
+    roots: set[int],
+    table: dict[int, ProcessRecord] | None = None,
+    build_executables: frozenset[str] = frozenset(KNOWN_BUILD_EXECUTABLES),
+) -> int:
+    table = process_table() if table is None else table
+    return sum(
+        1
+        for pid, (_, _, executable, _) in table.items()
+        if is_build_executable(executable, build_executables)
+        and not is_worker_owned(pid, roots, table)
+    )
+
+
+def foreign_build_executables(
+    roots: set[int],
+    table: dict[int, ProcessRecord] | None = None,
+    build_executables: frozenset[str] = frozenset(KNOWN_BUILD_EXECUTABLES),
+) -> list[str]:
+    table = process_table() if table is None else table
+    return sorted(
+        {
+            executable
+            for pid, (_, _, executable, _) in table.items()
+            if is_build_executable(executable, build_executables)
+            and not is_worker_owned(pid, roots, table)
+        }
+    )
+
+
+def is_build_executable(executable: str, build_executables: frozenset[str]) -> bool:
+    return executable in build_executables or BUILD_EXECUTABLE_PATTERN.search(executable) is not None
+
+
+def wait_for_foreign_build_quiescence(
+    *,
+    build_executables: frozenset[str] = frozenset(KNOWN_BUILD_EXECUTABLES),
+    quiet_seconds: float = OVERLAP_QUIET_SECONDS,
+    wait_seconds: float = OVERLAP_WAIT_SECONDS,
+) -> None:
+    deadline = time.monotonic() + wait_seconds
+    quiet_since: float | None = None
+    while True:
+        now = time.monotonic()
+        if foreign_build_count(set(), build_executables=build_executables) == 0:
+            quiet_since = now if quiet_since is None else quiet_since
+            if now - quiet_since >= quiet_seconds:
+                return
+        else:
+            quiet_since = None
+        if now >= deadline:
+            raise BenchmarkError(
+                "foreign_build_wait", "another build did not become quiescent"
+            )
+        time.sleep(0.05)
+
+
+def descendant_rss_kib(roots: set[int], table: dict[int, ProcessRecord]) -> int:
+    return sum(
+        resident_bytes
+        for pid, (_, _, _, resident_bytes) in table.items()
+        if is_worker_owned(pid, roots, table)
+    ) // 1024
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def load_receipt(
+    path: Path, source: SourceIdentity, expected_target: Path
+) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BenchmarkError("invalid_receipt", "a worker receipt is unavailable") from error
+    if (
+        document.get("schema_version") != 1
+        or document.get("document_type") != "glaeda-local-verification-receipt"
+        or document.get("authority") != "performance_observation_only"
+        or document.get("profile") != "fast"
+    ):
+        raise BenchmarkError("invalid_receipt", "a worker receipt has the wrong contract")
+    source_doc = document.get("source")
+    result = document.get("result")
+    plan = document.get("plan")
+    environment = document.get("environment")
+    phases = document.get("phases")
+    if not all(isinstance(value, dict) for value in (source_doc, result, plan, environment)):
+        raise BenchmarkError("invalid_receipt", "a worker receipt is incomplete")
+    if (
+        source_doc.get("commit") != source.commit
+        or source_doc.get("tree") != source.tree
+        or source_doc.get("unchanged") is not True
+        or result.get("exit_code") != 0
+        or plan.get("declared_phase_count") != len(FAST_PHASES)
+        or plan.get("executed_phase_count") != len(FAST_PHASES)
+        or not isinstance(phases, list)
+        or tuple(value.get("name") for value in phases) != FAST_PHASES
+        or any(value.get("exit_code") != 0 for value in phases)
+    ):
+        raise BenchmarkError("invalid_receipt", "a worker receipt failed semantic validation")
+    cargo_jobs = environment.get("cargo_build_jobs")
+    cargo_target = environment.get("cargo_target")
+    if (
+        not isinstance(cargo_jobs, dict)
+        or cargo_jobs.get("source") != "configured"
+        or cargo_jobs.get("value") != BUILD_JOBS
+        or not isinstance(cargo_target, dict)
+        or cargo_target.get("source") != "configured"
+    ):
+        raise BenchmarkError("invalid_receipt", "a worker receipt lost its resource identity")
+    expected_identity = hashlib.sha256(b"glaeda-local-verification-path-v1\0")
+    expected_identity.update(os.fsencode(expected_target.resolve(strict=False)))
+    if cargo_target.get("identity_digest") != f"sha256:{expected_identity.hexdigest()}":
+        raise BenchmarkError("invalid_receipt", "a worker receipt names another target")
+    numeric = (
+        result.get("elapsed_seconds"),
+        result.get("child_user_cpu_seconds"),
+        result.get("child_system_cpu_seconds"),
+        result.get("process_lifetime_child_max_rss_kib"),
+    )
+    if any(not isinstance(value, (int, float)) or value < 0 for value in numeric):
+        raise BenchmarkError("invalid_receipt", "a worker receipt has invalid measurements")
+    return document
+
+
+def help_digest(target: Path, root: Path) -> str:
+    binary = target / "debug" / "glaeda"
+    result = subprocess.run(
+        [binary, "--help"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=closed_child_environment(),
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > 128 * 1024:
+        raise BenchmarkError("binary_validation", "a built CLI failed semantic validation")
+    return f"sha256:{hashlib.sha256(result.stdout).hexdigest()}"
+
+
+def target_stats(path: Path) -> dict[str, int]:
+    entries = 0
+    logical = 0
+    allocated = 0
+    for current, directories, files in os.walk(path, followlinks=False):
+        for name in [*directories, *files]:
+            candidate = Path(current) / name
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise BenchmarkError("target_symlink", "a benchmark target contains a symlink")
+            entries += 1
+            logical += metadata.st_size
+            allocated += metadata.st_blocks * 512
+    return {"entries": entries, "logical_bytes": logical, "allocated_bytes": allocated}
+
+
+def summarize(values: list[float]) -> dict[str, float]:
+    ordered = sorted(values)
+    p90_index = max(0, (len(ordered) * 9 + 9) // 10 - 1)
+    return {
+        "minimum": ordered[0],
+        "median": statistics.median(ordered),
+        "p90": ordered[p90_index],
+        "maximum": ordered[-1],
+    }
+
+
+def measured_order(
+    arms: list[tuple[str, int]], round_index: int
+) -> list[tuple[str, int]]:
+    if not arms or round_index < 0:
+        raise BenchmarkError("invalid_schedule", "the measured schedule is invalid")
+    offset = round_index % len(arms)
+    return arms[offset:] + arms[:offset]
+
+
+def schedule_is_position_balanced(
+    arms: list[tuple[str, int]], samples: int
+) -> bool:
+    if not arms or samples <= 0 or samples % len(arms) != 0:
+        return False
+    positions = {arm: [0] * len(arms) for arm in arms}
+    for round_index in range(samples):
+        for position, arm in enumerate(measured_order(arms, round_index)):
+            positions[arm][position] += 1
+    expected = samples // len(arms)
+    return all(count == expected for counts in positions.values() for count in counts)
+
+
+def stop_workers(workers: list[Worker]) -> None:
+    errors: list[str] = []
+    for worker in workers:
+        try:
+            signal_scope(worker.scope, signal.SIGTERM)
+        except (BenchmarkError, OSError):
+            errors.append("signal")
+    grace_deadline = time.monotonic() + SCOPE_TERMINATION_SECONDS
+    while time.monotonic() < grace_deadline:
+        try:
+            if all(not scope_is_populated(worker.scope) for worker in workers):
+                break
+        except (BenchmarkError, OSError):
+            errors.append("observe")
+            break
+        time.sleep(0.01)
+    for worker in workers:
+        try:
+            if scope_is_populated(worker.scope):
+                kill_scope(worker.scope)
+        except (BenchmarkError, OSError):
+            errors.append("kill")
+    for worker in workers:
+        try:
+            worker.process.wait(timeout=SCOPE_TERMINATION_SECONDS + 1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(worker.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                worker.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                errors.append("reap")
+    for worker in workers:
+        try:
+            if not wait_scope_empty(worker.scope, SCOPE_TERMINATION_SECONDS):
+                errors.append("populated")
+        except (BenchmarkError, OSError):
+            errors.append("observe")
+        finally:
+            worker.scope.close()
+    if errors:
+        raise BenchmarkError(
+            "worker_cleanup_incomplete", "an owned worker scope did not settle"
+        )
+
+
+def finish_workers(workers: list[Worker]) -> None:
+    unsettled = False
+    errors: list[str] = []
+    for worker in workers:
+        try:
+            if scope_is_populated(worker.scope):
+                unsettled = True
+                kill_scope(worker.scope)
+        except (BenchmarkError, OSError):
+            errors.append("observe")
+    for worker in workers:
+        try:
+            if not wait_scope_empty(worker.scope, SCOPE_TERMINATION_SECONDS):
+                errors.append("populated")
+        except (BenchmarkError, OSError):
+            errors.append("observe")
+        finally:
+            worker.scope.close()
+    if errors:
+        raise BenchmarkError(
+            "worker_cleanup_incomplete", "an owned worker scope did not settle"
+        )
+    if unsettled:
+        raise BenchmarkError(
+            "unsettled_worker_scope", "a worker left descendants after its leader exited"
+        )
+
+
+def touch_source(path: Path, original: os.stat_result, last_ns: int) -> int:
+    now = max(time.time_ns(), last_ns + 1)
+    os.utime(path, ns=(original.st_atime_ns, now), follow_symlinks=False)
+    return now
+
+
+def run_batch(
+    *,
+    root: Path,
+    experiment: Path,
+    source: SourceIdentity,
+    capabilities: Capabilities,
+    linker: str,
+    width: int,
+    phase: str,
+    index: int,
+    retry: int = 0,
+) -> dict[str, Any]:
+    if foreign_build_count(
+        set(), build_executables=capabilities.build_executables
+    ) != 0:
+        raise BenchmarkError("foreign_build_overlap", "another build is already active")
+    workers: list[Worker] = []
+    started = time.monotonic()
+    batch_timeout_seconds = 180.0 if phase == "cold" else 90.0
+    try:
+        for worker_index in range(width):
+            target = experiment / "targets" / linker / f"worker-{worker_index}"
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            retry_suffix = "" if retry == 0 else f"-retry-{retry}"
+            name = f"{phase}-{linker}-w{width}-{index}-{worker_index}{retry_suffix}"
+            receipt = experiment / "receipts" / f"{name}.json"
+            log = experiment / "logs" / f"{name}.log"
+            stream = log.open("xb")
+            process: subprocess.Popen[bytes] | None = None
+            scope: OwnedScope | None = None
+            worker: Worker | None = None
+            try:
+                with DeferredRegistrationInterrupt():
+                    process, scope = start_owned_scope(
+                        [
+                            sys.executable,
+                            Path(__file__).resolve(strict=True),
+                            INTERNAL_SCOPE_ENTRY,
+                            "--",
+                            root,
+                            target,
+                            linker,
+                            receipt,
+                            capability_search_path(capabilities),
+                        ],
+                        batch_timeout_seconds,
+                        stream,
+                    )
+                    worker = Worker(process, receipt, log, target, scope)
+                    workers.append(worker)
+            except BaseException:
+                if worker is not None and all(
+                    registered is not worker for registered in workers
+                ):
+                    stop_workers([worker])
+                elif worker is None and process is not None and scope is not None:
+                    stop_workers([Worker(process, receipt, log, target, scope)])
+                raise
+            finally:
+                stream.close()
+    except BaseException as error:
+        try:
+            stop_workers(workers)
+        except BenchmarkError as cleanup_error:
+            raise cleanup_error from error
+        if isinstance(error, BenchmarkError):
+            raise
+        if isinstance(error, (OSError, subprocess.SubprocessError)):
+            raise BenchmarkError(
+                "worker_spawn", "a verification worker could not start"
+            ) from error
+        raise
+    overlap = False
+    overlap_executables: set[str] = set()
+    sampled_descendant_rss_peak_kib = 0
+    deadline = started + batch_timeout_seconds
+    try:
+        while any(worker.process.poll() is None for worker in workers):
+            table = process_table()
+            roots: set[int] = set()
+            for worker in workers:
+                roots.update(scope_processes(worker.scope))
+            foreign = foreign_build_executables(
+                roots, table, capabilities.build_executables
+            )
+            if foreign:
+                overlap = True
+                overlap_executables.update(foreign)
+            sampled_descendant_rss_peak_kib = max(
+                sampled_descendant_rss_peak_kib, descendant_rss_kib(roots, table)
+            )
+            if time.monotonic() >= deadline:
+                stop_workers(workers)
+                raise BenchmarkError("batch_timeout", "a verification batch exceeded its deadline")
+            time.sleep(0.05)
+    except BaseException:
+        stop_workers(workers)
+        raise
+    elapsed = time.monotonic() - started
+    finish_workers(workers)
+    if any(worker.process.returncode != 0 for worker in workers):
+        raise BenchmarkError("worker_failed", "a verification worker failed")
+
+    observations = []
+    help_digests = []
+    for worker in workers:
+        receipt = load_receipt(worker.receipt, source, worker.target)
+        result = receipt["result"]
+        help_digests.append(help_digest(worker.target, root))
+        observations.append(
+            {
+                "receipt_sha256": sha256_file(worker.receipt),
+                "elapsed_seconds": result["elapsed_seconds"],
+                "child_cpu_seconds": round(
+                    result["child_user_cpu_seconds"] + result["child_system_cpu_seconds"], 6
+                ),
+                "waited_child_max_rss_kib": result["process_lifetime_child_max_rss_kib"],
+                "phase_seconds": {
+                    value["name"]: value["elapsed_seconds"] for value in receipt["phases"]
+                },
+            }
+        )
+    if len(set(help_digests)) != 1:
+        raise BenchmarkError("binary_validation", "worker CLI output differs within an arm")
+    return {
+        "phase": phase,
+        "linker": linker,
+        "width": width,
+        "index": index,
+        "retry": retry,
+        "foreign_build_overlap_observed": overlap,
+        "foreign_build_executables": sorted(overlap_executables),
+        "batch_wall_seconds": round(elapsed, 9),
+        "completed_loops_per_second": round(width / elapsed, 9),
+        "child_cpu_seconds_sum": round(
+            sum(value["child_cpu_seconds"] for value in observations), 6
+        ),
+        "worst_waited_child_max_rss_kib": max(
+            value["waited_child_max_rss_kib"] for value in observations
+        ),
+        "sampled_descendant_rss_peak_kib": sampled_descendant_rss_peak_kib,
+        "help_sha256": help_digests[0],
+        "workers": observations,
+    }
+
+
+def machine_observation() -> dict[str, int | str]:
+    values: dict[str, int] = {}
+    for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+        name, raw = line.split(":", 1)
+        if name in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+            values[f"{name.lower()}_kib"] = int(raw.split()[0])
+    return {
+        "kernel": platform.release(),
+        "architecture": platform.machine(),
+        "logical_cpu_count": os.cpu_count() or 0,
+        "effective_cpu_count": len(os.sched_getaffinity(0)),
+        **values,
+    }
+
+
+def aggregate(
+    source: SourceIdentity,
+    tools: dict[str, str],
+    tool_path_identity_sha256: str,
+    samples: int,
+    observations: list[dict[str, Any]],
+    discarded_overlap_batches: list[dict[str, Any]],
+    cold_targets: dict[str, list[dict[str, int]]],
+    final_targets: dict[str, list[dict[str, int]]],
+    machine_before: dict[str, int | str],
+    machine_after: dict[str, int | str],
+    storage_before: int,
+    storage_after: int,
+) -> dict[str, Any]:
+    arms = [(linker, width) for linker in LINKERS for width in WIDTHS]
+    position_balanced = schedule_is_position_balanced(arms, samples)
+    measured = [value for value in observations if value["phase"] == "measured"]
+    if any(value["foreign_build_overlap_observed"] for value in observations):
+        raise BenchmarkError(
+            "accepted_overlap", "an accepted observation contains foreign build overlap"
+        )
+    if len({value["help_sha256"] for value in observations}) != 1:
+        raise BenchmarkError("binary_validation", "CLI output differs across linker arms")
+    summaries: dict[str, Any] = {}
+    for linker in LINKERS:
+        for width in WIDTHS:
+            arm = [
+                value
+                for value in measured
+                if value["linker"] == linker and value["width"] == width
+            ]
+            if len(arm) != samples:
+                raise BenchmarkError("incomplete_matrix", "the measured matrix is incomplete")
+            summaries[f"{linker}_width_{width}"] = {
+                "batch_wall_seconds": summarize(
+                    [value["batch_wall_seconds"] for value in arm]
+                ),
+                "completed_loops_per_second": summarize(
+                    [value["completed_loops_per_second"] for value in arm]
+                ),
+                "child_cpu_seconds_sum": summarize(
+                    [value["child_cpu_seconds_sum"] for value in arm]
+                ),
+                "worst_waited_child_max_rss_kib": max(
+                    value["worst_waited_child_max_rss_kib"] for value in arm
+                ),
+                "sampled_descendant_rss_peak_kib": summarize(
+                    [value["sampled_descendant_rss_peak_kib"] for value in arm]
+                ),
+            }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "document_type": "glaeda-linker-concurrency-benchmark-receipt",
+        "authority": "performance_observation_only",
+        "result": "succeeded",
+        "source": {"commit": source.commit, "tree": source.tree},
+        "plan": {
+            "issue": 951,
+            "profile": "fast",
+            "build_jobs_per_loop": BUILD_JOBS,
+            "widths": list(WIDTHS),
+            "linkers": list(LINKERS),
+            "cold_batches_per_linker": 1,
+            "minimum_experiment_available_bytes": MIN_EXPERIMENT_AVAILABLE_BYTES,
+            "warmups_per_arm": 1,
+            "measured_batches_per_arm": samples,
+            "forced_change": "mtime_only_same_tracked_rust_bytes",
+            "primary_gate": "width-4 median throughput >= 10% over GNU with no worse p90 wall",
+            "primary_gate_eligible": position_balanced,
+            "measured_order": "cyclic_latin_positions_v1",
+            "arm_position_balance": "complete" if position_balanced else "incomplete",
+            "overlap_quiet_seconds": OVERLAP_QUIET_SECONDS,
+            "overlap_wait_seconds": OVERLAP_WAIT_SECONDS,
+            "overlap_retry_limit_per_warm_batch": OVERLAP_RETRY_LIMIT,
+        },
+        "semantic_validator": {
+            "exact_source_and_tree": True,
+            "seven_green_fast_phases": True,
+            "source_unchanged": True,
+            "cli_help_equal_across_all_arms": True,
+            "foreign_build_overlap_observed": False,
+            "discarded_overlap_batch_count": len(discarded_overlap_batches),
+        },
+        "resource_semantics": {
+            "waited_child_rss": "per-worker process-lifetime maximum; not concurrent aggregate",
+            "sampled_descendant_rss": "50 ms /proc samples summed over harness-owned worker process trees; short-lived peaks may be missed",
+            "child_cpu": "sum of each worker receipt child user plus system CPU",
+        },
+        "tools": tools,
+        "tool_path_identity_sha256": tool_path_identity_sha256,
+        "worker_environment": {
+            "ambient_keys_forwarded": [],
+            "cargo_config": "effective_user_default_absent",
+            "linker_driver": "exact_resolved_clang",
+            "linker_selection": "explicit_fuse_ld_per_arm",
+        },
+        "machine_before": machine_before,
+        "machine_after": machine_after,
+        "experiment_filesystem": {
+            "available_bytes_before": storage_before,
+            "available_bytes_after": storage_after,
+        },
+        "cold_targets": cold_targets,
+        "final_targets": final_targets,
+        "summaries": summaries,
+        "discarded_overlap_batches": discarded_overlap_batches,
+        "observations": observations,
+    }
+
+
+def write_json(path: Path, document: dict[str, Any]) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(document, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        temporary.unlink()
+        temporary = None
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise BenchmarkError("receipt_write", "the aggregate receipt could not be written") from error
+
+
+def execute(experiment: Path, output: Path, samples: int) -> dict[str, Any]:
+    root = repository_root()
+    source = source_identity(root)
+    capabilities = require_capabilities(root)
+    storage_before = require_experiment_storage(experiment.parent)
+    create_experiment_root(experiment)
+    source_file = root / "src/lib.rs"
+    original = source_file.stat()
+    machine_before = machine_observation()
+    observations: list[dict[str, Any]] = []
+    discarded_overlap_batches: list[dict[str, Any]] = []
+    cold_targets: dict[str, list[dict[str, int]]] = {}
+    last_ns = original.st_mtime_ns
+    try:
+        for index, linker in enumerate(LINKERS):
+            wait_for_foreign_build_quiescence(
+                build_executables=capabilities.build_executables
+            )
+            observation = run_batch(
+                root=root,
+                experiment=experiment,
+                source=source,
+                capabilities=capabilities,
+                linker=linker,
+                width=4,
+                phase="cold",
+                index=index,
+            )
+            if observation["foreign_build_overlap_observed"]:
+                raise BenchmarkError(
+                    "cold_foreign_build_overlap", "another build overlapped a cold batch"
+                )
+            observations.append(observation)
+            cold_targets[linker] = [
+                target_stats(experiment / "targets" / linker / f"worker-{worker}")
+                for worker in range(4)
+            ]
+
+        arms = [(linker, width) for linker in LINKERS for width in WIDTHS]
+        def run_warm_batch(linker: str, width: int, phase: str, index: int) -> dict[str, Any]:
+            nonlocal last_ns
+            for retry in range(OVERLAP_RETRY_LIMIT + 1):
+                wait_for_foreign_build_quiescence(
+                    build_executables=capabilities.build_executables
+                )
+                last_ns = touch_source(source_file, original, last_ns)
+                observation = run_batch(
+                    root=root,
+                    experiment=experiment,
+                    source=source,
+                    capabilities=capabilities,
+                    linker=linker,
+                    width=width,
+                    phase=phase,
+                    index=index,
+                    retry=retry,
+                )
+                if not observation["foreign_build_overlap_observed"]:
+                    return observation
+                discarded_overlap_batches.append(
+                    {
+                        "phase": phase,
+                        "linker": linker,
+                        "width": width,
+                        "index": index,
+                        "retry": retry,
+                        "batch_wall_seconds": observation["batch_wall_seconds"],
+                        "foreign_build_executables": observation[
+                            "foreign_build_executables"
+                        ],
+                        "receipt_sha256": [
+                            worker["receipt_sha256"]
+                            for worker in observation["workers"]
+                        ],
+                    }
+                )
+            raise BenchmarkError(
+                "foreign_build_retry_exhausted",
+                "another build repeatedly overlapped one warm batch",
+            )
+
+        for index, (linker, width) in enumerate(arms):
+            observations.append(run_warm_batch(linker, width, "warmup", index))
+        for round_index in range(samples):
+            order = measured_order(arms, round_index)
+            for order_index, (linker, width) in enumerate(order):
+                observations.append(
+                    run_warm_batch(
+                        linker,
+                        width,
+                        "measured",
+                        round_index * len(arms) + order_index,
+                    )
+                )
+    finally:
+        os.utime(
+            source_file,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+            follow_symlinks=False,
+        )
+    if source_identity(root) != source:
+        raise BenchmarkError("source_changed", "the exact source changed during the benchmark")
+    final_targets = {
+        linker: [
+            target_stats(experiment / "targets" / linker / f"worker-{worker}")
+            for worker in range(4)
+        ]
+        for linker in LINKERS
+    }
+    document = aggregate(
+        source,
+        capabilities.versions,
+        capabilities.path_identity_sha256,
+        samples,
+        observations,
+        discarded_overlap_batches,
+        cold_targets,
+        final_targets,
+        machine_before,
+        machine_observation(),
+        storage_before,
+        filesystem_available_bytes(experiment),
+    )
+    write_json(output, document)
+    return document
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == INTERNAL_SCOPE_ENTRY:
+        return run_scope_entry(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == INTERNAL_NESTED_FIXTURE:
+        return run_nested_fixture(sys.argv[2:])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment-root", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--samples", type=int, default=9)
+    arguments = parser.parse_args()
+    if not 1 <= arguments.samples <= 18:
+        parser.error("--samples must be between 1 and 18")
+    try:
+        root = repository_root()
+        experiment = ensure_external_new_path(
+            root, arguments.experiment_root, "experiment root"
+        )
+        output = ensure_external_new_path(root, arguments.output, "output")
+        if output.is_relative_to(experiment) or experiment.is_relative_to(output):
+            raise BenchmarkError("unsafe_path", "output and experiment root must be separate")
+        document = execute(experiment, output, arguments.samples)
+    except BenchmarkError as error:
+        print(f"linker benchmark error [{error.code}]: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(document["summaries"], indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

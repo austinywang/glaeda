@@ -2,9 +2,9 @@
 
 ## Purpose
 
-SmolRunner repositories expose one repository-owned command that evaluates whether a checkout is ready for a named verification profile. The first implementation is read-only: it reports workspace capabilities and refuses installation, source mutation, Git mutation, credential use, and publication.
+Glaeda repositories expose one repository-owned command that evaluates whether a checkout is ready for a named verification profile. The first implementation is read-only: it reports workspace capabilities and refuses installation, source mutation, Git mutation, credential use, and publication.
 
-This boundary remains separate from SmolRunner host preparation and issue #148's runner-owned verification-profile execution.
+This boundary remains separate from Glaeda host preparation and issue #148's runner-owned verification-profile execution.
 
 ## Canonical command
 
@@ -19,11 +19,13 @@ The canonical path is `./scripts/bootstrap`. Each adopting repository owns that 
 
 ## Required working directory
 
-The current working directory must equal the resolved Git worktree root. Invocation from a parent directory, subdirectory, or unrelated worktree ends in `blocked`. The SmolRunner root must contain a `[package]` entry named `smolrunner` in `Cargo.toml` and a committed `Cargo.lock`.
+The current working directory must equal the resolved Git worktree root. Invocation from a parent directory, subdirectory, or unrelated worktree ends in `blocked`. The repository root must contain a `[package]` entry named `smolrunner` in `Cargo.toml` and a committed `Cargo.lock`.
+
+The workspace capability receipt is a Glaeda schema v2 identity. Its canonical public repository identity is `teamleaderleo/glaeda`; an observed SmolRunner or other GitHub remote remains a distinct alternate repository. The package marker remains transition-compatible with the retained name. Verification-profile names use the explicit Glaeda successor identities from issue #754. Retained SmolRunner schema v1 receipt/profile fixtures remain historical evidence.
 
 ## Accepted inputs
 
-Schema version 1 accepts only:
+Workspace receipt schema version 2 accepts only:
 
 - `--output human|json`, defaulting to `human`;
 - `--operation verify|commit|publish`, defaulting to `verify`.
@@ -117,18 +119,18 @@ The top-level `state` is exactly one of:
 
 ## Capability receipt schema
 
-Schema version 1 is a bounded object. The cache portion has this form:
+Schema version 2 is a bounded object. The cache portion has this form:
 
 ```json
 {
-  "schema_version": 1,
-  "receipt_type": "smolrunner-workspace-capability-receipt",
+  "schema_version": 2,
+  "receipt_type": "glaeda-workspace-capability-receipt",
   "state": "ready_with_declared_deviations",
   "operation": "verify",
   "repository_root": {
     "kind": "git-worktree",
-    "repository": "teamleaderleo/smolrunner",
-    "expected_repository": "teamleaderleo/smolrunner",
+    "repository": "teamleaderleo/glaeda",
+    "expected_repository": "teamleaderleo/glaeda",
     "required_marker": "Cargo.toml",
     "required_lockfile": "Cargo.lock",
     "working_directory": "repository-root",
@@ -184,9 +186,9 @@ Schema version 1 is a bounded object. The cache portion has this form:
     "authorization": "not-requested"
   },
   "next_verification_profiles": [
-    "smolrunner.required",
-    "smolrunner.doctor",
-    "smolrunner.plan"
+    "glaeda.required",
+    "glaeda.doctor",
+    "glaeda.plan"
   ],
   "deviations": [],
   "blocking_reasons": [],
@@ -198,11 +200,13 @@ The field names `required_tools`, `optional_tools`, `verification_backends`, `fo
 
 ## Verification profile names
 
-Schema version 1 emits:
+Workspace receipt schema version 2 emits the current Glaeda successor profile identities:
 
-- `smolrunner.required` — the complete required suite in `AGENTS.md`;
-- `smolrunner.doctor` — the machine-readable doctor check;
-- `smolrunner.plan` — the reference plan and host-plan smoke checks.
+- `glaeda.required` — exactly the eight checks emitted by `scripts/verify required --plan-json`;
+- `glaeda.doctor` — the machine-readable doctor check;
+- `glaeda.plan` — the reference plan and host-plan smoke checks.
+
+`glaeda.required` names the repository-required AGENTS suite. It does not claim parity with the larger GitHub Actions `Verify` closure, which also runs additional bridge, helper, shell, cross-target, and reference assertions.
 
 This slice identifies names only. It does not select, expand, or run profiles.
 
@@ -222,7 +226,7 @@ No cleanup action is required because the command creates no workspace state. Th
 
 For an unchanged clean checkout and equivalent machine observations, state, source identity, tool observations, cache classifications, profile names, and `capability_fingerprint` remain equivalent. `Cargo.lock` remains byte-identical and Git status remains clean.
 
-The fixture covers unset defaults, relative repository-local paths, absolute external paths, parent escapes, symlinks, wrong ownership, missing directories, private-path suppression, cold and repeated execution, commit readiness, publication refusal, dirty/subdirectory refusal, and lockfile preservation.
+The fixture covers the canonical Glaeda remote, historical SmolRunner and foreign remote classification, unset defaults, relative repository-local paths, absolute external paths, parent escapes, symlinks, wrong ownership, missing directories, private-path suppression, cold and repeated execution, commit readiness, publication refusal, dirty/subdirectory refusal, and lockfile preservation.
 
 ## Explicit exclusions
 

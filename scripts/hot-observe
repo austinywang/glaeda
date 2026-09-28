@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""Observe declared dependency generations and resident services without adopting them."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+MAX_ANCHORS = 16
+MAX_ANCHOR_BYTES = 8 * 1024 * 1024
+MAX_DEPENDENCY_ENTRIES = 250_000
+MAX_OBSERVED_PROCESSES = 8192
+MAX_DESCRIPTORS_PER_PROCESS = 8192
+TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\Z")
+SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class DeclaredFile:
+    label: str
+    path: Path
+    digest: str | None
+    size_bytes: int | None
+
+
+@dataclass(frozen=True)
+class Listener:
+    inode: str
+    exposure: str
+
+
+def bounded_token(value: str, field: str) -> str:
+    if not TOKEN.fullmatch(value) or ".." in value:
+        raise RuntimeError(f"{field} must be bounded safe ASCII")
+    return value
+
+
+def canonical_sha256(value: str) -> str:
+    if not SHA256.fullmatch(value):
+        raise RuntimeError("runtime executable digest must be canonical SHA-256")
+    return value
+
+
+def hash_file(path: Path, label: str) -> tuple[str, int]:
+    try:
+        details = path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"declared file {label} is absent") from error
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+        raise RuntimeError(f"declared file {label} is not one regular no-follow file")
+    if details.st_size > MAX_ANCHOR_BYTES:
+        raise RuntimeError(f"declared file {label} exceeds the observation bound")
+    digest = hashlib.sha256()
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    with os.fdopen(descriptor, "rb") as source:
+        opened = os.fstat(source.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            details.st_dev,
+            details.st_ino,
+        ):
+            raise RuntimeError(f"declared file {label} changed before observation")
+        if opened.st_size > MAX_ANCHOR_BYTES:
+            raise RuntimeError(f"declared file {label} exceeds the observation bound")
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+        final = os.fstat(source.fileno())
+    if (
+        final.st_size,
+        final.st_mtime_ns,
+        final.st_ctime_ns,
+    ) != (
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    ):
+        raise RuntimeError(f"declared file {label} changed during observation")
+    return f"sha256:{digest.hexdigest()}", opened.st_size
+
+
+def parse_declared_files(
+    values: list[str],
+    role: str,
+    *,
+    allow_absent: bool = False,
+    contained_by: Path | None = None,
+) -> list[DeclaredFile]:
+    if not values or len(values) > MAX_ANCHORS:
+        raise RuntimeError(f"{role} files must contain one to {MAX_ANCHORS} entries")
+    parsed: list[DeclaredFile] = []
+    labels: set[str] = set()
+    for value in values:
+        label, separator, raw_path = value.partition("=")
+        if not separator or not raw_path:
+            raise RuntimeError(f"{role} files must use LABEL=PATH")
+        bounded_token(label, f"{role} label")
+        if label in labels:
+            raise RuntimeError(f"{role} labels must be unique")
+        labels.add(label)
+        path = Path(os.path.abspath(raw_path))
+        if contained_by is not None:
+            try:
+                relative = path.relative_to(contained_by)
+            except ValueError as error:
+                raise RuntimeError(f"declared file {label} is outside its state root") from error
+            current = contained_by
+            for component in relative.parts[:-1]:
+                current /= component
+                try:
+                    parent_details = current.lstat()
+                except FileNotFoundError:
+                    break
+                if stat.S_ISLNK(parent_details.st_mode) or not stat.S_ISDIR(
+                    parent_details.st_mode
+                ):
+                    raise RuntimeError(
+                        f"declared file {label} has an unsafe parent chain"
+                    )
+        try:
+            digest, size_bytes = hash_file(path, label)
+        except RuntimeError as error:
+            if allow_absent and not path.exists() and not path.is_symlink():
+                digest, size_bytes = None, None
+            else:
+                raise error
+        parsed.append(DeclaredFile(label, path, digest, size_bytes))
+    return sorted(parsed, key=lambda item: item.label)
+
+
+def scan_dependency_root(root: Path) -> dict[str, int | bool] | None:
+    try:
+        root_details = root.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(root_details.st_mode) or not stat.S_ISDIR(root_details.st_mode):
+        raise RuntimeError("dependency root is not one directory without symlink traversal")
+
+    entry_count = 1
+    logical_bytes = root_details.st_size
+    allocated_bytes = root_details.st_blocks * 512
+    for current, directories, files in os.walk(root, followlinks=False):
+        for name in [*directories, *files]:
+            details = (Path(current) / name).lstat()
+            entry_count += 1
+            if entry_count > MAX_DEPENDENCY_ENTRIES:
+                raise RuntimeError("dependency root exceeds the entry observation bound")
+            logical_bytes += details.st_size
+            allocated_bytes += details.st_blocks * 512
+    return {
+        "entry_count": entry_count,
+        "logical_bytes": logical_bytes,
+        "allocated_bytes": allocated_bytes,
+        "owner_match": root_details.st_uid == os.getuid(),
+        "group_or_other_writable": bool(root_details.st_mode & 0o022),
+    }
+
+
+def generation_digest(
+    project_id: str,
+    runtime_id: str,
+    runtime_sha256: str,
+    parents: list[DeclaredFile],
+    anchors: list[DeclaredFile],
+) -> str | None:
+    if any(item.digest is None for item in [*parents, *anchors]):
+        return None
+    digest = hashlib.sha256(b"glaeda-observed-dependency-generation-v1\0")
+    for value in (project_id, runtime_id, runtime_sha256):
+        digest.update(value.encode("ascii") + b"\0")
+    for role, files in ((b"parent", parents), (b"anchor", anchors)):
+        for item in files:
+            digest.update(role + b"\0")
+            digest.update(item.label.encode("ascii") + b"\0")
+            digest.update(item.digest.encode("ascii") + b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def dependency_report(arguments: argparse.Namespace) -> dict[str, object]:
+    project_id = bounded_token(arguments.project_id, "project ID")
+    runtime_id = bounded_token(arguments.runtime_id, "runtime ID")
+    runtime_sha256 = canonical_sha256(arguments.runtime_sha256)
+    parents = parse_declared_files(arguments.parent, "parent")
+    root = Path(os.path.abspath(arguments.dependency_root))
+    anchors = parse_declared_files(
+        arguments.anchor,
+        "anchor",
+        allow_absent=True,
+        contained_by=root,
+    )
+    parent_by_label = {item.label: item for item in parents}
+    anchor_by_label = {item.label: item for item in anchors}
+    shared_labels = sorted(parent_by_label.keys() & anchor_by_label.keys())
+    if not shared_labels:
+        raise RuntimeError("at least one parent and dependency anchor label must be shared")
+
+    physical = scan_dependency_root(root)
+    comparisons = [
+        {
+            "label": label,
+            "matches": (
+                anchor_by_label[label].digest is not None
+                and parent_by_label[label].digest == anchor_by_label[label].digest
+            ),
+        }
+        for label in shared_labels
+    ]
+    anchors_after = parse_declared_files(
+        arguments.anchor,
+        "anchor",
+        allow_absent=True,
+        contained_by=root,
+    )
+    anchor_window_stable = [item.digest for item in anchors] == [
+        item.digest for item in anchors_after
+    ]
+    aligned = (
+        all(item.digest is not None for item in anchors)
+        and all(item["matches"] for item in comparisons)
+        and anchor_window_stable
+    )
+    if physical is None:
+        state = "absent"
+    elif aligned:
+        state = "anchor_aligned"
+    else:
+        state = "revalidate_required"
+
+    return {
+        "schema_version": 1,
+        "document_type": "glaeda-hot-dependency-observation",
+        "authority": "observation_only",
+        "project_id": project_id,
+        "state": state,
+        "generation_id": generation_digest(
+            project_id, runtime_id, runtime_sha256, parents, anchors
+        ),
+        "runtime": {"id": runtime_id, "program_sha256": runtime_sha256},
+        "parents": [
+            {
+                "label": item.label,
+                "present": item.digest is not None,
+                "sha256": item.digest,
+                "size_bytes": item.size_bytes,
+            }
+            for item in parents
+        ],
+        "anchors": [
+            {
+                "label": item.label,
+                "present": item.digest is not None,
+                "sha256": item.digest,
+                "size_bytes": item.size_bytes,
+            }
+            for item in anchors
+        ],
+        "comparisons": comparisons,
+        "anchor_window_stable": anchor_window_stable,
+        "physical": physical,
+        "semantic_limit": "declared_anchors_only",
+    }
+
+
+def listener_exposure(address: str, family: str) -> str:
+    if set(address) == {"0"}:
+        return "any"
+    if family == "tcp" and address == "0100007F":
+        return "loopback"
+    if family == "tcp6" and address == "00000000000000000000000001000000":
+        return "loopback"
+    return "other"
+
+
+def read_listeners(port: int) -> list[Listener]:
+    listeners: list[Listener] = []
+    for family in ("tcp", "tcp6"):
+        path = Path(f"/proc/net/{family}")
+        try:
+            lines = path.read_text(encoding="ascii").splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            fields = line.split()
+            local_address, local_port = fields[1].split(":")
+            if fields[3] != "0A" or int(local_port, 16) != port:
+                continue
+            listeners.append(
+                Listener(fields[9], listener_exposure(local_address, family))
+            )
+    return listeners
+
+
+def process_ids_for_sockets(inodes: set[str]) -> dict[int, set[str]]:
+    if not inodes:
+        return {}
+    matches: dict[int, set[str]] = {}
+    observed_processes = 0
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        observed_processes += 1
+        if observed_processes > MAX_OBSERVED_PROCESSES:
+            raise RuntimeError("process observation exceeds the process bound")
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            descriptors = entry / "fd"
+            descriptor_entries = list(descriptors.iterdir())
+            if len(descriptor_entries) > MAX_DESCRIPTORS_PER_PROCESS:
+                raise RuntimeError("process observation exceeds the descriptor bound")
+            observed = {
+                target.removeprefix("socket:[").removesuffix("]")
+                for descriptor in descriptor_entries
+                if (target := os.readlink(descriptor)).startswith("socket:[")
+            }
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        owned = observed & inodes
+        if owned:
+            matches[int(entry.name)] = owned
+    return matches
+
+
+def read_process_stat(pid: int) -> tuple[int, int, int]:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    remainder = raw[raw.rfind(")") + 2 :].split()
+    return int(remainder[19]), int(remainder[11]), int(remainder[12])
+
+
+def process_rss_kib(pid: int) -> int | None:
+    for line in Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+    return None
+
+
+def hash_process_executable(pid: int) -> str:
+    digest = hashlib.sha256()
+    with Path(f"/proc/{pid}/exe").open("rb") as executable:
+        opened = os.fstat(executable.fileno())
+        while chunk := executable.read(1024 * 1024):
+            digest.update(chunk)
+        final = os.fstat(executable.fileno())
+    if (
+        final.st_dev,
+        final.st_ino,
+        final.st_size,
+        final.st_mtime_ns,
+        final.st_ctime_ns,
+    ) != (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    ):
+        raise RuntimeError("resident service executable changed during observation")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def observe_process(
+    pid: int,
+    socket_inodes: set[str],
+    expected_workspace: os.stat_result,
+    expected_runtime_sha256: str,
+    expected_exposure: str,
+    project_id: str,
+    service_id: str,
+    port: int,
+) -> dict[str, object]:
+    start_time, user_ticks, system_ticks = read_process_stat(pid)
+    executable_digest = hash_process_executable(pid)
+    workspace = os.stat(f"/proc/{pid}/cwd")
+    workspace_match = (workspace.st_dev, workspace.st_ino) == (
+        expected_workspace.st_dev,
+        expected_workspace.st_ino,
+    )
+    process_identity = hashlib.sha256(b"glaeda-resident-process-observation-v1\0")
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_bytes().strip()
+    for value in (
+        boot_id,
+        str(start_time).encode("ascii"),
+        str(workspace.st_dev).encode("ascii"),
+        str(workspace.st_ino).encode("ascii"),
+        executable_digest.encode("ascii"),
+        project_id.encode("ascii"),
+        service_id.encode("ascii"),
+    ):
+        process_identity.update(value + b"\0")
+    for inode in sorted(socket_inodes):
+        process_identity.update(inode.encode("ascii") + b"\0")
+    final_start_time, _, _ = read_process_stat(pid)
+    live_inodes = {item.inode for item in read_listeners(port)}
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    uptime_seconds = float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
+    return {
+        "process_identity": f"sha256:{process_identity.hexdigest()}",
+        "runtime_sha256": executable_digest,
+        "runtime_match": executable_digest == expected_runtime_sha256,
+        "workspace_match": workspace_match,
+        "owner_match": Path(f"/proc/{pid}").stat().st_uid == os.getuid(),
+        "observation_window_stable": (
+            final_start_time == start_time and socket_inodes <= live_inodes
+        ),
+        "age_millis": max(0, round((uptime_seconds - start_time / ticks_per_second) * 1000)),
+        "cpu_time_millis": round(
+            (user_ticks + system_ticks) * 1000 / ticks_per_second
+        ),
+        "rss_kib": process_rss_kib(pid),
+        "expected_exposure": expected_exposure,
+    }
+
+
+def service_report(arguments: argparse.Namespace) -> dict[str, object]:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("resident service observation requires Linux procfs")
+    project_id = bounded_token(arguments.project_id, "project ID")
+    service_id = bounded_token(arguments.service_id, "service ID")
+    runtime_id = bounded_token(arguments.runtime_id, "runtime ID")
+    runtime_sha256 = canonical_sha256(arguments.runtime_sha256)
+    if not 0 < arguments.port < 65536:
+        raise RuntimeError("listener port must be between 1 and 65535")
+    workspace = Path(os.path.abspath(arguments.workspace))
+    workspace_details = workspace.lstat()
+    if stat.S_ISLNK(workspace_details.st_mode) or not stat.S_ISDIR(workspace_details.st_mode):
+        raise RuntimeError("expected workspace is not one no-follow directory")
+
+    listeners = read_listeners(arguments.port)
+    listener_inodes = {listener.inode for listener in listeners}
+    process_map = process_ids_for_sockets(listener_inodes)
+    resolved_inodes = set().union(*process_map.values()) if process_map else set()
+    unresolved_listener_count = len(listener_inodes - resolved_inodes)
+    observations: list[dict[str, object]] = []
+    for pid, inodes in process_map.items():
+        try:
+            observation = observe_process(
+                pid,
+                inodes,
+                workspace_details,
+                runtime_sha256,
+                arguments.exposure,
+                project_id,
+                service_id,
+                arguments.port,
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            unresolved_listener_count += len(inodes)
+            continue
+        process_exposures = sorted(
+            {listener.exposure for listener in listeners if listener.inode in inodes}
+        )
+        observation["exposures"] = process_exposures
+        observation["exposure_match"] = process_exposures == [arguments.exposure]
+        observations.append(observation)
+
+    matched = [
+        item
+        for item in observations
+        if item["runtime_match"]
+        and item["workspace_match"]
+        and item["owner_match"]
+        and item["observation_window_stable"]
+        and item["exposure_match"]
+    ]
+    if not listeners:
+        state = "absent"
+    elif unresolved_listener_count or len(observations) != 1:
+        state = "ambiguous"
+    elif len(matched) == 1:
+        state = "physical_match"
+    else:
+        state = "drift"
+
+    return {
+        "schema_version": 1,
+        "document_type": "glaeda-resident-service-observation",
+        "authority": "observation_only",
+        "project_id": project_id,
+        "service_id": service_id,
+        "state": state,
+        "runtime": {"id": runtime_id, "program_sha256": runtime_sha256},
+        "listener_count": len(listeners),
+        "process_count": len(observations),
+        "unresolved_listener_count": unresolved_listener_count,
+        "process": observations[0] if len(observations) == 1 else None,
+        "semantic_limit": "physical_process_only",
+    }
+
+
+def render_human(report: dict[str, object]) -> str:
+    lines = [
+        f"{report['document_type']}: {report['state']}",
+        f"authority: {report['authority']}",
+        f"project: {report['project_id']}",
+    ]
+    if report["document_type"] == "glaeda-hot-dependency-observation":
+        physical = report["physical"]
+        lines.append(f"generation: {report['generation_id']}")
+        if physical is not None:
+            lines.append(
+                "physical: "
+                f"entries={physical['entry_count']} "
+                f"logical_bytes={physical['logical_bytes']} "
+                f"allocated_bytes={physical['allocated_bytes']}"
+            )
+    else:
+        lines.append(f"service: {report['service_id']}")
+        lines.append(
+            f"listeners={report['listener_count']} processes={report['process_count']}"
+        )
+    lines.append(f"semantic limit: {report['semantic_limit']}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", choices=("human", "json"), default="human")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    dependency = subparsers.add_parser("dependency")
+    dependency.add_argument("--project-id", required=True)
+    dependency.add_argument("--dependency-root", required=True)
+    dependency.add_argument("--runtime-id", required=True)
+    dependency.add_argument("--runtime-sha256", required=True)
+    dependency.add_argument("--parent", action="append", default=[])
+    dependency.add_argument("--anchor", action="append", default=[])
+
+    service = subparsers.add_parser("service")
+    service.add_argument("--project-id", required=True)
+    service.add_argument("--service-id", required=True)
+    service.add_argument("--workspace", required=True)
+    service.add_argument("--runtime-id", required=True)
+    service.add_argument("--runtime-sha256", required=True)
+    service.add_argument("--port", type=int, required=True)
+    service.add_argument("--exposure", choices=("loopback", "any"), default="loopback")
+
+    arguments = parser.parse_args()
+    try:
+        report = (
+            dependency_report(arguments)
+            if arguments.command == "dependency"
+            else service_report(arguments)
+        )
+    except RuntimeError as error:
+        print(f"hot-observe error: {error}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError):
+        print("hot-observe error: bounded host observation failed", file=sys.stderr)
+        return 2
+    if arguments.output == "json":
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(render_human(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

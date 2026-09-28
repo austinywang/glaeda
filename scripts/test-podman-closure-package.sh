@@ -7,8 +7,8 @@ if [[ $EUID -ne 0 ]]; then
   printf 'error: disposable package probe must run as uid 0\n' >&2
   exit 1
 fi
-if [[ ${SMOLRUNNER_DISPOSABLE_PROBE:-} != github-hosted-ubuntu ]]; then
-  printf 'error: disposable package probe requires the explicit hosted-CI gate\n' >&2
+if [[ ${GLAEDA_DISPOSABLE_PROBE:-} != 1 ]]; then
+  printf 'error: disposable package probe requires the explicit dangerous integration gate\n' >&2
   exit 1
 fi
 

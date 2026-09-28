@@ -1031,9 +1031,9 @@ mod tests {
         let digest = prepared_template.guest_image_digest().as_str();
 
         for input in [
-            include_str!("../examples/lima/smolrunner-work.yaml"),
-            include_str!("../examples/lima/smolrunner-interactive.yaml"),
-            include_str!("../examples/lima/smolrunner-prepared-template.yaml"),
+            include_str!("../examples/lima/glaeda-work.yaml"),
+            include_str!("../examples/lima/glaeda-interactive.yaml"),
+            include_str!("../examples/lima/glaeda-prepared-template.yaml"),
         ] {
             let document: serde_yaml::Value = serde_yaml::from_str(input).unwrap();
             assert_eq!(
@@ -1077,7 +1077,7 @@ mod tests {
         }
 
         let production: serde_yaml::Value = serde_yaml::from_str(include_str!(
-            "../examples/lima/smolrunner-prepared-template.yaml"
+            "../examples/lima/glaeda-prepared-template.yaml"
         ))
         .unwrap();
         assert_eq!(

@@ -1,16 +1,16 @@
 #![cfg(target_os = "linux")]
 
-use smolrunner::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
-use smolrunner::host_preparation_plan::{
+use glaeda::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
+use glaeda::host_preparation_plan::{
     HostReadinessSourceIdentity, SourceExecutableIdentity, SourceRootlessPodmanIdentity,
     SourceRunnerAccountIdentity,
 };
-use smolrunner::host_preparation_receipt_binding::{
+use glaeda::host_preparation_receipt_binding::{
     HostPreparationReceiptBindingErrorKind, MAX_HOST_PREPARATION_SOURCE_DIGEST_BYTES,
     digest_host_preparation_source,
 };
-use smolrunner::host_readiness::HostObservationState;
-use smolrunner::rootless_podman_preflight::RootlessPodmanPreflightState;
+use glaeda::host_readiness::HostObservationState;
+use glaeda::rootless_podman_preflight::RootlessPodmanPreflightState;
 
 const PRIVATE_OVERSIZED_MARKER: &str = "PRIVATE_OVERSIZED_SOURCE_SENTINEL";
 

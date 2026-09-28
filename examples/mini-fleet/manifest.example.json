@@ -1,0 +1,168 @@
+{
+  "schema": "glaeda-mini-fleet/v1",
+  "fleet": "example build minis",
+  "ssh_user": "builder",
+  "never_touch": [
+    "coordinator-mini"
+  ],
+  "lan": {
+    "subnet": "10.0.8.",
+    "auth": "agent",
+    "note": "the minis reach each other's port 22 on this LAN; ssh -A from the operator lends the source its key"
+  },
+  "runner": {
+    "org": "example-org"
+  },
+  "keys": {
+    "coordinator": {
+      "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "comment": "fleet-coordinator",
+      "role": "fleet coordinator",
+      "status": "keep",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExampl fleet-coordinator"
+    },
+    "operator": {
+      "fingerprint": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "comment": "operator laptop",
+      "role": "operator",
+      "status": "keep"
+    },
+    "service-cache": {
+      "fingerprint": "SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "comment": "cache service",
+      "role": "service; owner decides",
+      "status": "review"
+    }
+  },
+  "hardware": {
+    "m4pro-48": {
+      "model": "Mac16,11",
+      "chip": "Apple M4 Pro",
+      "cpus": 14,
+      "memory_gib": 48,
+      "acceptance": {
+        "xcode_build": "17C529",
+        "candidate": "59ca9c9bd1bb",
+        "node": "cmux-mac-001"
+      }
+    },
+    "m4-16": {
+      "model": "Mac16,10",
+      "chip": "Apple M4",
+      "memory_gib": 16,
+      "compile_lane": false
+    }
+  },
+  "defaults": {
+    "macos": {
+      "major": 26,
+      "min": "26.5"
+    },
+    "xcode": {
+      "apps": [
+        {
+          "path": "/Applications/Xcode.app",
+          "version": "26.3",
+          "build": "17C529"
+        },
+        {
+          "path": "/Applications/Xcode_26.3.app",
+          "version": "26.3",
+          "build": "17C529",
+          "clone_from": "/Applications/Xcode.app"
+        }
+      ],
+      "select": "/Applications/Xcode.app/Contents/Developer",
+      "license": "26.3",
+      "pending": [
+        {
+          "path": "/Applications/Xcode_26.6.app",
+          "version": "26.6",
+          "build": "17F113",
+          "note": "next CI pin"
+        }
+      ]
+    },
+    "authorized_keys": {
+      "require": [
+        "coordinator",
+        "operator"
+      ],
+      "allow": [
+        "service-cache"
+      ],
+      "exclusive": true,
+      "no_backups": false
+    },
+    "launchd": {
+      "running": [
+        "com.example.build-worker"
+      ]
+    },
+    "disk": {
+      "min_free_gib": 100
+    },
+    "controller_token": "present",
+    "toolchain": {
+      "xcode": {
+        "app": "/Applications/Xcode.app",
+        "version": "26.3",
+        "build": "17C529",
+        "select": true
+      },
+      "metal": true,
+      "zig_min": "0.16.0",
+      "rustup_default": "stable",
+      "python_min": "3.13",
+      "cmux": {
+        "repo": "manaflow-ai/cmux",
+        "ref": "main",
+        "root": "~/cmux",
+        "submodule_depth": 1
+      }
+    }
+  },
+  "hosts": {
+    "build-mini-1": {
+      "hostname": "build-mini-1",
+      "node_id": "cmux-mac-001",
+      "hardware": "m4pro-48",
+      "class": "std",
+      "availability": "dedicated",
+      "roles": [
+        "dev-builds",
+        "ci-runner"
+      ],
+      "sudo": "password"
+    },
+    "build-mini-2": {
+      "hostname": "Build-Mini-2",
+      "node_id": "cmux-mac-002",
+      "hardware": "m4pro-48",
+      "class": "std",
+      "availability": "dedicated",
+      "roles": [
+        "nightly",
+        "ios-simulators"
+      ],
+      "sudo": "password"
+    },
+    "small-mini": {
+      "hostname": "small-mini",
+      "hardware": "m4-16",
+      "class": "light",
+      "availability": "dedicated",
+      "note": "runs other services; record only",
+      "overrides": {
+        "apply": false,
+        "disk": {
+          "min_free_gib": 40
+        }
+      },
+      "roles": [
+        "cache-host"
+      ],
+      "sudo": "nopasswd"
+    }
+  }
+}

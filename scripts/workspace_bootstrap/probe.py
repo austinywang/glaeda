@@ -1,4 +1,4 @@
-"""Bounded, read-only observations for the SmolRunner workspace receipt."""
+"""Bounded, read-only observations for the Glaeda workspace receipt."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-EXPECTED_REPOSITORY = "teamleaderleo/smolrunner"
-PROFILE_NAMES = ["smolrunner.required", "smolrunner.doctor", "smolrunner.plan"]
+EXPECTED_REPOSITORY = "teamleaderleo/glaeda"
+PROFILE_NAMES = ["glaeda.required", "glaeda.doctor", "glaeda.plan"]
 VERSION_RE = re.compile(r"\b\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9.-]+)?\b")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUIRED_COMMANDS = [
@@ -157,7 +157,9 @@ def package_marker_matches(root: Path) -> bool:
     package = re.search(r"(?ms)^\[package\]\s*(.*?)(?=^\[|\Z)", text)
     return bool(
         package
-        and re.search(r'(?m)^\s*name\s*=\s*"smolrunner"\s*$', package.group(1))
+        and re.search(
+            r'(?m)^\s*name\s*=\s*"(?:glaeda|smolrunner)"\s*$', package.group(1)
+        )
     )
 
 

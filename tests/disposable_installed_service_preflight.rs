@@ -6,17 +6,17 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde::Serialize;
-use serde_json::Value;
-use sha2::{Digest as _, Sha256};
-use smolrunner::artifact::Sha256Digest;
-use smolrunner::disposable_launchd_service::{
+use glaeda::artifact::Sha256Digest;
+use glaeda::disposable_launchd_service::{
     DISPOSABLE_LAUNCHD_SERVICE_LABEL, DisposableLaunchdServiceDesiredState,
     plan_disposable_launchd_service,
 };
-use smolrunner::disposable_worker_enrollment::{
+use glaeda::disposable_worker_enrollment::{
     MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
 };
+use serde::Serialize;
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 const OPT_IN_ENV: &str = "SMOLRUNNER_INSTALLED_SERVICE_ACCEPTANCE";
 const OPT_IN_TOKEN: &str = "preflight-identities";

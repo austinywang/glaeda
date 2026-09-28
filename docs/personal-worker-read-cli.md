@@ -1,11 +1,11 @@
 # Personal worker read CLI
 
-SmolRunner exposes three read-only commands for one already-published personal-worker snapshot:
+Glaeda exposes three read-only commands for one already-published personal-worker snapshot:
 
 ```text
-smolrunner worker status --store-root /absolute/state/root
-smolrunner queue list --store-root /absolute/state/root --revision 7 --generation 11 --offset 0 --limit 100
-smolrunner job show --store-root /absolute/state/root --revision 7 --generation 11 JOB_ID
+glaeda worker status --store-root /absolute/state/root
+glaeda queue list --store-root /absolute/state/root --revision 7 --generation 11 --offset 0 --limit 100
+glaeda job show --store-root /absolute/state/root --revision 7 --generation 11 JOB_ID
 ```
 
 Use `--output json` for the schema-versioned machine-readable views. Human output is deterministic and intended for operator inspection.

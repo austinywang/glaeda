@@ -204,11 +204,11 @@ impl std::error::Error for LocalInstallCargoConfigPreflightError {}
 
 /// Prove the isolated self-build Cargo lookup path from direct filesystem evidence.
 ///
-/// The observation runs twice. Private directory/file identities participate in snapshot equality,
-/// including change-time evidence for same-inode entry churn, but never enter the public receipt.
-/// Any difference becomes one bounded `observation_changed` refusal. No source-checkout or
-/// personal-home Cargo path is inspected unless it is literally an ancestor of the selected
-/// isolated build root.
+/// The observation runs twice. Exact private directories and config files retain change-time
+/// evidence; shared lineage directories retain stable entry identity without treating unrelated
+/// sibling churn as configuration drift. Any relevant difference becomes one bounded
+/// `observation_changed` refusal. No source-checkout or personal-home Cargo path is inspected
+/// unless it is literally an ancestor of the selected isolated build root.
 #[must_use]
 pub fn observe_local_install_cargo_config_preflight(
     context: &LocalInstallCargoConfigPreflightContext,
@@ -222,7 +222,7 @@ fn observe_with(
 ) -> LocalInstallCargoConfigPreflightReceipt {
     let first = snapshot(context, filesystem);
     let second = snapshot(context, filesystem);
-    if first != second {
+    if !first.same_as(&second) {
         return changed_receipt();
     }
     first.public_receipt()
@@ -239,6 +239,20 @@ struct PrivateSnapshot {
 }
 
 impl PrivateSnapshot {
+    fn same_as(&self, other: &Self) -> bool {
+        self.build_root.same_exact_as(&other.build_root)
+            && self.work.same_exact_as(&other.work)
+            && self.home.same_exact_as(&other.home)
+            && self.target.same_exact_as(&other.target)
+            && self.lineage.len() == other.lineage.len()
+            && self
+                .lineage
+                .iter()
+                .zip(&other.lineage)
+                .all(|(left, right)| left.same_as(right))
+            && self.cargo_home.same_as(&other.cargo_home)
+    }
+
     fn public_receipt(&self) -> LocalInstallCargoConfigPreflightReceipt {
         let build_root = build_root_disposition(self);
         let lineage_config = lineage_disposition(&self.lineage);
@@ -516,6 +530,16 @@ struct ObjectIdentity {
     change_nanoseconds: i128,
 }
 
+impl ObjectIdentity {
+    fn same_path_entry_as(&self, other: &Self) -> bool {
+        self.device == other.device
+            && self.inode == other.inode
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryObservation {
     Missing,
@@ -531,6 +555,17 @@ impl DirectoryObservation {
 
     fn is_unsafe_or_unknown(self) -> bool {
         matches!(self, Self::Unsafe | Self::Unknown)
+    }
+
+    fn same_exact_as(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn same_path_entry_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ready(left), Self::Ready(right)) => left.same_path_entry_as(right),
+            _ => self == other,
+        }
     }
 }
 
@@ -565,6 +600,15 @@ struct LineageObservation {
 }
 
 impl LineageObservation {
+    fn same_as(&self, other: &Self) -> bool {
+        self.ancestor.same_path_entry_as(&other.ancestor)
+            && self
+                .cargo_directory
+                .same_path_entry_as(&other.cargo_directory)
+            && self.modern == other.modern
+            && self.legacy == other.legacy
+    }
+
     fn unsafe_evidence(&self) -> bool {
         matches!(
             (
@@ -614,6 +658,12 @@ impl CargoHomeObservation {
             modern: ConfigObservation::Missing,
             legacy: ConfigObservation::Missing,
         }
+    }
+
+    fn same_as(&self, other: &Self) -> bool {
+        self.directory.same_exact_as(&other.directory)
+            && self.modern == other.modern
+            && self.legacy == other.legacy
     }
 }
 
@@ -715,7 +765,7 @@ fn inspect_open_directory(
                 && u64::from(mode) == u64::from(PRIVATE_DIRECTORY_MODE)
         }
         DirectoryExpectation::TrustedAncestor => {
-            trusted_owner(stat.st_uid, stat.st_gid, context) && mode & 0o022 == 0
+            trusted_ancestor_is_ready(stat.st_uid, stat.st_gid, u64::from(mode), context)
         }
     };
     if !metadata_ok {
@@ -790,7 +840,18 @@ fn inspect_config_file(
 }
 
 fn trusted_owner(uid: u32, gid: u32, context: &LocalInstallCargoConfigPreflightContext) -> bool {
-    (uid == 0 && gid == 0) || (uid == context.runner_uid && gid == context.runner_gid)
+    uid == 0 || (uid == context.runner_uid && gid == context.runner_gid)
+}
+
+fn trusted_ancestor_is_ready(
+    uid: u32,
+    gid: u32,
+    mode: u64,
+    context: &LocalInstallCargoConfigPreflightContext,
+) -> bool {
+    trusted_owner(uid, gid, context)
+        && mode & 0o002 == 0
+        && (mode & 0o020 == 0 || (uid == context.runner_uid && gid == context.runner_gid))
 }
 
 fn normal_components(path: &Path) -> Vec<&OsStr> {
@@ -910,6 +971,23 @@ mod tests {
 
     fn context() -> LocalInstallCargoConfigPreflightContext {
         LocalInstallCargoConfigPreflightContext::new("/var/lib/smolrunner-build", 501, 20).unwrap()
+    }
+
+    #[test]
+    fn runner_owned_primary_group_write_does_not_add_ambient_authority() {
+        let context = context();
+        assert!(trusted_ancestor_is_ready(501, 20, 0o775, &context));
+        assert!(!trusted_ancestor_is_ready(0, 0, 0o775, &context));
+        assert!(!trusted_ancestor_is_ready(501, 20, 0o777, &context));
+        assert!(!trusted_ancestor_is_ready(777, 20, 0o755, &context));
+    }
+
+    #[test]
+    fn root_owned_system_group_is_trusted_only_without_group_write() {
+        let context = context();
+        assert!(trusted_owner(0, 80, &context));
+        assert!(trusted_ancestor_is_ready(0, 80, 0o755, &context));
+        assert!(!trusted_ancestor_is_ready(0, 80, 0o775, &context));
     }
 
     fn identity(seed: u64) -> ObjectIdentity {

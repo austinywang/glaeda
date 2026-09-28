@@ -1,0 +1,324 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/teamleaderleo/glaeda/examples/cmux-fleet/enrollment-v1.schema.json",
+  "title": "Glaeda CMUX fleet enrollment v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "nodeId",
+    "architecture",
+    "os",
+    "hardwareCapabilityClass",
+    "supportedToolchainGenerations",
+    "roleProfiles",
+    "allowedExecutionRoles",
+    "operatorFleetScope",
+    "enrollmentGeneration",
+    "glaedaGeneration",
+    "state",
+    "quarantineReason"
+  ],
+  "properties": {
+    "schema": {
+      "const": "glaeda-cmux-fleet-enrollment/v1"
+    },
+    "nodeId": {
+      "type": "string",
+      "pattern": "^cmux-[a-z0-9][a-z0-9-]{2,59}$"
+    },
+    "architecture": {
+      "enum": [
+        "arm64",
+        "x86_64"
+      ]
+    },
+    "os": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "versionClass"
+      ],
+      "properties": {
+        "family": {
+          "enum": [
+            "macos",
+            "linux"
+          ]
+        },
+        "versionClass": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"
+        }
+      }
+    },
+    "hardwareCapabilityClass": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"
+    },
+    "supportedToolchainGenerations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+    },
+    "allowedExecutionRoles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "cmux_linux_ci",
+          "cmux_macos_native_build"
+        ]
+      }
+    },
+    "operatorFleetScope": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"
+    },
+    "enrollmentGeneration": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "glaedaGeneration": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "state": {
+      "enum": [
+        "discovered",
+        "enrolling",
+        "eligible",
+        "draining",
+        "quarantined",
+        "retired"
+      ]
+    },
+    "quarantineReason": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "enum": [
+            "dirty_canonical_checkout",
+            "disk_pressure",
+            "failed_acceptance",
+            "hardware_failure",
+            "service_mismatch",
+            "stale_glaeda_generation",
+            "toolchain_mismatch",
+            "unexplained_process_settlement"
+          ]
+        }
+      ]
+    },
+    "classAcceptanceSha256": {
+      "description": "Present only on a node made eligible by a class acceptance: that class receipt's receiptSha256.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "roleProfiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cmux_macos_native_build": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "generation"
+          ],
+          "properties": {
+            "id": {
+              "const": "cmux.macos.dev-check"
+            },
+            "generation": {
+              "const": 1
+            }
+          }
+        },
+        "cmux_linux_ci": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "generation"
+          ],
+          "properties": {
+            "id": {
+              "const": "cmux.ci.guard"
+            },
+            "generation": {
+              "const": 1
+            }
+          }
+        }
+      },
+      "minProperties": 1,
+      "maxProperties": 2
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "quarantined"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "quarantineReason": {
+            "type": "string"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "quarantineReason": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "os": {
+            "properties": {
+              "family": {
+                "const": "macos"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "allowedExecutionRoles": {
+            "items": {
+              "not": {
+                "enum": [
+                  "cmux_linux_agent",
+                  "cmux_linux_ci"
+                ]
+              }
+            }
+          },
+          "architecture": {
+            "const": "arm64"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "os": {
+            "properties": {
+              "family": {
+                "const": "linux"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "allowedExecutionRoles": {
+            "items": {
+              "not": {
+                "enum": [
+                  "cmux_macos_native_build",
+                  "cmux_macos_test"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "os": {
+            "properties": {
+              "family": {
+                "const": "macos"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "roleProfiles": {
+            "required": [
+              "cmux_macos_native_build"
+            ],
+            "not": {
+              "required": [
+                "cmux_linux_ci"
+              ]
+            }
+          },
+          "architecture": {
+            "const": "arm64"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "os": {
+            "properties": {
+              "family": {
+                "const": "linux"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "roleProfiles": {
+            "required": [
+              "cmux_linux_ci"
+            ],
+            "not": {
+              "required": [
+                "cmux_macos_native_build"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "knownRole": {
+      "description": "CMUX fleet role vocabulary. Roles become enrolable only after an exact reviewed acceptance workload lands.",
+      "enum": [
+        "artifact_cache",
+        "background_replay",
+        "benchmark",
+        "cmux_linux_agent",
+        "cmux_linux_ci",
+        "cmux_macos_native_build",
+        "cmux_macos_test",
+        "diagnostic"
+      ]
+    }
+  }
+}

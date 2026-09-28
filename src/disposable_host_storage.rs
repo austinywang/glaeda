@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn exact_private_directory_is_observed_without_exposing_its_path() {
         let root = TempRoot::new(0o700);
-        let storage = DisposableHostStorage::new(root.0.clone(), 1).unwrap();
+        let storage = DisposableHostStorage {
+            lima_home: root.0.clone(),
+            required_available_bytes: 0,
+        };
         assert!(storage.admits_new_worker().unwrap());
     }
 

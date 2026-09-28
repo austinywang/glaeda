@@ -7,26 +7,26 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput, ExecutionAdmissionRecord,
     ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
     PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
     PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
     encode_personal_worker_store_document,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use rustix::fs::{FlockOperation, flock};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE: u64 = 9_000_000;
@@ -191,11 +191,11 @@ fn load_store(root: &TempRoot) -> PersonalWorkerStoreDocument {
         .expect("current document")
 }
 
-fn run_smolrunner(arguments: &[&OsStr]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_smolrunner"))
+fn run_glaeda(arguments: &[&OsStr]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_glaeda"))
         .args(arguments)
         .output()
-        .expect("run installed smolrunner binary")
+        .expect("run installed glaeda binary")
 }
 
 fn cancel_arguments<'a>(
@@ -235,7 +235,7 @@ fn queued_cancellation_applies_once_and_exact_replay_is_duplicate() {
     let root = TempRoot::new("queued");
     create_store(&root, &queued_document());
 
-    let applied = run_smolrunner(&cancel_arguments(
+    let applied = run_glaeda(&cancel_arguments(
         &root,
         "1",
         "1",
@@ -262,7 +262,7 @@ fn queued_cancellation_applies_once_and_exact_replay_is_duplicate() {
     );
 
     let before_duplicate = current_bytes(&root);
-    let duplicate = run_smolrunner(&cancel_arguments(
+    let duplicate = run_glaeda(&cancel_arguments(
         &root,
         "2",
         "2",
@@ -283,7 +283,7 @@ fn queued_cancellation_applies_once_and_exact_replay_is_duplicate() {
 fn conflicts_stale_expectations_and_missing_identity_are_bounded() {
     let root = TempRoot::new("errors");
     create_store(&root, &queued_document());
-    let applied = run_smolrunner(&cancel_arguments(
+    let applied = run_glaeda(&cancel_arguments(
         &root,
         "1",
         "1",
@@ -299,7 +299,7 @@ fn conflicts_stale_expectations_and_missing_identity_are_bounded() {
         ("2", "1", "9001000", "queued-one", "stale_queue_generation"),
         ("2", "2", "9001000", "missing-one", "not_found"),
     ] {
-        let output = run_smolrunner(&cancel_arguments(
+        let output = run_glaeda(&cancel_arguments(
             &root,
             revision,
             generation,
@@ -318,7 +318,7 @@ fn active_cancellation_is_refused_without_drain_evidence() {
     create_store(&root, &active_document());
     let before = current_bytes(&root);
 
-    let output = run_smolrunner(&cancel_arguments(
+    let output = run_glaeda(&cancel_arguments(
         &root,
         "1",
         "1",
@@ -338,7 +338,7 @@ fn active_cancellation_is_refused_without_drain_evidence() {
 #[test]
 fn missing_state_invalid_inputs_and_lock_contention_do_not_mutate() {
     let missing = TempRoot::new("missing");
-    let missing_output = run_smolrunner(&cancel_arguments(
+    let missing_output = run_glaeda(&cancel_arguments(
         &missing,
         "1",
         "1",
@@ -357,7 +357,7 @@ fn missing_state_invalid_inputs_and_lock_contention_do_not_mutate() {
         ("0", "queued-one", "invalid_cancellation_time"),
         ("9001000", "../private-id", "invalid_request_id"),
     ] {
-        let output = run_smolrunner(&cancel_arguments(&root, "1", "1", cancelled_at, request_id));
+        let output = run_glaeda(&cancel_arguments(&root, "1", "1", cancelled_at, request_id));
         assert!(!output.status.success());
         let text = String::from_utf8(output.stdout).expect("UTF-8 error JSON");
         let json: serde_json::Value = serde_json::from_str(&text).expect("error JSON");
@@ -373,7 +373,7 @@ fn missing_state_invalid_inputs_and_lock_contention_do_not_mutate() {
         .open(root.store_directory().join("store.lock"))
         .expect("open writer lock");
     flock(&lock, FlockOperation::NonBlockingLockExclusive).expect("hold writer lock");
-    let busy = run_smolrunner(&cancel_arguments(
+    let busy = run_glaeda(&cancel_arguments(
         &root,
         "1",
         "1",
@@ -412,7 +412,7 @@ fn staged_successor_is_recovered_before_cancellation() {
     .expect("write staged successor");
     fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600)).expect("set staged mode");
 
-    let output = run_smolrunner(&cancel_arguments(
+    let output = run_glaeda(&cancel_arguments(
         &root,
         "2",
         "2",

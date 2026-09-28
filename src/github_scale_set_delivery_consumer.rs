@@ -55,14 +55,53 @@ impl ScaleSetDeliveryConsumerPolicy {
             .source_cpu_count()
             .checked_mul(1_000)
             .ok_or_else(invalid_policy)?;
+        if resources.cpu_millis() < source_cpu_millis
+            || resources.memory_bytes() < prepared_template.source_memory_bytes()
+            || resources.disk_bytes() < prepared_template.source_disk_bytes()
+        {
+            return Err(invalid_policy());
+        }
+        Self::new_with_identity(
+            scale_set_id,
+            repository,
+            owner,
+            request_labels,
+            resources,
+            prepared_template.identity().map_err(|_| invalid_policy())?,
+        )
+    }
+
+    pub(crate) fn new_owned_linux(
+        scale_set_id: u32,
+        repository: &str,
+        owner: &str,
+        request_labels: &[String],
+        resources: DisposableWorkerResources,
+        generation: DisposablePreparedTemplateIdentity,
+    ) -> Result<Self, ScaleSetDeliveryConsumerError> {
+        Self::new_with_identity(
+            scale_set_id,
+            repository,
+            owner,
+            request_labels,
+            resources,
+            generation,
+        )
+    }
+
+    fn new_with_identity(
+        scale_set_id: u32,
+        repository: &str,
+        owner: &str,
+        request_labels: &[String],
+        resources: DisposableWorkerResources,
+        prepared_template_identity: DisposablePreparedTemplateIdentity,
+    ) -> Result<Self, ScaleSetDeliveryConsumerError> {
         if scale_set_id == 0
             || !bounded_token(repository, MAX_REPOSITORY_COMPONENT_BYTES)
             || !bounded_token(owner, MAX_REPOSITORY_COMPONENT_BYTES)
             || request_labels.is_empty()
             || request_labels.len() > MAX_LABELS
-            || resources.cpu_millis() < source_cpu_millis
-            || resources.memory_bytes() < prepared_template.source_memory_bytes()
-            || resources.disk_bytes() < prepared_template.source_disk_bytes()
         {
             return Err(invalid_policy());
         }
@@ -83,9 +122,7 @@ impl ScaleSetDeliveryConsumerPolicy {
             owner: owner.to_owned(),
             request_labels: labels,
             resources,
-            prepared_template_identity: prepared_template
-                .identity()
-                .map_err(|_| invalid_policy())?,
+            prepared_template_identity,
         })
     }
 }

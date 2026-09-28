@@ -19,14 +19,77 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  # Most pull requests change only Python and shell under scripts/, which the Rust and Go jobs cannot judge: of 60
+  # recent PRs, 48 touched nothing they read, and each still spent about 295 runner-seconds on lint, test, cli and go.
+  # Those jobs now run for a pull request only when it changes something they read. A script counts as Rust input
+  # when src/, tests/ or the cli job names it (scripts/bootstrap, for one). Pushes to main run everything, and
+  # scripts and runner-tests always run, since several script tests drive cargo.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      go: ${{ steps.scope.outputs.go }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The pull request's merge commit and its first parent, the base it merges into.
+          fetch-depth: 2
+          persist-credentials: false
+          show-progress: false
+
+      - name: Decide which jobs this change needs
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if test "$EVENT" != pull_request; then
+            printf 'rust=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          rust=false
+          go=false
+          # Scripts that Rust tests run: the modules they load are Rust input too (fleet_bundle.py through
+          # scripts/test-fleet-bundle.py, for one).
+          rust_named=$(grep -rhoE 'scripts/[A-Za-z0-9_./-]+' src tests | sort -u | while read -r f; do
+            if test -f "$f"; then echo "$f"; fi
+          done)
+          # --no-renames lists a rename's old path too; writing to a file first fails the job, not open, on error.
+          git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
+          while IFS= read -r path; do
+            case "$path" in
+              docs/MODULE_INVENTORY.md) rust=true ;;
+              docs/*|*.md) ;;
+              .github/workflows/ci.yml) rust=true; go=true ;;
+              tools/scaleset-bridge/*) go=true ;;
+              scripts/bootstrap|scripts/workspace_bootstrap/*) rust=true ;;
+              .github/*|.claude/*|skills/*) ;;
+              scripts/*)
+                # The script's name as a whole word: glaeda-gh is not named by glaeda-gha-{token}.
+                # shellcheck disable=SC2086
+                if grep -rqwF -- "${path#scripts/}" src tests $rust_named; then
+                  echo "Rust sources or the scripts they run name $path"
+                  rust=true
+                fi
+                ;;
+              *) rust=true ;;
+            esac
+          done < "$RUNNER_TEMP/changed"
+          printf 'rust=%s\ngo=%s\n' "$rust" "$go" | tee -a "$GITHUB_OUTPUT"
+
+  go:
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          persist-credentials: false
           show-progress: false
 
       - name: Install pinned Go toolchain
@@ -39,11 +102,419 @@ jobs:
         working-directory: tools/scaleset-bridge
         run: |
           go mod verify
-          gofmt -d -e . | tee /tmp/smolrunner-scaleset-gofmt.diff
-          test ! -s /tmp/smolrunner-scaleset-gofmt.diff
+          gofmt -d -e . | tee /tmp/glaeda-scaleset-gofmt.diff
+          test ! -s /tmp/glaeda-scaleset-gofmt.diff
           go vet ./...
           go test ./...
-          go build -trimpath -o /tmp/smolrunner-scaleset-bridge .
+          go build -trimpath -o /tmp/glaeda-scaleset-bridge .
+
+
+  # Script syntax and every script test file but the runner's, which runner-tests shards.
+  scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
+      - name: Validate and test scripts
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          paths = [
+              Path("smolrunner"),
+              Path("scripts/bootstrap"),
+              Path("scripts/benchmark-hot-state-fanout"),
+              Path("scripts/benchmark-pnpm-task-dependencies"),
+              Path("scripts/benchmark-linker-throughput"),
+              Path("scripts/hot-observe"),
+              Path("scripts/hot-pressure-shadow"),
+              Path("scripts/hot-run-python"),
+              Path("scripts/hot_run_impl.py"),
+              Path("scripts/verify"),
+              Path("scripts/verify-focused"),
+              Path("scripts/verify-required"),
+              Path("scripts/verify_focused_impl.py"),
+              Path("scripts/provider_neutral_request.py"),
+              Path("scripts/owner_local_dispatch.py"),
+              Path("scripts/owner-local-dispatch"),
+              Path("scripts/test-provider-neutral-request.py"),
+              Path("scripts/test-owner-local-dispatch.py"),
+              Path("scripts/owned_linux_task.py"),
+              Path("scripts/owned_linux_admission.py"),
+              Path("scripts/owned_linux_jit_task.py"),
+              Path("scripts/external_execution_request.py"),
+              Path("scripts/trusted_agent_dispatch.py"),
+              Path("scripts/owned-admission-control"),
+              Path("scripts/test-owned-linux-admission.py"),
+              Path("scripts/test-owned-linux-jit-task.py"),
+              Path("scripts/test-external-execution-request.py"),
+              Path("scripts/test-trusted-agent-dispatch.py"),
+              Path("scripts/cmux_fleet.py"),
+              Path("scripts/cmux_fleet_bootstrap.py"),
+              Path("scripts/glaeda-mini-setup"),
+              Path("scripts/test-glaeda-mini-setup.py"),
+              Path("scripts/glaeda-mini-enroll"),
+              Path("scripts/test-glaeda-mini-enroll.py"),
+              Path("scripts/glaeda-cmux-runner"),
+              Path("scripts/glaeda-cmux-runner-hook"),
+              Path("scripts/glaeda_fleet_labels.py"),
+              Path("scripts/glaeda_reservation.py"),
+              Path("scripts/test-glaeda-cmux-runner.py"),
+              Path("scripts/glaeda-cmux-runner-fleet"),
+              Path("scripts/test-glaeda-cmux-runner-fleet.py"),
+              Path("scripts/glaeda-mini-fleet"),
+              Path("scripts/test-glaeda-mini-fleet.py"),
+              Path("scripts/glaeda-fleet-status"),
+              Path("scripts/test-glaeda-fleet-status.py"),
+              Path("scripts/glaeda-route"),
+              Path("scripts/test-glaeda-route.py"),
+              Path("scripts/cmux_execution_roles.py"),
+              Path("scripts/test-cmux-fleet.py"),
+              Path("scripts/test-cmux-execution-roles.py"),
+              Path("scripts/test-cmux-fleet-bootstrap.py"),
+              Path("scripts/cmux_workload_request.py"),
+              Path("scripts/test-cmux-workload-request.py"),
+              Path("scripts/owned-fleet-benchmark"),
+              Path("scripts/test-owned-fleet-benchmark.py"),
+              *Path("scripts/owned_fleet_benchmark").glob("*.py"),
+              Path("scripts/test-verify-focused.py"),
+              Path("scripts/verify-changed-rustfmt"),
+              Path("scripts/test-hot-run.py"),
+              Path("scripts/test-hot-pressure-shadow.py"),
+              Path("scripts/test-benchmark-hot-state-fanout.py"),
+              Path("scripts/test-benchmark-pnpm-task-dependencies.py"),
+              Path("scripts/test-benchmark-linker-throughput.py"),
+              Path("scripts/test-hot-observe.py"),
+              Path("scripts/glaeda-disk"),
+              Path("scripts/test-glaeda-disk.py"),
+              Path("scripts/glaeda-procs"),
+              Path("scripts/test-glaeda-procs.py"),
+              Path("scripts/glaeda-local-guard"),
+              Path("scripts/test-glaeda-local-guard.py"),
+              Path("scripts/glaeda-update"),
+              Path("scripts/glaeda_release.py"),
+              Path("scripts/test-glaeda-update.py"),
+              Path("scripts/glaeda-fleet-cas-prune"),
+              Path("scripts/test-glaeda-fleet-cas-prune.py"),
+              Path("scripts/glaeda-seed-prefetch"),
+              Path("scripts/test-glaeda-seed-prefetch.py"),
+              Path("scripts/glaeda-idle-warm"),
+              Path("scripts/test-glaeda-idle-warm.py"),
+              Path("scripts/glaeda-mini-health"),
+              Path("scripts/test-glaeda-mini-health.py"),
+              Path("scripts/glaeda-seed-serve"),
+              Path("scripts/glaeda-seed-lan"),
+              Path("scripts/test-glaeda-seed-lan.py"),
+              Path("scripts/glaeda-lan-fetch"),
+              Path("scripts/test-glaeda-lan-fetch.py"),
+              Path("scripts/glaeda-gh"),
+              Path("scripts/test-glaeda-gh.py"),
+              Path("scripts/test-verify.py"),
+              Path("scripts/test-verify-changed-rustfmt.py"),
+              Path("scripts/test-front-door.py"),
+              Path("scripts/project_disk_physical_receipt.py"),
+              Path("scripts/test_project_disk_physical_receipt.py"),
+              Path("scripts/quarry_sweep_impl.py"),
+              Path("scripts/test-quarry-sweep.py"),
+              Path("scripts/quarry_parallel_impl.py"),
+              Path("scripts/test-quarry-parallel.py"),
+              Path("scripts/status_page.py"),
+              Path("scripts/test-status-page.py"),
+              Path("scripts/unittest-shard"),
+              Path("scripts/test-unittest-shard.py"),
+              *Path("scripts/workspace_bootstrap").glob("*.py"),
+          ]
+          for path in paths:
+              compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          PY
+          test -x ./smolrunner
+          sh -n scripts/hot-run
+          bash -n scripts/benchmark-developer-loop
+          bash -n scripts/test-bootstrap.sh
+          bash -n scripts/cmux-fleet
+          bash -n scripts/cmux-fleet-bootstrap-macos
+          bash -n scripts/cmux-fleet-bootstrap-linux
+          bash -n scripts/glaeda-worktree-reclaim-all
+          bash -n scripts/cmux_mini_probe.sh
+          bash -n scripts/cmux_mini_preflight.sh
+          bash -n scripts/cmux_mini_fix.sh
+          bash scripts/test-bootstrap.sh
+          python3 scripts/test-benchmark-developer-loop.py
+          python3 scripts/test-benchmark-hot-state-fanout.py
+          python3 scripts/test-benchmark-pnpm-task-dependencies.py
+          python3 scripts/test-benchmark-linker-throughput.py
+          python3 scripts/test-hot-observe.py
+          python3 scripts/test-glaeda-disk.py
+          python3 scripts/test-glaeda-procs.py
+          python3 scripts/test-glaeda-local-guard.py
+          python3 scripts/test-glaeda-update.py
+          python3 scripts/test-glaeda-fleet-cas-prune.py
+          python3 scripts/test-glaeda-seed-prefetch.py
+          python3 scripts/test-glaeda-idle-warm.py
+          python3 scripts/test-glaeda-mini-health.py
+          python3 scripts/test-glaeda-seed-lan.py
+          python3 scripts/test-glaeda-lan-fetch.py
+          python3 scripts/test-glaeda-gh.py
+          python3 scripts/test-hot-pressure-shadow.py
+          python3 scripts/test-hot-run.py
+          python3 scripts/test-verify-focused.py
+          python3 scripts/test-owned-linux-admission.py
+          python3 scripts/test-owned-linux-jit-task.py
+          python3 scripts/test-external-execution-request.py
+          python3 scripts/test-trusted-agent-dispatch.py
+          python3 scripts/test-provider-neutral-request.py
+          python3 scripts/test-owner-local-dispatch.py
+          python3 scripts/test-cmux-fleet.py
+          python3 scripts/test-cmux-fleet-operator-summary.py
+          python3 scripts/test-cmux-fleet-bootstrap.py
+          python3 scripts/test-glaeda-mini-setup.py
+          python3 scripts/test-glaeda-mini-enroll.py
+          python3 scripts/test-glaeda-cmux-runner-fleet.py
+          python3 scripts/test-glaeda-mini-fleet.py
+          python3 scripts/test-glaeda-fleet-status.py
+          python3 scripts/test-glaeda-route.py
+          python3 scripts/test-cmux-execution-roles.py
+          python3 scripts/test-cmux-workload-request.py
+          python3 scripts/test-owned-fleet-benchmark.py
+          python3 scripts/test-verify.py
+          python3 scripts/test-verify-changed-rustfmt.py
+          python3 scripts/test-front-door.py
+          python3 scripts/test-quarry-sweep.py
+          python3 scripts/test-quarry-parallel.py
+          python3 scripts/test-status-page.py
+          python3 scripts/test-unittest-shard.py
+          # a test that leaves files in the checkout fails, as it did before the split
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Validate Mac helper scripts
+        run: |
+          python3 scripts/test_project_disk_physical_receipt.py
+          bash -n \
+            scripts/macbook-runner-bootstrap.sh \
+            scripts/macbook-runner-observe.sh \
+            scripts/macbook-runner-vm.sh \
+            scripts/macbook-workspace.sh \
+            scripts/quarry-trusted-runner.sh \
+            scripts/test-macbook-runner-bootstrap.sh \
+            scripts/test-macbook-runner-vm.sh \
+            scripts/test-macbook-runner-vm-paths.sh \
+            scripts/test-quarry-trusted-runner.sh
+          bash scripts/test-macbook-runner-bootstrap.sh
+          bash scripts/test-macbook-runner-vm.sh
+          bash scripts/test-macbook-runner-vm-paths.sh
+          bash scripts/test-quarry-trusted-runner.sh
+          bash scripts/macbook-workspace.sh help >/dev/null
+          bash scripts/macbook-workspace.sh notify-doctor 0
+          if grep -Eq 'allowAll|openAccess|CMUX_SOCKET_(PATH|PASSWORD)' scripts/macbook-workspace.sh; then
+            printf 'error: Mac workspace helper widens cmux socket authority\n' >&2
+            exit 1
+          fi
+
+      - name: Validate Glaeda Lima example aliases
+        run: |
+          cmp examples/lima/smolrunner-interactive.yaml examples/lima/glaeda-interactive.yaml
+          cmp examples/lima/smolrunner-jit-launcher examples/lima/glaeda-jit-launcher
+          cmp examples/lima/smolrunner-prepared-template.json examples/lima/glaeda-prepared-template.json
+          cmp examples/lima/smolrunner-prepared-template.yaml examples/lima/glaeda-prepared-template.yaml
+          cmp examples/lima/smolrunner-runner-integrity examples/lima/glaeda-runner-integrity
+          cmp examples/lima/smolrunner-work.yaml examples/lima/glaeda-work.yaml
+          bash -n examples/lima/glaeda-jit-launcher
+          bash -n examples/lima/glaeda-runner-integrity
+
+      - name: Validate repository verification wrappers
+        run: bash -n examples/renderprove/run-renderprove-review.sh
+
+
+  # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
+  runner-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
+      - name: Run runner and hook tests (shard ${{ matrix.shard }} of 4)
+        run: |
+          python3 scripts/unittest-shard scripts/test-glaeda-cmux-runner.py ${{ matrix.shard }} 4
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  # rust was one serial job of about 4.4 min (cache restore 69 s, check and two clippy runs 70 s, tests 100 s);
+  # lint and test now run side by side.
+  lint:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
+    # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
+    # an ambient cargo config, as a real install would.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
+      # Pull requests read the generation the last main push published; only main writes, so the cache stays
+      # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Cross-check the documented Apple Silicon Lima guest target.
+      - name: Install ARM64 Linux target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Check ARM64 Linux build
+        run: cargo check --locked --target aarch64-unknown-linux-gnu
+
+      # Keep the operator CLI buildable on its supported Apple Silicon host.
+      - name: Install Apple Silicon target
+        run: rustup target add aarch64-apple-darwin
+
+      # Glaeda is developed on Apple Silicon, so the repository's own `required` profile has to
+      # pass in the macOS `cfg` configuration, not only the Linux one this job runs natively.
+      # `cargo check` already compiled that configuration and already printed the `cfg` drift it
+      # sees -- code whose only consumers are `target_os = "linux"` -- but nothing promoted those
+      # warnings to errors, so `./scripts/verify required` could be broken on the author's machine
+      # while this job stayed green. Clippy with `-D warnings` subsumes the previous check and
+      # closes that gap without needing a macOS runner.
+      - name: Lint Apple Silicon build
+        run: >-
+          cargo clippy --locked --all-targets --all-features
+          --target aarch64-apple-darwin -- -D warnings
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
+  test:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
+    # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
+    # an ambient cargo config, as a real install would.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
+      # Pull requests read the generation the last main push published; only main writes, so the cache stays
+      # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
+  # The workspace bootstrap receipt and the operator CLI's own entry points (front door, doctor, plans). The front
+  # door's cargo run scrubs the environment, so it builds the default profile; here that is the only build.
+  cli:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
 
       - name: Install pinned Rust toolchain
         run: >-
@@ -54,25 +525,6 @@ jobs:
 
       - name: Validate workspace bootstrap
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          paths = [
-              Path("smolrunner"),
-              Path("scripts/bootstrap"),
-              Path("scripts/test-front-door.py"),
-              Path("scripts/project_disk_physical_receipt.py"),
-              Path("scripts/test_project_disk_physical_receipt.py"),
-              *Path("scripts/workspace_bootstrap").glob("*.py"),
-          ]
-          for path in paths:
-              compile(path.read_text(encoding="utf-8"), str(path), "exec")
-          PY
-          test -x ./smolrunner
-          bash -n scripts/test-bootstrap.sh
-          bash scripts/test-bootstrap.sh
-          python3 scripts/test-front-door.py
-
           first_receipt=$(mktemp)
           second_receipt=$(mktemp)
           bootstrap_cache_root=$(mktemp -d)
@@ -88,8 +540,8 @@ jobs:
             ./scripts/bootstrap --output json > "$second_receipt"
 
           jq -e '
-            .schema_version == 1 and
-            .receipt_type == "smolrunner-workspace-capability-receipt" and
+            .schema_version == 2 and
+            .receipt_type == "glaeda-workspace-capability-receipt" and
             (.state == "ready" or .state == "ready_with_declared_deviations") and
             .source.clean_before == true and
             .source.clean_after == true and
@@ -101,7 +553,7 @@ jobs:
               .path_class == "external-private" and
               .ownership == "current-user" and
               .path_exposed == false)) and
-            (.next_verification_profiles == ["smolrunner.required", "smolrunner.doctor", "smolrunner.plan"])
+            (.next_verification_profiles == ["glaeda.required", "glaeda.doctor", "glaeda.plan"])
           ' "$first_receipt"
           jq -S 'del(
             .capability_fingerprint,
@@ -134,64 +586,29 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           cat "$first_receipt"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      # The front door's cargo run is --offline: fetch and build first, as cargo test did when these ran in one job.
+      # Its scrubbed environment builds the default dev profile, which lint and test (no debuginfo) do not share, so
+      # this job keeps its own main-written cache; without one the build was cold on every run (49 s).
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
 
-      - name: Validate Mac helper scripts
+      - name: Build the CLI
+        run: cargo build --locked
+
+      - name: Exercise root Glaeda front door
         run: |
-          python3 scripts/test_project_disk_physical_receipt.py
-          bash -n \
-            scripts/macbook-runner-bootstrap.sh \
-            scripts/macbook-runner-observe.sh \
-            scripts/macbook-runner-vm.sh \
-            scripts/macbook-workspace.sh \
-            scripts/quarry-trusted-runner.sh \
-            scripts/test-macbook-runner-bootstrap.sh \
-            scripts/test-macbook-runner-vm.sh \
-            scripts/test-macbook-runner-vm-paths.sh \
-            scripts/test-quarry-trusted-runner.sh
-          bash scripts/test-macbook-runner-bootstrap.sh
-          bash scripts/test-macbook-runner-vm.sh
-          bash scripts/test-macbook-runner-vm-paths.sh
-          bash scripts/test-quarry-trusted-runner.sh
-          bash scripts/macbook-workspace.sh help >/dev/null
-          bash scripts/macbook-workspace.sh notify-doctor 0
-          if grep -Eq 'allowAll|openAccess|CMUX_SOCKET_(PATH|PASSWORD)' scripts/macbook-workspace.sh; then
-            printf 'error: Mac workspace helper widens cmux socket authority\n' >&2
-            exit 1
-          fi
-
-      - name: Validate repository verification wrappers
-        run: bash -n examples/renderprove/run-renderprove-review.sh
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain
-
-      # Cross-check the documented Apple Silicon Lima guest target.
-      - name: Install ARM64 Linux target
-        run: rustup target add aarch64-unknown-linux-gnu
-
-      - name: Check ARM64 Linux build
-        run: cargo check --locked --target aarch64-unknown-linux-gnu
-
-      # Keep the operator CLI buildable on its supported Apple Silicon host.
-      - name: Install Apple Silicon target
-        run: rustup target add aarch64-apple-darwin
-
-      - name: Check Apple Silicon build
-        run: cargo check --locked --all-targets --all-features --target aarch64-apple-darwin
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked --all-targets --all-features
-
-      - name: Exercise root SmolRunner front door
-        run: |
-          ./smolrunner --output json | jq -e '
-            .schema_version == 1 and
-            .receipt_type == "smolrunner-front-door-readiness-receipt" and
+          ./glaeda --output json | jq -e '
+            .schema_version == 2 and
+            .receipt_type == "glaeda-front-door-readiness-receipt" and
             .verdict == "ready" and
             .doctor.evaluated == true and
             (.doctor.overall == "pass" or .doctor.overall == "warn") and
@@ -214,3 +631,31 @@ jobs:
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account'
+
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
+  # One check that stands for the whole workflow, under the old single job's name.
+  verify:
+    if: ${{ always() }}
+    needs: [changes, go, scripts, runner-tests, lint, test, cli]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Verify job
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do
+            # A job this change cannot affect is skipped, not failed.
+            test "$result" = success || test "$result" = skipped
+          done

@@ -1,0 +1,11 @@
+[Unit]
+Description=Install this host's glaeda release ring over the air (glaeda-update)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/env python3 %h/.local/bin/glaeda-update --apply
+StandardOutput=append:%h/.local/state/glaeda-update.jsonl

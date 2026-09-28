@@ -1,18 +1,18 @@
-use smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction;
-use smolrunner::disposable_attempt_state::{
+use glaeda::disposable_attempt_catalog::DisposableAttemptCatalogAction;
+use glaeda::disposable_attempt_state::{
     DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
 use std::sync::LazyLock;
 
-use smolrunner::disposable_worker_reconciler::{
+use glaeda::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableHostBudget,
     DisposableHostUsage, DisposableVmId, DisposableVmIdentity, DisposableVmObservation,
     DisposableWorkerAction, DisposableWorkerObservationTarget, DisposableWorkerReconcileInput,
     DisposableWorkerResources, ScaleSetDemand, ScaleSetRunnerObservation, plan_capacity,
     reconcile_attempt,
 };
-use smolrunner::execution_admission::EpochMillis;
-use smolrunner::github_scale_set_protocol::{
+use glaeda::execution_admission::EpochMillis;
+use glaeda::github_scale_set_protocol::{
     ScaleSetJobEvent, ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
     ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };

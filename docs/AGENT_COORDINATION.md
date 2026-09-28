@@ -1,6 +1,6 @@
 # Agent coordination protocol
 
-This document defines how multiple implementation agents coordinate work on SmolRunner. The goal is to keep delegation observable, bounded, and recoverable. An agent must never disappear into an indefinite scheduled wait while the coordinator assumes progress is still happening.
+This document defines how multiple implementation agents coordinate work on Glaeda. The goal is to keep delegation observable, bounded, and recoverable. An agent must never disappear into an indefinite scheduled wait while the coordinator assumes progress is still happening.
 
 ## Core rule
 

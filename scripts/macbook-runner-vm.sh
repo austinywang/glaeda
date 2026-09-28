@@ -60,7 +60,7 @@ Commands:
   tmux                       Start the VM and attach/create the guest tmux session.
   status                     Show Lima instance state and host/guest Git branch status.
   sync                       Fast-forward the clean guest checkout to origin/main.
-  doctor                     Run SmolRunner doctor inside the guest checkout.
+  doctor                     Run Glaeda doctor inside the guest checkout.
   observe                    Run the read-only Mac/guest observation report.
   exec -- CMD                Run an explicit command inside the guest.
   stop                       Gracefully stop the Lima instance when no helper run is active.
@@ -102,7 +102,7 @@ require_lima() {
 
 require_instance() {
   [ -d "${instance_dir}" ] \
-    || die "Lima instance '${instance}' does not exist. Create it from examples/lima/smolrunner-interactive.yaml before using this helper."
+    || die "Lima instance '${instance}' does not exist. Create it from examples/lima/glaeda-interactive.yaml before using this helper."
 }
 
 acquire_operation_lock() {
@@ -328,7 +328,7 @@ case "${command_name}" in
         printf "tmux is not installed in the guest. Run: sudo apt-get update && sudo apt-get install -y tmux\n" >&2
         exit 1
       fi
-      exec tmux new-session -A -s smolrunner
+      exec tmux new-session -A -s glaeda
     '
     ;;
   status)

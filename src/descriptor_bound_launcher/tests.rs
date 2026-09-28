@@ -419,8 +419,9 @@ fn output_limit_terminates_the_child_process_group() {
 fn public_json_and_debug_redact_paths_identities_secrets_and_output() {
     let fixture = Fixture::new("privacy");
     let working_directory = fixture.directory("private-cwd-marker");
+    fixture.directory("private-executable-marker");
     let executable = fixture.copy_binary(
-        "private-executable-marker",
+        "private-executable-marker/printf",
         &["/usr/bin/printf", "/bin/printf"],
     );
     let launch = plan(

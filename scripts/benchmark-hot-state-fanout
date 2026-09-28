@@ -1,0 +1,2056 @@
+#!/usr/bin/env python3
+"""Run one controlled big-red hot-state fan-out window.
+
+The workload, source, edit, validator, state modes, and fan-out widths are closed here so the
+result cannot silently compare different useful work. This is physical R&D orchestration, not a
+general job runner or an authority-bearing benchmark result.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import pwd
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parent.parent
+HOT_RUN = ROOT / "scripts" / "hot-run"
+BENCHMARK = ROOT / "scripts" / "benchmark-developer-loop"
+REFLINK_TASK = ROOT / "target" / "release" / "glaeda-reflink-task"
+REFLINK_TASK_SOURCE = ROOT / "src" / "bin" / "glaeda-reflink-task.rs"
+REFLINK_TASK_LIBRARY = ROOT / "src" / "linux_reflink_task_materialization.rs"
+FIXTURE = ROOT / "benchmarks" / "developer-loop-doc-edit.patch"
+GIT = Path("/usr/bin/git")
+FINDMNT = Path("/usr/bin/findmnt")
+TASKSET = Path("/usr/bin/taskset")
+
+SOURCE_COMMIT = "b9fa23462420c13a465d635d9694f0c827c1e685"
+SOURCE_TREE = "edd0b7bb9d3e59305c21c69b721b5278d8aff6da"
+FIXTURE_DIGEST = "sha256:bfdd60e73e8b106c0129d1052310495ae2dbe1ff70bb52b35a9f9ef4911927eb"
+FIXTURE_FILE_DIGEST = "sha256:c51d467376a86adfeafa7a2b161d216ca6d6e2eb9d48ac08fe6585edcd1cec0d"
+EMPTY_DIFF_DIGEST = f"sha256:{hashlib.sha256(b'').hexdigest()}"
+RUSTC_VERSION = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+CARGO_VERSION = "cargo 1.97.1 (c980f4866 2026-06-30)"
+RUSTC_SHA256 = "d3a664c970a9fd8361b64194861bebc1ae37b9054e5ee3400dc1c9e691797eea"
+CARGO_SHA256 = "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953"
+COMPARISON_BASIS_VERSION = 4
+ARMS = ("ordinary-native", "private", "overlay", "private-copy")
+SOURCE_MATERIALIZATIONS = (
+    "git-sequential",
+    "glaeda-ordinary",
+    "glaeda-reflink",
+)
+FANOUTS = (1, 4, 8)
+RETAINED_REUSE_WINDOW_COUNTS = (1, 3, 7)
+PAGE_CACHE_RESIDENT_WARM = "resident_uncontrolled_warm"
+PAGE_CACHE_RESIDENT_TARGET_DONTNEED = (
+    "resident_target_fsync_fadvise_dontneed"
+)
+PAGE_CACHE_CLI_TREATMENTS = {
+    "resident-uncontrolled-warm": PAGE_CACHE_RESIDENT_WARM,
+    "resident-target-dontneed": PAGE_CACHE_RESIDENT_TARGET_DONTNEED,
+}
+DEFAULT_DEADLINE_SECONDS = 900
+CHILD_UMASK = 0o022
+PROCESS_GROUP_TERM_GRACE_SECONDS = 2.0
+PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
+PROCESS_GROUP_POLL_SECONDS = 0.02
+STATE_PHASE_INITIAL = "initial_for_source_state"
+STATE_PHASE_RETAINED_REUSE = "retained_after_accepted_edit"
+
+
+class ExperimentError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ExperimentPlan:
+    arm: str
+    source_materialization: str
+    source_materializer_program_sha256: str | None
+    fanout: int
+    logical_cpus: int
+    cargo_jobs_per_task: int
+    deadline_seconds: int
+    available_cpu_ids: tuple[int, ...]
+    task_cpu_sets: tuple[tuple[int, ...], ...]
+    page_cache_treatment: str
+    retained_reuse_windows: int
+
+    @property
+    def retained_reuse(self) -> bool:
+        return self.retained_reuse_windows > 0
+
+    def to_json(self) -> dict[str, Any]:
+        comparison = {
+            "basis_schema_version": COMPARISON_BASIS_VERSION,
+            "prime_key": comparison_key(self, edited=False),
+            "edit_key": comparison_key(self, edited=True),
+        }
+        if self.retained_reuse:
+            comparison["retained_reuse_key"] = comparison_key(
+                self,
+                edited=True,
+                retained_reuse=True,
+                retained_reuse_ordinal=1,
+            )
+            comparison["retained_reuse_keys"] = [
+                {
+                    "ordinal": ordinal,
+                    "key": comparison_key(
+                        self,
+                        edited=True,
+                        retained_reuse=True,
+                        retained_reuse_ordinal=ordinal,
+                    ),
+                }
+                for ordinal in range(1, self.retained_reuse_windows + 1)
+            ]
+        return {
+            "schema_version": 1,
+            "document_type": "glaeda-hot-state-fanout-plan",
+            "authority": "performance_observation_only",
+            "arm": self.arm,
+            "source_materialization": self.source_materialization,
+            "fanout": self.fanout,
+            "resources": {
+                "available_logical_cpus": self.logical_cpus,
+                "available_cpu_ids": list(self.available_cpu_ids),
+                "cargo_jobs_per_task": self.cargo_jobs_per_task,
+                "configured_total_cargo_jobs": self.fanout
+                * self.cargo_jobs_per_task,
+                "task_cpu_sets": [list(cpu_set) for cpu_set in self.task_cpu_sets],
+                "cpu_enforcement": "linux_sched_affinity",
+                "memory_enforcement": "host_default_unbounded",
+            },
+            "deadline_seconds": self.deadline_seconds,
+            "retained_reuse_window": self.retained_reuse,
+            "retained_reuse_window_count": self.retained_reuse_windows,
+            "environment": {
+                "policy": "closed_allowlist",
+                "child_filesystem_creation_umask": f"{CHILD_UMASK:04o}",
+                "cargo_network": "offline",
+                "dependency_cache": "existing_account_cargo_home",
+                "caller_build_flags_wrappers_and_target_dir": "excluded",
+                "page_cache_treatment": self.page_cache_treatment,
+            },
+            "workload": workload_identity(),
+            "comparison": comparison,
+        }
+
+
+@dataclass
+class TaskProcess:
+    task_id: str
+    process: subprocess.Popen[bytes]
+    benchmark_receipt: Path
+    hot_run_receipt: Path | None
+
+
+def workload_identity() -> dict[str, Any]:
+    return {
+        "benchmark_id": "resident-eligible-rust-edit-v1",
+        "source_commit": SOURCE_COMMIT,
+        "source_tree": SOURCE_TREE,
+        "fixture_diff_digest": FIXTURE_DIGEST,
+        "fixture_file_digest": FIXTURE_FILE_DIGEST,
+        "benchmark_receipt_schema": 2,
+        "test_inventory_source": "rust_test_terminal_summaries_v1",
+        "excluded_host_fact_test_count": 16,
+    }
+
+
+def comparison_basis(
+    plan: ExperimentPlan,
+    edited: bool,
+    retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
+) -> dict[str, Any]:
+    """Return the path-free, exact-work basis owned by this closed harness."""
+    if retained_reuse and not edited:
+        raise ExperimentError("retained reuse requires the accepted edit state")
+    if retained_reuse:
+        ordinal = 1 if retained_reuse_ordinal is None else retained_reuse_ordinal
+        if (
+            not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or ordinal < 1
+            or ordinal > max(RETAINED_REUSE_WINDOW_COUNTS)
+        ):
+            raise ExperimentError("retained-reuse ordinal is outside the bounded sequence")
+        if ordinal > plan.retained_reuse_windows:
+            raise ExperimentError("retained-reuse ordinal exceeds the declared plan")
+    elif retained_reuse_ordinal is not None:
+        raise ExperimentError("retained-reuse ordinal requires retained reuse")
+    else:
+        ordinal = None
+    producer_programs = {
+        "fanout_harness_sha256": f"sha256:{file_sha256(SCRIPT)}",
+        "git_sha256": f"sha256:{file_sha256(GIT)}",
+        "hot_run_sha256": f"sha256:{file_sha256(HOT_RUN)}",
+        "semantic_benchmark_sha256": f"sha256:{file_sha256(BENCHMARK)}",
+    }
+    if plan.source_materialization != "git-sequential":
+        producer_programs.update(
+            {
+                "reflink_task_cli_source_sha256": (
+                    f"sha256:{file_sha256(REFLINK_TASK_SOURCE)}"
+                ),
+                "reflink_task_library_source_sha256": (
+                    f"sha256:{file_sha256(REFLINK_TASK_LIBRARY)}"
+                ),
+                "source_materializer_program_sha256": (
+                    plan.source_materializer_program_sha256
+                ),
+            }
+        )
+    return {
+        "schema_version": COMPARISON_BASIS_VERSION,
+        "document_type": "glaeda-hot-state-fanout-comparison-basis",
+        "workload": {
+            **workload_identity(),
+            "tracked_workload_dirty": edited,
+            "tracked_workload_diff_digest": (
+                FIXTURE_DIGEST if edited else EMPTY_DIFF_DIGEST
+            ),
+        },
+        "toolchain": {
+            "rustc": RUSTC_VERSION,
+            "rustc_program_sha256": f"sha256:{RUSTC_SHA256}",
+            "cargo": CARGO_VERSION,
+            "cargo_program_sha256": f"sha256:{CARGO_SHA256}",
+        },
+        "producer_programs": producer_programs,
+        "treatment": {
+            "arm": plan.arm,
+            "source_materialization": plan.source_materialization,
+            "fanout": plan.fanout,
+            "cargo_build_jobs_per_task": plan.cargo_jobs_per_task,
+            "configured_total_cargo_jobs": (
+                plan.fanout * plan.cargo_jobs_per_task
+            ),
+            "available_cpu_ids": list(plan.available_cpu_ids),
+            "task_cpu_sets": [list(cpu_set) for cpu_set in plan.task_cpu_sets],
+            "cpu_enforcement": "linux_sched_affinity",
+            "memory_enforcement": "host_default_unbounded",
+            "cargo_incremental": True,
+            "cargo_network": "offline",
+            "page_cache_treatment": plan.page_cache_treatment,
+            "child_filesystem_creation_umask": f"{CHILD_UMASK:04o}",
+            "state_phase": (
+                STATE_PHASE_RETAINED_REUSE
+                if retained_reuse
+                else STATE_PHASE_INITIAL
+            ),
+            "retained_reuse_ordinal": ordinal,
+        },
+    }
+
+
+def comparison_key(
+    plan: ExperimentPlan,
+    edited: bool,
+    retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
+) -> str:
+    encoded = json.dumps(
+        comparison_basis(
+            plan, edited, retained_reuse, retained_reuse_ordinal
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def build_plan(
+    arm: str,
+    fanout: int,
+    logical_cpus: int,
+    deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
+    available_cpu_ids: tuple[int, ...] | None = None,
+    page_cache_treatment: str = PAGE_CACHE_RESIDENT_WARM,
+    retained_reuse: bool = False,
+    retained_reuse_windows: int | None = None,
+    source_materialization: str = "git-sequential",
+    source_materializer_program_sha256: str | None = None,
+) -> ExperimentPlan:
+    if arm not in ARMS:
+        raise ExperimentError("unsupported hot-state arm")
+    if fanout not in FANOUTS:
+        raise ExperimentError("fan-out must be one of 1, 4, or 8")
+    if source_materialization not in SOURCE_MATERIALIZATIONS:
+        raise ExperimentError("unsupported source materialization")
+    if source_materialization == "git-sequential":
+        if source_materializer_program_sha256 is not None:
+            raise ExperimentError(
+                "Git source materialization cannot bind a Glaeda program"
+            )
+    elif (
+        not isinstance(source_materializer_program_sha256, str)
+        or len(source_materializer_program_sha256) != 71
+        or not source_materializer_program_sha256.startswith("sha256:")
+        or any(
+            character not in "0123456789abcdef"
+            for character in source_materializer_program_sha256[7:]
+        )
+    ):
+        raise ExperimentError(
+            "Glaeda source materialization requires an exact program digest"
+        )
+    if logical_cpus < fanout:
+        raise ExperimentError("fan-out exceeds the available logical CPU grant")
+    if deadline_seconds < 1 or deadline_seconds > 3600:
+        raise ExperimentError("deadline must be between 1 and 3600 seconds")
+    if page_cache_treatment not in PAGE_CACHE_CLI_TREATMENTS.values():
+        raise ExperimentError("unsupported page-cache treatment")
+    if not isinstance(retained_reuse, bool):
+        raise ExperimentError("retained-reuse selection must be boolean")
+    if retained_reuse and retained_reuse_windows is not None:
+        raise ExperimentError(
+            "single retained reuse and retained-reuse sequence are mutually exclusive"
+        )
+    if retained_reuse_windows is None:
+        sequence_windows = 1 if retained_reuse else 0
+    else:
+        sequence_windows = retained_reuse_windows
+    if (
+        not isinstance(sequence_windows, int)
+        or isinstance(sequence_windows, bool)
+        or sequence_windows not in (0, *RETAINED_REUSE_WINDOW_COUNTS)
+    ):
+        raise ExperimentError("retained-reuse window count is unsupported")
+    if (
+        page_cache_treatment == PAGE_CACHE_RESIDENT_TARGET_DONTNEED
+        and arm not in ("overlay", "private-copy")
+    ):
+        raise ExperimentError(
+            "resident-target cold advice requires overlay or private-copy"
+        )
+    cpu_ids = (
+        tuple(range(logical_cpus))
+        if available_cpu_ids is None
+        else available_cpu_ids
+    )
+    if len(cpu_ids) != logical_cpus or len(set(cpu_ids)) != logical_cpus:
+        raise ExperimentError("available CPU identity is inconsistent")
+    jobs_per_task = max(1, logical_cpus // fanout)
+    task_cpu_sets = tuple(
+        tuple(cpu_ids[index * jobs_per_task : (index + 1) * jobs_per_task])
+        for index in range(fanout)
+    )
+    return ExperimentPlan(
+        arm=arm,
+        source_materialization=source_materialization,
+        source_materializer_program_sha256=(
+            source_materializer_program_sha256
+        ),
+        fanout=fanout,
+        logical_cpus=logical_cpus,
+        cargo_jobs_per_task=jobs_per_task,
+        deadline_seconds=deadline_seconds,
+        available_cpu_ids=cpu_ids,
+        task_cpu_sets=task_cpu_sets,
+        page_cache_treatment=page_cache_treatment,
+        retained_reuse_windows=sequence_windows,
+    )
+
+
+def run_checked(arguments: list[str], *, cwd: Path | None = None) -> None:
+    result = subprocess.run(
+        arguments,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ExperimentError("experiment setup command failed")
+
+
+def git_output(arguments: list[str], *, cwd: Path) -> str:
+    result = subprocess.run(
+        [os.fspath(GIT), *arguments],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ExperimentError("required Git observation failed")
+    return result.stdout.strip()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_toolchain_contract() -> None:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    cargo_bin = home / ".cargo" / "bin"
+    rustup = cargo_bin / "rustup"
+    environment = {
+        "HOME": os.fspath(home),
+        "PATH": f"{os.fspath(cargo_bin)}:/usr/bin:/bin",
+        "CARGO_HOME": os.fspath(home / ".cargo"),
+        "RUSTUP_HOME": os.fspath(home / ".rustup"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    observed: dict[str, tuple[str, str]] = {}
+    for name in ("rustc", "cargo"):
+        which = subprocess.run(
+            [os.fspath(rustup), "which", name],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if which.returncode != 0:
+            raise ExperimentError("pinned Rust toolchain is unavailable")
+        program = Path(which.stdout.strip())
+        if not program.is_file() or not os.access(program, os.X_OK):
+            raise ExperimentError("pinned Rust toolchain program is unavailable")
+        version = subprocess.run(
+            [os.fspath(program), "--version"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if version.returncode != 0:
+            raise ExperimentError("pinned Rust toolchain version is unavailable")
+        observed[name] = (version.stdout.strip(), file_sha256(program))
+    if observed != {
+        "rustc": (RUSTC_VERSION, RUSTC_SHA256),
+        "cargo": (CARGO_VERSION, CARGO_SHA256),
+    }:
+        raise ExperimentError("pinned Rust toolchain identity changed")
+
+
+def validate_static_contract(repository: Path, plan: ExperimentPlan) -> None:
+    for capability in (GIT, FINDMNT, TASKSET, HOT_RUN, BENCHMARK, FIXTURE):
+        if not capability.is_file():
+            raise ExperimentError("required experiment capability is unavailable")
+    if plan.source_materialization != "git-sequential":
+        if not REFLINK_TASK.is_file() or not os.access(REFLINK_TASK, os.X_OK):
+            raise ExperimentError("Glaeda source materializer is unavailable")
+        if (
+            f"sha256:{file_sha256(REFLINK_TASK)}"
+            != plan.source_materializer_program_sha256
+        ):
+            raise ExperimentError("Glaeda source materializer identity changed")
+    if git_output(["rev-parse", f"{SOURCE_COMMIT}^{{tree}}"], cwd=repository) != SOURCE_TREE:
+        raise ExperimentError("frozen source identity is unavailable")
+    fixture_digest = f"sha256:{hashlib.sha256(FIXTURE.read_bytes()).hexdigest()}"
+    if fixture_digest != FIXTURE_FILE_DIGEST:
+        raise ExperimentError("frozen fixture identity changed")
+    validate_toolchain_contract()
+    relevant_status = git_output(
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            "scripts/benchmark-hot-state-fanout",
+            "scripts/hot-run",
+            "scripts/benchmark-developer-loop",
+            "benchmarks/developer-loop-doc-edit.patch",
+            "src/bin/glaeda-reflink-task.rs",
+            "src/linux_reflink_task_materialization.rs",
+        ],
+        cwd=ROOT,
+    )
+    if relevant_status:
+        raise ExperimentError("experiment implementation differs from its recorded Git head")
+
+
+def validate_scratch_root(path: Path, output: Path) -> Path:
+    path = Path(os.path.abspath(path))
+    output = Path(os.path.abspath(output))
+    try:
+        observed = path.lstat()
+    except FileNotFoundError as error:
+        raise ExperimentError("scratch root does not exist") from error
+    if not stat.S_ISDIR(observed.st_mode) or path.is_symlink():
+        raise ExperimentError("scratch root must be a plain directory")
+    if observed.st_uid != os.getuid():
+        raise ExperimentError("scratch root is not owned by the current user")
+    if output == path or path in output.parents:
+        raise ExperimentError("output must remain outside the disposable scratch root")
+    return path
+
+
+def validate_cargo_config_absence(repository: Path, scratch_root: Path) -> None:
+    source_configs = git_output(
+        [
+            "ls-tree",
+            "-r",
+            "--name-only",
+            SOURCE_COMMIT,
+            "--",
+            ".cargo/config",
+            ".cargo/config.toml",
+        ],
+        cwd=repository,
+    )
+    if source_configs:
+        raise ExperimentError("frozen source contains a Cargo configuration treatment")
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    candidates = {home / ".cargo" / "config", home / ".cargo" / "config.toml"}
+    for ancestor in (scratch_root, *scratch_root.parents):
+        candidates.add(ancestor / ".cargo" / "config")
+        candidates.add(ancestor / ".cargo" / "config.toml")
+    if any(candidate.exists() or candidate.is_symlink() for candidate in candidates):
+        raise ExperimentError("ambient Cargo configuration would change the treatment")
+
+
+def filesystem_observation(path: Path) -> dict[str, Any]:
+    observed = path.stat()
+    filesystem = os.statvfs(path)
+    result = subprocess.run(
+        [
+            os.fspath(FINDMNT),
+            "-n",
+            "-o",
+            "ID,MAJ:MIN,FSTYPE",
+            "--target",
+            os.fspath(path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    fields = result.stdout.split()
+    if result.returncode != 0 or len(fields) != 3:
+        raise ExperimentError("scratch filesystem identity is unavailable")
+    fragment_size = filesystem.f_frsize or filesystem.f_bsize
+    return {
+        "mount_id": fields[0],
+        "device_major": os.major(observed.st_dev),
+        "device_minor": os.minor(observed.st_dev),
+        "findmnt_device": fields[1],
+        "filesystem_type": fields[2],
+        "fragment_size_bytes": fragment_size,
+        "total_bytes": filesystem.f_blocks * fragment_size,
+        "available_bytes": filesystem.f_bavail * fragment_size,
+    }
+
+
+def same_filesystem_identity(
+    first: dict[str, Any], second: dict[str, Any]
+) -> bool:
+    fields = (
+        "mount_id",
+        "device_major",
+        "device_minor",
+        "findmnt_device",
+        "filesystem_type",
+        "fragment_size_bytes",
+        "total_bytes",
+    )
+    return all(first[field] == second[field] for field in fields)
+
+
+def add_worktree(repository: Path, destination: Path) -> None:
+    run_checked(
+        [
+            os.fspath(GIT),
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            os.fspath(destination),
+            SOURCE_COMMIT,
+        ],
+        cwd=repository,
+    )
+
+
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def signal_process_group(process_group_id: int, sent_signal: signal.Signals) -> None:
+    try:
+        os.killpg(process_group_id, sent_signal)
+    except ProcessLookupError:
+        pass
+
+
+def wait_for_process_group_absence(
+    process: subprocess.Popen[bytes],
+    process_group_id: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        process.poll()
+        if not process_group_exists(process_group_id):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(PROCESS_GROUP_POLL_SECONDS)
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    process_group_id = process.pid
+    process.poll()
+    if process_group_exists(process_group_id):
+        signal_process_group(process_group_id, signal.SIGTERM)
+    if not wait_for_process_group_absence(
+        process,
+        process_group_id,
+        PROCESS_GROUP_TERM_GRACE_SECONDS,
+    ):
+        signal_process_group(process_group_id, signal.SIGKILL)
+        if not wait_for_process_group_absence(
+            process,
+            process_group_id,
+            PROCESS_GROUP_KILL_GRACE_SECONDS,
+        ):
+            raise ExperimentError("source materialization process group cleanup failed")
+    try:
+        process.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        raise ExperimentError("source materialization leader cleanup failed") from error
+
+
+def validate_source_materialization_report(
+    plan: ExperimentPlan, report: object
+) -> None:
+    expected_fields = {
+        "schema_version",
+        "document_type",
+        "authority",
+        "requested_mode",
+        "task_count",
+        "ordinary_tasks",
+        "reflinked_tasks",
+        "ordinary_fallback_tasks",
+        "fallback_reasons",
+        "commit",
+        "tree",
+        "tracked_regular_files_per_task",
+        "logical_bytes_per_task",
+        "timings",
+        "final_git_proof",
+    }
+    if not isinstance(report, dict) or set(report) != expected_fields:
+        raise ExperimentError("source materialization receipt changed treatment")
+    count_fields = (
+        "task_count",
+        "ordinary_tasks",
+        "reflinked_tasks",
+        "ordinary_fallback_tasks",
+        "tracked_regular_files_per_task",
+        "logical_bytes_per_task",
+    )
+    if not all(
+        isinstance(report[field], int)
+        and not isinstance(report[field], bool)
+        and report[field] >= 0
+        for field in count_fields
+    ):
+        raise ExperimentError("source materialization receipt changed treatment")
+    expected_mode = (
+        "ordinary"
+        if plan.source_materialization == "glaeda-ordinary"
+        else "reflink_with_fallback"
+    )
+    expected_ordinary = (
+        plan.fanout if plan.source_materialization == "glaeda-ordinary" else 0
+    )
+    expected_reflinked = (
+        plan.fanout if plan.source_materialization == "glaeda-reflink" else 0
+    )
+    if (
+        report.get("schema_version") != 1
+        or report.get("document_type") != "glaeda-reflink-task-fanout"
+        or report.get("authority") != "research_materialization_only"
+        or report.get("requested_mode") != expected_mode
+        or report.get("task_count") != plan.fanout
+        or report.get("ordinary_tasks") != expected_ordinary
+        or report.get("reflinked_tasks") != expected_reflinked
+        or report.get("ordinary_fallback_tasks") != 0
+        or report.get("fallback_reasons") != {}
+        or report.get("commit") != SOURCE_COMMIT
+        or report.get("tree") != SOURCE_TREE
+        or report["tracked_regular_files_per_task"] <= 0
+        or report["logical_bytes_per_task"] <= 0
+        or report.get("final_git_proof")
+        != "head_tree_diff_files_diff_index_per_task"
+    ):
+        raise ExperimentError("source materialization receipt changed treatment")
+    timings = report.get("timings")
+    if not isinstance(timings, dict) or set(timings) != {
+        "total_microseconds",
+        "source_proof_microseconds",
+        "parallel_preparation_microseconds",
+        "parallel_finalization_microseconds",
+    }:
+        raise ExperimentError("source materialization timings are invalid")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in timings.values()
+    ):
+        raise ExperimentError("source materialization timings are invalid")
+
+
+def materialize_tasks(
+    plan: ExperimentPlan,
+    repository: Path,
+    resident: Path,
+    tasks: list[Path],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    if plan.source_materialization == "git-sequential":
+        for task in tasks:
+            add_worktree(repository, task)
+        return {
+            "implementation": "git_sequential_worktree_add",
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+            "semantic_validation": "accepted",
+            "receipt": None,
+        }
+
+    mode = (
+        "ordinary"
+        if plan.source_materialization == "glaeda-ordinary"
+        else "reflink"
+    )
+    expected_program_digest = plan.source_materializer_program_sha256
+    if f"sha256:{file_sha256(REFLINK_TASK)}" != expected_program_digest:
+        raise ExperimentError("Glaeda source materializer identity changed")
+    command = [
+        os.fspath(REFLINK_TASK),
+        "--git",
+        os.fspath(GIT),
+        "--source",
+        os.fspath(resident),
+        "--fanout",
+    ]
+    for task in tasks:
+        command.extend(("--target", os.fspath(task)))
+    command.extend(
+        (
+            "--commit",
+            SOURCE_COMMIT,
+            "--mode",
+            mode,
+            "--output",
+            "json",
+        )
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=repository,
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = process.communicate(timeout=plan.deadline_seconds)
+    except subprocess.TimeoutExpired as error:
+        terminate_process_group(process)
+        raise ExperimentError("source materialization deadline exceeded") from error
+    except BaseException:
+        terminate_process_group(process)
+        raise
+    if process.returncode != 0:
+        raise ExperimentError("Glaeda source materialization failed")
+    if len(stdout) > 1024 * 1024:
+        raise ExperimentError("source materialization receipt exceeds its bound")
+    try:
+        report = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ExperimentError("source materialization receipt is invalid") from error
+    validate_source_materialization_report(plan, report)
+    if f"sha256:{file_sha256(REFLINK_TASK)}" != expected_program_digest:
+        raise ExperimentError("Glaeda source materializer identity changed")
+    return {
+        "implementation": plan.source_materialization.replace("-", "_"),
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+        "program_sha256": expected_program_digest,
+        "semantic_validation": "accepted",
+        "receipt": report,
+    }
+
+
+def apply_fixture(task: Path) -> None:
+    run_checked(
+        [os.fspath(GIT), "apply", "--check", os.fspath(FIXTURE)], cwd=task
+    )
+    run_checked([os.fspath(GIT), "apply", os.fspath(FIXTURE)], cwd=task)
+
+
+def command_for_task(
+    plan: ExperimentPlan,
+    resident: Path,
+    task: Path,
+    state: Path,
+    benchmark_receipt: Path,
+    hot_run_receipt: Path,
+    edited: bool,
+    retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
+) -> tuple[list[str], Path | None]:
+    benchmark_command = [
+        os.fspath(BENCHMARK),
+        "--output",
+        os.fspath(benchmark_receipt),
+    ]
+    direct_native = plan.arm == "ordinary-native"
+    hot_resident = task if direct_native else resident
+    cache_mode = "native" if direct_native else plan.arm
+    source_preparation_arguments = (
+        ["--seed-source-mtimes"] if plan.arm == "private-copy" else []
+    )
+    return (
+        [
+            os.fspath(HOT_RUN),
+            "--resident",
+            os.fspath(hot_resident),
+            "--task",
+            os.fspath(task),
+            "--state",
+            os.fspath(state),
+            "--cache",
+            f"target:{cache_mode}",
+            *source_preparation_arguments,
+            "--measurement",
+            os.fspath(hot_run_receipt),
+            "--comparison-key",
+            comparison_key(
+                plan, edited, retained_reuse, retained_reuse_ordinal
+            ),
+            "--",
+            *benchmark_command,
+        ],
+        hot_run_receipt,
+    )
+
+
+def closed_environment(cargo_jobs: int, temporary_directory: Path) -> dict[str, str]:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    cargo_home = home / ".cargo"
+    rustup_home = home / ".rustup"
+    cargo_bin = cargo_home / "bin"
+    for program in (cargo_bin / "cargo", cargo_bin / "rustc", cargo_bin / "rustup"):
+        if not program.is_file() or not os.access(program, os.X_OK):
+            raise ExperimentError("pinned Rust toolchain front door is unavailable")
+    temporary_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return {
+        "HOME": os.fspath(home),
+        "PATH": f"{os.fspath(cargo_bin)}:/usr/bin:/bin",
+        "CARGO_HOME": os.fspath(cargo_home),
+        "RUSTUP_HOME": os.fspath(rustup_home),
+        "CARGO_BUILD_JOBS": str(cargo_jobs),
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_NET_OFFLINE": "true",
+        "CARGO_TERM_COLOR": "never",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TMPDIR": os.fspath(temporary_directory),
+    }
+
+
+def start_task(
+    task_id: str,
+    command: list[str],
+    cwd: Path,
+    benchmark_receipt: Path,
+    hot_run_receipt: Path | None,
+    cargo_jobs: int,
+    temporary_directory: Path,
+    cpu_set: tuple[int, ...],
+) -> TaskProcess:
+    if not cpu_set:
+        raise ExperimentError("task CPU affinity set is empty")
+    affinity = ",".join(str(cpu) for cpu in cpu_set)
+    process = subprocess.Popen(
+        [os.fspath(TASKSET), "--cpu-list", affinity, *command],
+        cwd=cwd,
+        env=closed_environment(cargo_jobs, temporary_directory),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        umask=CHILD_UMASK,
+    )
+    return TaskProcess(task_id, process, benchmark_receipt, hot_run_receipt)
+
+
+def terminate_tasks(tasks: list[TaskProcess]) -> None:
+    for task in tasks:
+        if task.process.poll() is None:
+            try:
+                os.killpg(task.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and any(
+        task.process.poll() is None for task in tasks
+    ):
+        time.sleep(0.05)
+    for task in tasks:
+        if task.process.poll() is None:
+            try:
+                os.killpg(task.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    for task in tasks:
+        task.process.wait()
+
+
+def wait_for_tasks(
+    tasks: list[TaskProcess],
+    deadline_seconds: int,
+    started: float | None = None,
+) -> tuple[float, str | None, int]:
+    started = time.monotonic() if started is None else started
+    deadline = started + deadline_seconds
+    failed = False
+    maximum_running = 0
+    while True:
+        running = [task for task in tasks if task.process.poll() is None]
+        maximum_running = max(maximum_running, len(running))
+        failed = failed or any(
+            task.process.returncode not in (None, 0) for task in tasks
+        )
+        if not running:
+            break
+        if failed:
+            terminate_tasks(tasks)
+            break
+        if time.monotonic() >= deadline:
+            terminate_tasks(tasks)
+            return (
+                time.monotonic() - started,
+                "fan-out window reached its declared deadline",
+                maximum_running,
+            )
+        time.sleep(0.05)
+    elapsed = time.monotonic() - started
+    if any(task.process.returncode != 0 for task in tasks):
+        return elapsed, "one or more fan-out tasks failed", maximum_running
+    return elapsed, None, maximum_running
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        raise ExperimentError("expected task receipt is unavailable") from error
+    if not isinstance(value, dict):
+        raise ExperimentError("task receipt is not a JSON object")
+    return value
+
+
+def validate_benchmark_receipt(
+    receipt: dict[str, Any], edited: bool, expected_cargo_jobs: int
+) -> None:
+    expected_digest = FIXTURE_DIGEST if edited else EMPTY_DIFF_DIGEST
+    inventory = receipt.get("workload", {}).get("test_inventory")
+    inventory_counts: tuple[Any, ...] = ()
+    if isinstance(inventory, dict):
+        inventory_counts = tuple(
+            inventory.get(field)
+            for field in (
+                "summary_count",
+                "selected_test_count",
+                "executed_test_count",
+                "passed_test_count",
+                "failed_test_count",
+                "ignored_test_count",
+                "measured_test_count",
+                "filtered_out_test_count",
+            )
+        )
+    valid_counts = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in inventory_counts
+    )
+    if (
+        receipt.get("schema_version") != 2
+        or receipt.get("document_type") != "glaeda-developer-loop-benchmark"
+        or receipt.get("benchmark_id") != "resident-eligible-rust-edit-v1"
+        or receipt.get("source", {}).get("commit") != SOURCE_COMMIT
+        or receipt.get("source", {}).get("tree") != SOURCE_TREE
+        or receipt.get("source", {}).get("tracked_workload_diff_digest")
+        != expected_digest
+        or receipt.get("source", {}).get("tracked_workload_dirty") is not edited
+        or receipt.get("result", {}).get("exit_code") != 0
+        or receipt.get("resources", {}).get("cargo_build_jobs")
+        != str(expected_cargo_jobs)
+        or receipt.get("toolchain", {}).get("rustc") != RUSTC_VERSION
+        or receipt.get("toolchain", {}).get("cargo") != CARGO_VERSION
+        or receipt.get("workload", {}).get("excluded_host_fact_test_count") != 16
+        or not isinstance(inventory, dict)
+        or inventory.get("disposition") != "observed"
+        or inventory.get("source") != "rust_test_terminal_summaries_v1"
+        or len(inventory_counts) != 8
+        or not valid_counts
+        or inventory_counts[0] == 0
+        or inventory_counts[1] == 0
+        or inventory_counts[2] == 0
+        or inventory_counts[3] != inventory_counts[2]
+        or inventory_counts[4] != 0
+        or inventory_counts[6] != 0
+        or inventory_counts[7] != 16
+        or inventory_counts[1] != inventory_counts[2] + inventory_counts[5]
+    ):
+        raise ExperimentError("task semantic receipt does not match the frozen workload")
+
+
+def tree_bytes(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {
+            "entries": 0,
+            "logical_file_bytes": 0,
+            "allocated_file_blocks_bytes": 0,
+        }
+    root_observation = path.lstat()
+    logical = root_observation.st_size
+    allocated = root_observation.st_blocks * 512
+    entries = 1
+    for root, directories, files in os.walk(path, followlinks=False):
+        for name in [*directories, *files]:
+            observed_path = Path(root) / name
+            try:
+                observed = observed_path.lstat()
+            except FileNotFoundError:
+                continue
+            entries += 1
+            logical += observed.st_size
+            allocated += observed.st_blocks * 512
+    return {
+        "entries": entries,
+        "logical_file_bytes": logical,
+        "allocated_file_blocks_bytes": allocated,
+    }
+
+
+def optional_integer(value: object, *, signed: bool) -> bool:
+    return value is None or (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (signed or value >= 0)
+    )
+
+
+def optional_nonnegative_number(value: object) -> bool:
+    return value is None or (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def valid_machine_interval(interval: object, elapsed_seconds: object) -> bool:
+    if not isinstance(interval, dict) or set(interval) != {
+        "duration_basis",
+        "elapsed_seconds",
+        "memory",
+        "pressure",
+    }:
+        return False
+    if (
+        interval["duration_basis"] != "command_elapsed"
+        or interval["elapsed_seconds"] != elapsed_seconds
+        or not optional_nonnegative_number(interval["elapsed_seconds"])
+        or interval["elapsed_seconds"] is None
+    ):
+        return False
+    memory = interval["memory"]
+    if not isinstance(memory, dict) or set(memory) != {
+        "available_bytes_delta",
+        "swap_used_bytes_delta",
+    }:
+        return False
+    if not all(optional_integer(value, signed=True) for value in memory.values()):
+        return False
+    pressure = interval["pressure"]
+    if not isinstance(pressure, dict) or set(pressure) != {"cpu", "memory", "io"}:
+        return False
+    for kind in pressure.values():
+        if not isinstance(kind, dict) or set(kind) != {"some", "full"}:
+            return False
+        for pressure_class in kind.values():
+            if not isinstance(pressure_class, dict) or set(pressure_class) != {
+                "total_microseconds_delta",
+                "stall_fraction_of_command_elapsed",
+            }:
+                return False
+            if not optional_integer(
+                pressure_class["total_microseconds_delta"], signed=False
+            ) or not optional_nonnegative_number(
+                pressure_class["stall_fraction_of_command_elapsed"]
+            ):
+                return False
+    return True
+
+
+def aggregate_task(
+    task: TaskProcess,
+    plan: ExperimentPlan,
+    edited: bool,
+    retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
+) -> dict[str, Any]:
+    benchmark = read_json(task.benchmark_receipt)
+    validate_benchmark_receipt(benchmark, edited, plan.cargo_jobs_per_task)
+    hot_run = read_json(task.hot_run_receipt) if task.hot_run_receipt else None
+    machine_observation = (
+        hot_run.get("machine_observation") if hot_run is not None else None
+    )
+    expected_preparation: list[dict[str, Any]] = []
+    if plan.arm == "private-copy":
+        expected_preparation = [
+            {
+                "path": "target",
+                "mode": "private-copy",
+                "disposition": "reused" if retained_reuse else "seeded",
+            }
+        ]
+    raw_preparation = [] if hot_run is None else hot_run.get("state_preparation")
+    observed_preparation = raw_preparation if isinstance(raw_preparation, list) else None
+    normalized_preparation = [
+        {
+            "path": item.get("path"),
+            "mode": item.get("mode"),
+            "disposition": item.get("disposition"),
+        }
+        for item in observed_preparation or []
+        if isinstance(item, dict)
+    ]
+    source_preparation = (
+        hot_run.get("source_preparation") if hot_run is not None else None
+    )
+    source_counts: tuple[Any, ...] = ()
+    if isinstance(source_preparation, dict):
+        source_counts = tuple(
+            source_preparation.get(field)
+            for field in (
+                "tracked_path_count",
+                "normalized_regular_file_count",
+                "differing_regular_file_count",
+                "skipped_path_count",
+            )
+        )
+    valid_source_counts = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in source_counts
+    )
+    if plan.arm == "private-copy":
+        expected_source_disposition = (
+            "retained_state_unchanged" if retained_reuse else "normalized_on_seed"
+        )
+        source_preparation_matches = (
+            isinstance(source_preparation, dict)
+            and source_preparation.get("mode")
+            == "resident_mtime_for_identical_tracked_regular_files_v1"
+            and source_preparation.get("disposition") == expected_source_disposition
+            and len(source_counts) == 4
+            and valid_source_counts
+            and isinstance(source_preparation.get("elapsed_seconds"), (int, float))
+            and not isinstance(source_preparation.get("elapsed_seconds"), bool)
+            and (
+                source_counts == (0, 0, 0, 0)
+                and source_preparation["elapsed_seconds"] == 0
+                if retained_reuse
+                else source_counts[0] > 0
+                and source_counts[1] > 0
+                and source_counts[0] == sum(source_counts[1:])
+                and source_preparation["elapsed_seconds"] >= 0
+            )
+        )
+    else:
+        source_preparation_matches = source_preparation is None
+    interval = (
+        machine_observation.get("interval")
+        if isinstance(machine_observation, dict)
+        else None
+    )
+    interval_values_are_valid = valid_machine_interval(
+        interval, hot_run.get("elapsed_seconds") if hot_run is not None else None
+    )
+    expected_cache_mode = "native" if plan.arm == "ordinary-native" else plan.arm
+    expected_cross_worktree = plan.arm != "ordinary-native"
+    if hot_run is not None and (
+        hot_run.get("schema_version") != 6
+        or hot_run.get("document_type") != "glaeda-hot-run-measurement"
+        or hot_run.get("exit_code") != 0
+        or hot_run.get("completion_reason") != "exited"
+        or hot_run.get("comparison_key")
+        != comparison_key(
+            plan, edited, retained_reuse, retained_reuse_ordinal
+        )
+        or hot_run.get("cross_worktree") is not expected_cross_worktree
+        or hot_run.get("resource_profile") is not None
+        or hot_run.get("cache_views")
+        != [{"path": "target", "mode": expected_cache_mode}]
+        or normalized_preparation != expected_preparation
+        or observed_preparation is None
+        or not all(isinstance(item, dict) for item in observed_preparation)
+        or not source_preparation_matches
+        or not isinstance(machine_observation, dict)
+        or machine_observation.get("scope") != "host_aggregate"
+        or not all(
+            isinstance(machine_observation.get(phase), dict)
+            and machine_observation[phase].get("status")
+            in ("observed", "partial", "unavailable")
+            for phase in ("before", "after")
+        )
+        or not interval_values_are_valid
+        or (
+            plan.arm == "private-copy"
+            and not all(
+                isinstance(item.get("elapsed_seconds"), (int, float))
+                and (
+                    item["elapsed_seconds"] == 0
+                    if retained_reuse
+                    else item["elapsed_seconds"] > 0
+                )
+                for item in observed_preparation
+            )
+        )
+    ):
+        raise ExperimentError("hot-run receipt does not match the declared arm")
+    return {
+        "task_id": task.task_id,
+        "semantic_validation": "accepted",
+        "benchmark": benchmark,
+        "hot_run": hot_run,
+    }
+
+
+def aggregate_failed_task(
+    task: TaskProcess, plan: ExperimentPlan, edited: bool
+) -> dict[str, Any]:
+    benchmark: dict[str, Any] | None = None
+    semantic_validation = "unobserved"
+    if task.benchmark_receipt.is_file():
+        try:
+            benchmark = read_json(task.benchmark_receipt)
+            validate_benchmark_receipt(
+                benchmark,
+                edited=edited,
+                expected_cargo_jobs=plan.cargo_jobs_per_task,
+            )
+            semantic_validation = "accepted"
+        except ExperimentError:
+            semantic_validation = "rejected"
+    hot_run: dict[str, Any] | None = None
+    if task.hot_run_receipt is not None and task.hot_run_receipt.is_file():
+        try:
+            hot_run = read_json(task.hot_run_receipt)
+        except ExperimentError:
+            hot_run = None
+    return {
+        "task_id": task.task_id,
+        "process_exit_code": task.process.returncode,
+        "semantic_validation": semantic_validation,
+        "benchmark": benchmark,
+        "hot_run": hot_run,
+        "declared_arm": plan.arm,
+    }
+
+
+def run_cohort(
+    plan: ExperimentPlan,
+    resident: Path,
+    tasks: list[Path],
+    states: list[Path],
+    temporary_directories: list[Path],
+    receipts: Path,
+    phase: str,
+    edited: bool,
+    retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
+) -> tuple[float, list[dict[str, Any]], str | None, int]:
+    processes: list[TaskProcess] = []
+    started = time.monotonic()
+    try:
+        cohort = zip(tasks, states, temporary_directories, strict=True)
+        for index, (task, state_path, temporary_directory) in enumerate(cohort, 1):
+            task_id = f"task-{index:02d}"
+            benchmark_receipt = receipts / f"{phase}-{task_id}-benchmark.json"
+            hot_run_receipt = receipts / f"{phase}-{task_id}-hot-run.json"
+            command, hot_receipt = command_for_task(
+                plan,
+                resident,
+                task,
+                state_path,
+                benchmark_receipt,
+                hot_run_receipt,
+                edited,
+                retained_reuse,
+                retained_reuse_ordinal,
+            )
+            processes.append(
+                start_task(
+                    task_id,
+                    command,
+                    task,
+                    benchmark_receipt,
+                    hot_receipt,
+                    plan.cargo_jobs_per_task,
+                    temporary_directory,
+                    plan.task_cpu_sets[index - 1],
+                )
+            )
+        elapsed, failure, maximum_running = wait_for_tasks(
+            processes, plan.deadline_seconds, started
+        )
+    except BaseException:
+        terminate_tasks(processes)
+        raise
+    if failure is not None:
+        return (
+            elapsed,
+            [aggregate_failed_task(task, plan, edited) for task in processes],
+            failure,
+            maximum_running,
+        )
+    try:
+        accepted = [
+            aggregate_task(
+                task,
+                plan,
+                edited,
+                retained_reuse,
+                retained_reuse_ordinal,
+            )
+            for task in processes
+        ]
+    except ExperimentError as error:
+        return (
+            elapsed,
+            [aggregate_failed_task(task, plan, edited) for task in processes],
+            str(error),
+            maximum_running,
+        )
+    inventory_shapes = {
+        tuple(
+            task["benchmark"]["workload"]["test_inventory"][field]
+            for field in (
+                "summary_count",
+                "selected_test_count",
+                "executed_test_count",
+                "passed_test_count",
+                "ignored_test_count",
+                "filtered_out_test_count",
+            )
+        )
+        for task in accepted
+    }
+    if len(inventory_shapes) != 1:
+        return (
+            elapsed,
+            accepted,
+            "fan-out task test inventories diverged",
+            maximum_running,
+        )
+    return (
+        elapsed,
+        accepted,
+        None,
+        maximum_running,
+    )
+
+
+def prime_resident(
+    plan: ExperimentPlan,
+    resident: Path,
+    receipt: Path,
+    temporary_directory: Path,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    task = start_task(
+        "resident",
+        [os.fspath(BENCHMARK), "--output", os.fspath(receipt)],
+        resident,
+        receipt,
+        None,
+        plan.logical_cpus,
+        temporary_directory,
+        plan.available_cpu_ids,
+    )
+    try:
+        elapsed, failure, maximum_running = wait_for_tasks(
+            [task], plan.deadline_seconds, started
+        )
+    except BaseException:
+        terminate_tasks([task])
+        raise
+    if failure is not None:
+        benchmark: dict[str, Any] | None = None
+        semantic_validation = "unobserved"
+        if receipt.is_file():
+            try:
+                benchmark = read_json(receipt)
+                validate_benchmark_receipt(
+                    benchmark,
+                    edited=False,
+                    expected_cargo_jobs=plan.logical_cpus,
+                )
+                semantic_validation = "accepted"
+            except ExperimentError:
+                semantic_validation = "rejected"
+        return {
+            "elapsed_seconds": round(elapsed, 6),
+            "maximum_simultaneous_observed": maximum_running,
+            "process_exit_code": task.process.returncode,
+            "semantic_validation": semantic_validation,
+            "failure": failure,
+            "benchmark": benchmark,
+        }
+    benchmark: dict[str, Any] | None = None
+    try:
+        benchmark = read_json(receipt)
+        validate_benchmark_receipt(
+            benchmark, edited=False, expected_cargo_jobs=plan.logical_cpus
+        )
+    except ExperimentError as error:
+        return {
+            "elapsed_seconds": round(elapsed, 6),
+            "maximum_simultaneous_observed": maximum_running,
+            "process_exit_code": task.process.returncode,
+            "semantic_validation": (
+                "rejected" if benchmark is not None else "unobserved"
+            ),
+            "failure": str(error),
+            "benchmark": benchmark,
+        }
+    return {
+        "elapsed_seconds": round(elapsed, 6),
+        "maximum_simultaneous_observed": maximum_running,
+        "process_exit_code": task.process.returncode,
+        "semantic_validation": "accepted",
+        "failure": None,
+        "benchmark": benchmark,
+    }
+
+
+def advise_resident_target_dontneed(target: Path) -> dict[str, Any]:
+    """Flush and advise away file pages for one owned resident target tree.
+
+    POSIX_FADV_DONTNEED is advisory, so the treatment deliberately records what was
+    requested rather than claiming that it proved a globally cold page cache.
+    """
+    if not hasattr(os, "posix_fadvise") or not hasattr(
+        os, "POSIX_FADV_DONTNEED"
+    ):
+        raise ExperimentError("POSIX_FADV_DONTNEED is unavailable")
+    try:
+        root = target.lstat()
+    except FileNotFoundError as error:
+        raise ExperimentError("resident target is absent for cold advice") from error
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or stat.S_ISLNK(root.st_mode)
+        or root.st_uid != os.getuid()
+    ):
+        raise ExperimentError("resident target is not an owned directory")
+
+    started = time.monotonic()
+    directory_count = 0
+    regular_file_count = 0
+    symlink_count = 0
+    logical_file_bytes = 0
+    allocated_file_blocks_bytes = 0
+    open_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+
+    for directory, child_directories, child_files in os.walk(
+        target, topdown=True, followlinks=False
+    ):
+        directory_path = Path(directory)
+        directory_details = directory_path.lstat()
+        if (
+            not stat.S_ISDIR(directory_details.st_mode)
+            or stat.S_ISLNK(directory_details.st_mode)
+            or directory_details.st_uid != os.getuid()
+        ):
+            raise ExperimentError("resident target contains an unsafe directory")
+        directory_count += 1
+
+        retained_directories: list[str] = []
+        for child_name in child_directories:
+            child = directory_path / child_name
+            child_details = child.lstat()
+            if stat.S_ISLNK(child_details.st_mode):
+                symlink_count += 1
+                continue
+            if (
+                not stat.S_ISDIR(child_details.st_mode)
+                or child_details.st_uid != os.getuid()
+            ):
+                raise ExperimentError("resident target contains an unsafe directory")
+            retained_directories.append(child_name)
+        child_directories[:] = retained_directories
+
+        for child_name in child_files:
+            child = directory_path / child_name
+            before = child.lstat()
+            if stat.S_ISLNK(before.st_mode):
+                symlink_count += 1
+                continue
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid():
+                raise ExperimentError("resident target contains an unsafe file")
+            descriptor = os.open(child, open_flags)
+            try:
+                held = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(held.st_mode)
+                    or held.st_uid != os.getuid()
+                    or (held.st_dev, held.st_ino, held.st_size)
+                    != (before.st_dev, before.st_ino, before.st_size)
+                ):
+                    raise ExperimentError(
+                        "resident target changed during cold advice"
+                    )
+                os.fsync(descriptor)
+                os.posix_fadvise(
+                    descriptor, 0, 0, os.POSIX_FADV_DONTNEED
+                )
+            finally:
+                os.close(descriptor)
+            regular_file_count += 1
+            logical_file_bytes += held.st_size
+            allocated_file_blocks_bytes += held.st_blocks * 512
+
+    if regular_file_count == 0:
+        raise ExperimentError("resident target has no regular files for cold advice")
+    return {
+        "treatment": PAGE_CACHE_RESIDENT_TARGET_DONTNEED,
+        "scope": "resident_target_regular_files",
+        "disposition": "advised",
+        "writeback": "per_file_fsync",
+        "advice": "POSIX_FADV_DONTNEED",
+        "directories": directory_count,
+        "regular_files": regular_file_count,
+        "symlinks_skipped": symlink_count,
+        "logical_file_bytes": logical_file_bytes,
+        "allocated_file_blocks_bytes": allocated_file_blocks_bytes,
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+    }
+
+
+def remove_worktree(repository: Path, worktree: Path) -> None:
+    result = subprocess.run(
+        [
+            os.fspath(GIT),
+            "worktree",
+            "remove",
+            "--force",
+            os.fspath(worktree),
+        ],
+        cwd=repository,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode == 0:
+        return
+    observed = subprocess.run(
+        [os.fspath(GIT), "worktree", "list", "--porcelain", "-z"],
+        cwd=repository,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if observed.returncode != 0 or len(observed.stdout) > 1024 * 1024:
+        raise ExperimentError("experiment worktree cleanup failed")
+    prefix = b"worktree "
+    registered = {
+        Path(os.fsdecode(field.removeprefix(prefix)))
+        for field in observed.stdout.split(b"\0")
+        if field.startswith(prefix)
+    }
+    if worktree in registered:
+        raise ExperimentError("experiment worktree cleanup failed")
+
+
+def remove_owned_experiment_tree(experiment: Path) -> None:
+    """Remove one exact owned tree, including mode-000 OverlayFS work directories."""
+
+    root = experiment.lstat()
+    if (
+        stat.S_ISLNK(root.st_mode)
+        or not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != os.getuid()
+    ):
+        raise ExperimentError("experiment state root is not an owned directory")
+
+    for directory, child_directories, _ in os.walk(
+        experiment, topdown=True, followlinks=False
+    ):
+        for child_name in child_directories:
+            child = Path(directory) / child_name
+            details = child.lstat()
+            if stat.S_ISLNK(details.st_mode):
+                continue
+            if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
+                raise ExperimentError("experiment state contains an unowned directory")
+            owner_access = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+            if details.st_mode & owner_access != owner_access:
+                os.chmod(
+                    child,
+                    stat.S_IMODE(details.st_mode) | owner_access,
+                    follow_symlinks=False,
+                )
+
+    shutil.rmtree(experiment)
+
+
+def write_report(output: Path, report: dict[str, Any]) -> None:
+    output = Path(os.path.abspath(output))
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            os.fchmod(temporary.fileno(), 0o600)
+            json.dump(report, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, output)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def run_experiment(
+    repository: Path,
+    scratch_root: Path,
+    output: Path,
+    plan: ExperimentPlan,
+) -> int:
+    validate_static_contract(repository, plan)
+    scratch_root = validate_scratch_root(scratch_root, output)
+    validate_cargo_config_absence(repository, scratch_root)
+    storage_filesystem: dict[str, Any] = {
+        "before": filesystem_observation(scratch_root)
+    }
+    experiment: Path | None = None
+    created_worktrees: list[Path] = []
+    setup: dict[str, Any] = {}
+    window: dict[str, Any] = {}
+    retained_reuse_window: dict[str, Any] = {"disposition": "not_requested"}
+    retained_reuse_windows: list[dict[str, Any]] = []
+    cleanup: dict[str, Any] = {"disposition": "not_started"}
+    result = "failed"
+    failure: str | None = None
+    try:
+        experiment = Path(
+            tempfile.mkdtemp(
+                prefix=(
+                    f"glaeda-hot-state-{plan.arm}-"
+                    f"{plan.source_materialization}-{plan.fanout}."
+                ),
+                dir=scratch_root,
+            )
+        )
+        experiment.chmod(0o700)
+        worktrees = experiment / "worktrees"
+        states_root = experiment / "states"
+        receipts = experiment / "receipts"
+        temporary_root = experiment / "tmp"
+        for directory in (worktrees, states_root, receipts, temporary_root):
+            directory.mkdir(mode=0o700)
+        resident = worktrees / "resident"
+        tasks = [
+            worktrees / f"task-{index:02d}" for index in range(1, plan.fanout + 1)
+        ]
+        states = [
+            states_root / f"task-{index:02d}" for index in range(1, plan.fanout + 1)
+        ]
+        temporary_directories = [
+            temporary_root / f"task-{index:02d}"
+            for index in range(1, plan.fanout + 1)
+        ]
+        add_worktree(repository, resident)
+        created_worktrees.append(resident)
+
+        if plan.arm in ("overlay", "private-copy"):
+            resident_prime = prime_resident(
+                plan,
+                resident,
+                receipts / "resident-prime.json",
+                temporary_root / "resident",
+            )
+            setup["resident_prime"] = resident_prime
+            if resident_prime["failure"] is not None:
+                raise ExperimentError(str(resident_prime["failure"]))
+
+        created_worktrees.extend(tasks)
+        setup["source_materialization"] = materialize_tasks(
+            plan, repository, resident, tasks
+        )
+
+        if plan.arm not in ("overlay", "private-copy"):
+            (resident / "target").mkdir(mode=0o700)
+            prime_elapsed, prime_tasks, prime_failure, prime_maximum = run_cohort(
+                plan,
+                resident,
+                tasks,
+                states,
+                temporary_directories,
+                receipts,
+                "prime",
+                edited=False,
+            )
+            setup["task_prime"] = {
+                "elapsed_seconds": round(prime_elapsed, 6),
+                "tasks": prime_tasks,
+                "failure": prime_failure,
+                "maximum_simultaneous_observed": prime_maximum,
+            }
+            if prime_failure is not None:
+                raise ExperimentError(prime_failure)
+
+        fixture_started = time.monotonic()
+        for task in tasks:
+            apply_fixture(task)
+        setup["fixture_application_seconds"] = round(
+            time.monotonic() - fixture_started, 6
+        )
+
+        before_observation_started = time.monotonic()
+        setup["pre_window_bytes"] = {
+            "resident": tree_bytes(resident),
+            "tasks": [tree_bytes(task) for task in tasks],
+            "states": [tree_bytes(state_path) for state_path in states],
+        }
+        setup["pre_window_observation_seconds"] = round(
+            time.monotonic() - before_observation_started, 6
+        )
+        if plan.page_cache_treatment == PAGE_CACHE_RESIDENT_TARGET_DONTNEED:
+            setup["page_cache_preparation"] = advise_resident_target_dontneed(
+                resident / "target"
+            )
+        else:
+            setup["page_cache_preparation"] = {
+                "treatment": PAGE_CACHE_RESIDENT_WARM,
+                "scope": "none",
+                "disposition": "not_requested",
+            }
+        window_elapsed, window_tasks, window_failure, window_maximum = run_cohort(
+            plan,
+            resident,
+            tasks,
+            states,
+            temporary_directories,
+            receipts,
+            "edit",
+            edited=True,
+        )
+        post_observation_started = time.monotonic()
+        window = {
+            "elapsed_seconds": round(window_elapsed, 6),
+            "task_known_to_final_result_seconds": round(
+                setup["source_materialization"]["elapsed_seconds"]
+                + setup["fixture_application_seconds"]
+                + window_elapsed,
+                6,
+            ),
+            "task_known_duration_basis": (
+                "source_materialization_plus_fixture_plus_edit_window"
+            ),
+            "maximum_simultaneous_observed": window_maximum,
+            "tasks": window_tasks,
+            "failure": window_failure,
+            "post_window_bytes": {
+                "resident": tree_bytes(resident),
+                "tasks": [tree_bytes(task) for task in tasks],
+                "states": [tree_bytes(state_path) for state_path in states],
+            },
+        }
+        window["post_window_observation_seconds"] = round(
+            time.monotonic() - post_observation_started, 6
+        )
+        storage_filesystem["post_window"] = filesystem_observation(scratch_root)
+        if not same_filesystem_identity(
+            storage_filesystem["before"], storage_filesystem["post_window"]
+        ):
+            raise ExperimentError("scratch filesystem identity changed during the window")
+        if window_failure is not None:
+            raise ExperimentError(window_failure)
+        for ordinal in range(1, plan.retained_reuse_windows + 1):
+            (
+                reuse_elapsed,
+                reuse_tasks,
+                reuse_failure,
+                reuse_maximum,
+            ) = run_cohort(
+                plan,
+                resident,
+                tasks,
+                states,
+                temporary_directories,
+                receipts,
+                f"retained-reuse-{ordinal:02d}",
+                edited=True,
+                retained_reuse=True,
+                retained_reuse_ordinal=ordinal,
+            )
+            reuse_observation_started = time.monotonic()
+            measured_reuse_window = {
+                "disposition": "measured",
+                "ordinal": ordinal,
+                "elapsed_seconds": round(reuse_elapsed, 6),
+                "maximum_simultaneous_observed": reuse_maximum,
+                "tasks": reuse_tasks,
+                "failure": reuse_failure,
+                "post_window_bytes": {
+                    "resident": tree_bytes(resident),
+                    "tasks": [tree_bytes(task) for task in tasks],
+                    "states": [
+                        tree_bytes(state_path) for state_path in states
+                    ],
+                },
+            }
+            measured_reuse_window["post_window_observation_seconds"] = round(
+                time.monotonic() - reuse_observation_started, 6
+            )
+            retained_reuse_windows.append(measured_reuse_window)
+            storage_key = f"post_retained_reuse_window_{ordinal:02d}"
+            storage_filesystem[storage_key] = filesystem_observation(scratch_root)
+            if ordinal == 1:
+                retained_reuse_window = measured_reuse_window
+                storage_filesystem["post_retained_reuse_window"] = (
+                    storage_filesystem[storage_key]
+                )
+            if not same_filesystem_identity(
+                storage_filesystem["before"],
+                storage_filesystem[storage_key],
+            ):
+                raise ExperimentError(
+                    "scratch filesystem identity changed during retained reuse"
+                )
+            if reuse_failure is not None:
+                raise ExperimentError(reuse_failure)
+        result = "succeeded"
+    except (ExperimentError, OSError) as error:
+        failure = str(error)
+    except KeyboardInterrupt:
+        failure = "experiment interrupted"
+    finally:
+        cleanup_started = time.monotonic()
+        cleanup_errors: list[str] = []
+        removed_worktrees = 0
+        for worktree in reversed(created_worktrees):
+            try:
+                remove_worktree(repository, worktree)
+                removed_worktrees += 1
+            except (ExperimentError, OSError):
+                cleanup_errors.append("experiment worktree cleanup failed")
+        if experiment is None:
+            cleanup["disposition"] = "no_state_created"
+        else:
+            if not cleanup_errors:
+                try:
+                    remove_owned_experiment_tree(experiment)
+                except (ExperimentError, OSError):
+                    cleanup_errors.append("experiment state cleanup failed")
+            cleanup["disposition"] = (
+                "removed" if not cleanup_errors else "recovery_required"
+            )
+        cleanup["worktrees_expected"] = len(created_worktrees)
+        cleanup["worktrees_removed"] = removed_worktrees
+        cleanup["failure_count"] = len(cleanup_errors)
+        cleanup["elapsed_seconds"] = round(time.monotonic() - cleanup_started, 6)
+        try:
+            storage_filesystem["after_cleanup"] = filesystem_observation(scratch_root)
+            if not same_filesystem_identity(
+                storage_filesystem["before"], storage_filesystem["after_cleanup"]
+            ):
+                cleanup_errors.append("scratch filesystem identity changed during cleanup")
+                cleanup["disposition"] = "recovery_required"
+                cleanup["failure_count"] = len(cleanup_errors)
+        except (ExperimentError, OSError):
+            cleanup_errors.append("scratch filesystem cleanup observation failed")
+            cleanup["disposition"] = "recovery_required"
+            cleanup["failure_count"] = len(cleanup_errors)
+        if cleanup_errors:
+            result = "failed"
+            cleanup_failure = "; ".join(cleanup_errors)
+            failure = (
+                cleanup_failure
+                if failure is None
+                else f"{failure}; {cleanup_failure}"
+            )
+
+    report = {
+        **plan.to_json(),
+        "document_type": "glaeda-hot-state-fanout-result",
+        "harness": {
+            "commit": git_output(["rev-parse", "HEAD"], cwd=ROOT),
+            "tree": git_output(["rev-parse", "HEAD^{tree}"], cwd=ROOT),
+        },
+        "setup": setup,
+        "window": window,
+        "retained_reuse_window": retained_reuse_window,
+        "retained_reuse_windows": retained_reuse_windows,
+        "storage_filesystem": storage_filesystem,
+        "cleanup": cleanup,
+        "result": result,
+        "failure": failure,
+    }
+    write_report(output, report)
+    return 0 if result == "succeeded" else 1
+
+
+def parse_arguments(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arm", choices=ARMS, required=True)
+    parser.add_argument(
+        "--source-materialization",
+        choices=SOURCE_MATERIALIZATIONS,
+        default="git-sequential",
+        help=(
+            "create task sources with sequential Git, Glaeda ordinary fan-out, "
+            "or exact Glaeda reflink fan-out"
+        ),
+    )
+    parser.add_argument("--fanout", choices=FANOUTS, type=int, required=True)
+    parser.add_argument("--deadline-seconds", type=int, default=DEFAULT_DEADLINE_SECONDS)
+    parser.add_argument(
+        "--page-cache-treatment",
+        choices=PAGE_CACHE_CLI_TREATMENTS,
+        default="resident-uncontrolled-warm",
+        help=(
+            "retain resident pages or fsync and issue POSIX_FADV_DONTNEED for "
+            "the resident target immediately before the edit window"
+        ),
+    )
+    parser.add_argument("--scratch-root", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="print the closed experiment plan without creating physical state",
+    )
+    reuse_group = parser.add_mutually_exclusive_group()
+    reuse_group.add_argument(
+        "--retained-reuse",
+        action="store_true",
+        help=(
+            "run a second exact validation window against the accepted edit "
+            "and retained task state"
+        ),
+    )
+    reuse_group.add_argument(
+        "--retained-reuse-windows",
+        choices=RETAINED_REUSE_WINDOW_COUNTS,
+        type=int,
+        help=(
+            "run a bounded ordinal-specific sequence of retained validation "
+            "windows against the accepted edit and evolving task state"
+        ),
+    )
+    return parser.parse_args(arguments)
+
+
+def interrupt_experiment(_signal: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
+def main(arguments: list[str] | None = None) -> int:
+    parsed = parse_arguments(sys.argv[1:] if arguments is None else arguments)
+    if hasattr(os, "sched_getaffinity"):
+        available_cpu_ids = tuple(sorted(os.sched_getaffinity(0)))
+    else:
+        available_cpu_ids = tuple(range(os.cpu_count() or 1))
+    logical_cpus = len(available_cpu_ids)
+    try:
+        source_materializer_program_sha256 = None
+        if parsed.source_materialization != "git-sequential":
+            if not REFLINK_TASK.is_file() or not os.access(REFLINK_TASK, os.X_OK):
+                raise ExperimentError("Glaeda source materializer is unavailable")
+            source_materializer_program_sha256 = (
+                f"sha256:{file_sha256(REFLINK_TASK)}"
+            )
+        plan = build_plan(
+            parsed.arm,
+            parsed.fanout,
+            logical_cpus,
+            parsed.deadline_seconds,
+            available_cpu_ids,
+            PAGE_CACHE_CLI_TREATMENTS[parsed.page_cache_treatment],
+            parsed.retained_reuse,
+            parsed.retained_reuse_windows,
+            parsed.source_materialization,
+            source_materializer_program_sha256,
+        )
+        if parsed.plan:
+            json.dump(plan.to_json(), sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        if parsed.scratch_root is None or parsed.output is None:
+            raise ExperimentError("physical execution requires --scratch-root and --output")
+        previous_handler = signal.signal(signal.SIGTERM, interrupt_experiment)
+        try:
+            return run_experiment(ROOT, parsed.scratch_root, parsed.output, plan)
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+    except ExperimentError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

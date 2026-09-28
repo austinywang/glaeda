@@ -1,33 +1,33 @@
 #![cfg(target_os = "linux")]
 
-use serde_json::Value;
-use smolrunner::artifact::Sha256Digest;
-use smolrunner::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
-use smolrunner::execution_receipt::{
+use glaeda::artifact::Sha256Digest;
+use glaeda::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
+use glaeda::execution_receipt::{
     ExecutionReceiptActionOutcome, ExecutionReceiptDisposition, ReceiptTimestamp,
     encode_execution_receipt,
 };
-use smolrunner::host_preparation_execution::{
+use glaeda::host_preparation_execution::{
     HOST_PREPARATION_EXECUTION_SCHEMA_VERSION, HostPreparationExecutionDisposition,
     HostPreparationExecutionReport,
 };
-use smolrunner::host_preparation_plan::{
+use glaeda::host_preparation_plan::{
     DeferredActionReason, DeferredHostPreparationAction, FreshObservationBarrier,
     HostReadinessSourceIdentity, SourceExecutableIdentity, SourceRootlessPodmanIdentity,
     SourceRunnerAccountIdentity,
 };
-use smolrunner::host_preparation_receipt::{
+use glaeda::host_preparation_receipt::{
     HostPreparationReceiptContext, HostPreparationReceiptMappingErrorKind,
     map_host_preparation_execution_receipt,
 };
-use smolrunner::host_readiness::HostObservationState;
-use smolrunner::journal::{
+use glaeda::host_readiness::HostObservationState;
+use glaeda::journal::{
     ActionOutcome, ExecutionJournal, ExecutionLane, JOURNAL_SCHEMA_VERSION, JournalRecord,
     PlannedMutation, Preconditions, RollbackClass,
 };
-use smolrunner::lane_command::LaneCommandKind;
-use smolrunner::rootless_podman_preflight::RootlessPodmanPreflightState;
-use smolrunner::state::JournalId;
+use glaeda::lane_command::LaneCommandKind;
+use glaeda::rootless_podman_preflight::RootlessPodmanPreflightState;
+use glaeda::state::JournalId;
+use serde_json::Value;
 
 const PRIVATE_EXECUTABLE_PATH: &str = "/private/host/usr/bin/git";
 const PRIVATE_PRECONDITION: &str = "PRIVATE_PRECONDITION_EVIDENCE";

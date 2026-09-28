@@ -9,32 +9,32 @@ use std::time::Duration;
 
 mod lima_host_identity_support;
 
-use smolrunner::lima_lifecycle::LimaResourceProfile;
-use smolrunner::lima_observation::{
+use glaeda::lima_lifecycle::LimaResourceProfile;
+use glaeda::lima_observation::{
     LimaArchitecture, LimaInstanceName, LimaObservationAdapter, LimaObservationRequest,
     LimaRuntimeState, LimaVmType,
 };
-use smolrunner::mac_availability::{
+use glaeda::mac_availability::{
     AvailabilityRequest, HostPowerSource, MemoryPressure, ObservationFreshness,
 };
-use smolrunner::macos_resource_observation::{
+use glaeda::macos_resource_observation::{
     lima_process_command, memory_pressure_command, power_command, swap_command,
 };
-use smolrunner::operator_config::{
+use glaeda::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
-use smolrunner::process::{
+use glaeda::process::{
     CommandExecutor, CommandSpec, ExecutionRecord, ProcessExecutor, TimedCommandExecutor,
 };
-use smolrunner::verification_profile::VerificationProfileId;
+use glaeda::verification_profile::VerificationProfileId;
 
-use lima_host_identity_support::{LimaHostIdentityFixture, rewrite_disk_identity};
-use smolrunner::personal_worker_mac_observation::{
+use glaeda::personal_worker_mac_observation::{
     PersonalWorkerMacObservationAdapter, PersonalWorkerMacObservationClock,
     PersonalWorkerMacObservationErrorKind, SystemPersonalWorkerMacObservationClock,
     logical_cpu_command, vm_stat_command,
 };
+use lima_host_identity_support::{LimaHostIdentityFixture, rewrite_disk_identity};
 
 const CACHE_PATH: &str = "/home/runner/.cache/cargo";
 const INTERACTIVE_MEMORY: u64 = 3 * 1024 * 1024 * 1024;
@@ -421,7 +421,7 @@ fn host_identity_drift_during_b02_window_fails_closed() {
     assert_eq!(error.code, "lima_host_identity_observation_failed");
     assert_eq!(
         error.lima_host_identity_kind,
-        Some(smolrunner::lima_host_identity::LimaHostIdentityErrorKind::IdentityDrift)
+        Some(glaeda::lima_host_identity::LimaHostIdentityErrorKind::IdentityDrift)
     );
     assert!(error.private_lima_host_identity_failure().is_some());
     assert!(!format!("{error:?}").contains(&fixture.lima_home));

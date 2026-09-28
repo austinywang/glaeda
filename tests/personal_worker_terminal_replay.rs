@@ -5,20 +5,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
     ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
     PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
     PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES, PersonalWorkerDurableCacheLease, PersonalWorkerStore,
     PersonalWorkerStoreDocument, PersonalWorkerStoreError, PersonalWorkerStoreErrorKind,
     PersonalWorkerStoreRecovery, PersonalWorkerStoreRecoveryDisposition,
@@ -26,12 +26,12 @@ use smolrunner::personal_worker_store::{
     PersonalWorkerStoreWriteReceipt, PersonalWorkerTerminalTombstone,
     decode_personal_worker_store_document, encode_personal_worker_store_document,
 };
-use smolrunner::personal_worker_store_transaction::{
+use glaeda::personal_worker_store_transaction::{
     PersonalWorkerStoreMutation, PersonalWorkerStoreMutationDisposition,
     PersonalWorkerStoreMutationErrorKind, apply_personal_worker_store_mutation,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE: u64 = 10_000_000;
@@ -800,7 +800,7 @@ fn terminal_successor_rejects_unrelated_queue_profile_activity_intent_and_time_d
     let (mut queue, leases, tombstones) =
         terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
     queue.pending_profile_change = Some(
-        smolrunner::personal_worker_queue::PersonalWorkerPendingProfileChange {
+        glaeda::personal_worker_queue::PersonalWorkerPendingProfileChange {
             target: PersonalWorkerProfile::Interactive,
             requested_at: terminal.observed_at(),
         },

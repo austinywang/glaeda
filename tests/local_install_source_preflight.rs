@@ -8,16 +8,16 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sha2::{Digest as _, Sha256};
-use smolrunner::artifact::{CommitId, GitTreeId, Sha256Digest};
-use smolrunner::local_install_plan::{LocalInstallSourceIdentity, LocalInstallToolchainIdentity};
-use smolrunner::local_install_source_preflight::{
+use glaeda::artifact::{CommitId, GitTreeId, Sha256Digest};
+use glaeda::local_install_plan::{LocalInstallSourceIdentity, LocalInstallToolchainIdentity};
+use glaeda::local_install_source_preflight::{
     LocalInstallSourceBlockingCode, observe_local_install_source_preflight,
 };
-use smolrunner::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
-use smolrunner::project_checkout_observation::{
-    PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectCheckoutObserver,
+use glaeda::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use glaeda::project_checkout_observation::{
+    PROJECT_CHECKOUT_COMMAND_TIMEOUT, PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT, ProjectCheckoutObserver,
 };
+use sha2::{Digest as _, Sha256};
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
 const TREE: &str = "2222222222222222222222222222222222222222";
@@ -103,7 +103,18 @@ impl TimedCommandExecutor for ScriptedExecutor {
         spec: &CommandSpec,
         timeout: std::time::Duration,
     ) -> io::Result<ExecutionRecord> {
-        assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
+        let argv = spec.displayed_argv();
+        let tree_scan = argv
+            .iter()
+            .any(|argument| argument == "status" || argument == "ls-files");
+        assert_eq!(
+            timeout,
+            if tree_scan {
+                PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT
+            } else {
+                PROJECT_CHECKOUT_COMMAND_TIMEOUT
+            }
+        );
         self.commands.borrow_mut().push(spec.clone());
         let response = self
             .responses
@@ -151,7 +162,7 @@ fn snapshot(commit: &str) -> Vec<Response> {
     vec![
         Response::success(format!("{commit}\n")),
         Response::success(format!("{TREE}\n")),
-        Response::success("remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0"),
+        Response::success("remote.origin.url\nhttps://github.com/teamleaderleo/glaeda.git\0"),
         Response::failed(1, ""),
         Response::success(format!("# branch.oid {commit}\0# branch.head main\0")),
         Response::success("100644\n"),

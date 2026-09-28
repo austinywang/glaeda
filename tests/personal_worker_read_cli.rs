@@ -7,26 +7,26 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
     ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
     PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
     PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
     PersonalWorkerTerminalTombstone, encode_personal_worker_store_document,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use rustix::fs::{FlockOperation, flock};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE: u64 = 8_000_000;
@@ -246,11 +246,11 @@ fn create_store(root: &TempRoot, document: &PersonalWorkerStoreDocument) {
     store.create(document).expect("create durable document");
 }
 
-fn run_smolrunner(arguments: &[&OsStr]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_smolrunner"))
+fn run_glaeda(arguments: &[&OsStr]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_glaeda"))
         .args(arguments)
         .output()
-        .expect("run installed smolrunner binary")
+        .expect("run installed glaeda binary")
 }
 
 fn output_text(bytes: &[u8]) -> String {
@@ -285,7 +285,7 @@ fn installed_cli_reads_status_queue_and_active_job_without_lock_or_writes() {
     flock(&lock, FlockOperation::NonBlockingLockExclusive).expect("hold writer lock");
 
     let root_arg = root.path().as_os_str();
-    let status = run_smolrunner(&[
+    let status = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("worker"),
@@ -300,7 +300,7 @@ fn installed_cli_reads_status_queue_and_active_job_without_lock_or_writes() {
     assert_eq!(status_json["queue_generation"], 1);
     assert_eq!(status_json["active_count"], 1);
 
-    let queue = run_smolrunner(&[
+    let queue = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("queue"),
@@ -325,7 +325,7 @@ fn installed_cli_reads_status_queue_and_active_job_without_lock_or_writes() {
     );
     assert_eq!(queue_json["next_offset"], 1);
 
-    let job = run_smolrunner(&[
+    let job = run_glaeda(&[
         OsStr::new("job"),
         OsStr::new("show"),
         OsStr::new("--store-root"),
@@ -362,7 +362,7 @@ fn installed_cli_renders_unobserved_never_active_status_without_guessing() {
     .expect("unobserved document");
     create_store(&root, &document);
 
-    let json_output = run_smolrunner(&[
+    let json_output = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("worker"),
@@ -387,7 +387,7 @@ fn installed_cli_renders_unobserved_never_active_status_without_guessing() {
     );
     assert_eq!(value["desired_profile"], "stopped");
 
-    let human_output = run_smolrunner(&[
+    let human_output = run_glaeda(&[
         OsStr::new("worker"),
         OsStr::new("status"),
         OsStr::new("--store-root"),
@@ -430,7 +430,7 @@ fn installed_cli_distinguishes_canonical_v1_from_corrupt_state() {
     );
     fs::write(root.store_directory().join("current.json"), v1).expect("write canonical v1");
 
-    let output = run_smolrunner(&[
+    let output = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("worker"),
@@ -462,7 +462,7 @@ fn installed_cli_projects_retained_terminal_and_bounds_errors() {
     create_store(&root, &terminal_document());
     let root_arg = root.path().as_os_str();
 
-    let terminal = run_smolrunner(&[
+    let terminal = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("job"),
@@ -488,7 +488,7 @@ fn installed_cli_projects_retained_terminal_and_bounds_errors() {
         "terminal-one"
     );
 
-    let stale = run_smolrunner(&[
+    let stale = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("queue"),
@@ -506,7 +506,7 @@ fn installed_cli_projects_retained_terminal_and_bounds_errors() {
     assert_eq!(stale_json["kind"], "stale_revision");
     assert!(!stale_text.contains(root.path().to_string_lossy().as_ref()));
 
-    let missing = run_smolrunner(&[
+    let missing = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("job"),
@@ -528,7 +528,7 @@ fn installed_cli_projects_retained_terminal_and_bounds_errors() {
 #[test]
 fn installed_cli_does_not_create_or_recover_durable_state() {
     let missing_root = TempRoot::new("missing");
-    let missing = run_smolrunner(&[
+    let missing = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("worker"),
@@ -570,7 +570,7 @@ fn installed_cli_does_not_create_or_recover_durable_state() {
     fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600)).expect("set staged mode");
 
     let before = store_snapshot(&root);
-    let status = run_smolrunner(&[
+    let status = run_glaeda(&[
         OsStr::new("--output"),
         OsStr::new("json"),
         OsStr::new("worker"),

@@ -3,7 +3,7 @@
 use std::env;
 use std::fs;
 
-use smolrunner::project_disk_host_observation::{
+use glaeda::project_disk_host_observation::{
     LimaStandaloneDiskDisposition, LimaStandaloneDiskFixtureObservationRequest,
     LimaStandaloneDiskName, observe_lima_standalone_disk_fixture,
 };

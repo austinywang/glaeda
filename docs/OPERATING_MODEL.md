@@ -4,7 +4,7 @@
 
 This document records product direction and sequencing. It is not an accepted mutation protocol and does not grant the current executable any new authority.
 
-SmolRunner remains pre-alpha. Today it provides diagnostics, deterministic plans, bounded observations, ownership models, and durable execution primitives. Live runner installation, registration, upgrade, autonomous repair, remote telemetry, backup, and fleet coordination remain future work.
+Glaeda remains pre-alpha. Today it provides diagnostics, deterministic plans, bounded observations, ownership models, and durable execution primitives. Live runner installation, registration, upgrade, autonomous repair, remote telemetry, backup, and fleet coordination remain future work.
 
 Tracked implementation contracts:
 
@@ -15,11 +15,11 @@ Tracked implementation contracts:
 
 ## Product principle
 
-“Smol” describes the operator surface and deployment footprint, not the absence of reliability machinery.
+The operator surface and deployment footprint should stay small without sacrificing reliability machinery.
 
-A human or agent should eventually be able to use a small set of predictable commands while SmolRunner handles version identity, state validation, draining, journals, rollback, incident evidence, retention, and recovery behind that surface.
+A human or agent should eventually be able to use a small set of predictable commands while Glaeda handles version identity, state validation, draining, journals, rollback, incident evidence, retention, and recovery behind that surface.
 
-Complexity is justified when it removes repeated operator work or prevents data loss, host compromise, silent drift, or unrecoverable runner failure. It is not justified when it invents another workflow language, hides authority, or turns SmolRunner into a general-purpose cloud platform.
+Complexity is justified when it removes repeated operator work or prevents data loss, host compromise, silent drift, or unrecoverable runner failure. It is not justified when it invents another workflow language, hides authority, or turns Glaeda into a general-purpose cloud platform.
 
 ## System boundary
 
@@ -32,7 +32,7 @@ GitHub Actions
 Official GitHub Actions runner
     authenticated listener for one repository or organization scope
 
-SmolRunner
+Glaeda
     desired state, ownership, lifecycle, isolation policy, diagnostics,
     release management, recovery evidence, and later fleet coordination
 
@@ -47,7 +47,7 @@ A runner host is not automatically a production deployment host. Sharing one mac
 
 ## A living system without self-granted authority
 
-SmolRunner may become self-observing, self-healing, and improvement-oriented, but those terms have strict meanings:
+Glaeda may become self-observing, self-healing, and improvement-oriented, but those terms have strict meanings:
 
 - **self-observing** means collecting bounded typed facts and public receipts;
 - **self-healing** means executing pre-authorised, narrowly classified repairs through the same ownership, lane, journal, and fresh-verification boundaries as operator-triggered work;
@@ -88,22 +88,22 @@ One canary failure can pause promotion. Repeated failures across canaries should
 
 ### Stable
 
-Stable hosts run tagged, verified releases selected by explicit policy. A stable channel is not a mutable `latest` identity: each host records one exact SmolRunner version and binary digest.
+Stable hosts run tagged, verified releases selected by explicit policy. A stable channel is not a mutable `latest` identity: each host records one exact Glaeda version and binary digest.
 
-The official GitHub runner version is tracked independently from the SmolRunner version.
+The official GitHub runner version is tracked independently from the Glaeda version.
 
 ## Independent repair path
 
-SmolRunner must not depend exclusively on the fleet it manages to produce its next repair.
+Glaeda must not depend exclusively on the fleet it manages to produce its next repair.
 
-The SmolRunner repository should retain GitHub-hosted CI or another separately managed path capable of building, testing, and publishing a recovery release. Self-hosted canaries can add systemd, ARM64, Podman, and real-host evidence, but they are supplementary until an independent escape hatch is proven.
+The Glaeda repository should retain GitHub-hosted CI or another separately managed path capable of building, testing, and publishing a recovery release. Self-hosted canaries can add systemd, ARM64, Podman, and real-host evidence, but they are supplementary until an independent escape hatch is proven.
 
 ## Version and state identities
 
 A trustworthy host records at least:
 
-- SmolRunner semantic version;
-- exact SmolRunner binary digest;
+- Glaeda semantic version;
+- exact Glaeda binary digest;
 - supported durable-state schema range;
 - official GitHub runner version and archive digest;
 - installation identity;
@@ -183,7 +183,7 @@ A later coordinator may distribute versioned policy directives, but it is not an
 
 A directive may select:
 
-- allowed SmolRunner and official-runner versions;
+- allowed Glaeda and official-runner versions;
 - release channel and maintenance window;
 - maximum unavailable hosts;
 - capability labels and workload admission limits;
@@ -222,7 +222,7 @@ Local health observations, execution receipts, incident bundles, and upstream is
 A valid incident bundle may contain bounded facts such as:
 
 - normalized incident and failure codes;
-- SmolRunner and official-runner versions;
+- Glaeda and official-runner versions;
 - distribution, architecture, and declared capability class;
 - pseudonymous installation or fleet identity;
 - relevant public plan, journal, action, run, and artifact identities;
@@ -259,9 +259,9 @@ Durable ownership records, journals, lease records needed for cleanup, release m
 
 Temporary tokens, active secrets, `/run` state, disposable worktrees, mutable caches, temporary containers, and reproducible downloaded artifacts are not authoritative backup state.
 
-Project databases and user uploads remain project-owned persistence domains. SmolRunner may later invoke project-specific backup adapters, but cannot claim that one generic host snapshot safely backs up every application.
+Project databases and user uploads remain project-owned persistence domains. Glaeda may later invoke project-specific backup adapters, but cannot claim that one generic host snapshot safely backs up every application.
 
-Restore begins quarantined. Restored documents do not authorise adoption by themselves. SmolRunner re-observes host resources and GitHub registrations, classifies drift or conflict, and produces a recovery plan before new host-specific evidence is written.
+Restore begins quarantined. Restored documents do not authorise adoption by themselves. Glaeda re-observes host resources and GitHub registrations, classifies drift or conflict, and produces a recovery plan before new host-specific evidence is written.
 
 A VM snapshot is useful recovery material but is never current proof of external registration or managed-resource ownership.
 
@@ -270,15 +270,15 @@ A VM snapshot is useful recovery material but is never current proof of external
 The detailed internal model should eventually support a small public surface:
 
 ```text
-smolrunner doctor
-smolrunner status
-smolrunner reconcile
-smolrunner upgrade
-smolrunner rollback
-smolrunner incident
-smolrunner backup
-smolrunner restore
-smolrunner quarantine
+glaeda doctor
+glaeda status
+glaeda reconcile
+glaeda upgrade
+glaeda rollback
+glaeda incident
+glaeda backup
+glaeda restore
+glaeda quarantine
 ```
 
 Each high-level command may expose `plan`, `apply`, `status`, or `verify` subcommands where authority or recovery requires the distinction. Human output and stable JSON come from the same typed reports.

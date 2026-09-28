@@ -100,7 +100,7 @@ pub fn build(manifest: &Manifest, source: &Path) -> PlanReport {
 #[must_use]
 pub fn render_human(report: &PlanReport) -> String {
     let mut output = format!(
-        "SmolRunner plan\n\nManifest: {}\nRepository: {}\n\n",
+        "Glaeda plan\n\nManifest: {}\nRepository: {}\n\n",
         report.source, report.repository
     );
 
@@ -148,7 +148,7 @@ trust:
     #[test]
     fn plan_is_stable_and_read_only_by_construction() {
         let manifest = parse(MANIFEST).expect("valid manifest");
-        let plan = build(&manifest, Path::new("smolrunner.yml"));
+        let plan = build(&manifest, Path::new("glaeda.yml"));
 
         assert_eq!(plan.actions.len(), 4);
         assert_eq!(plan.actions[0].kind, PlanActionKind::EnsureRunnerUser);
@@ -160,7 +160,7 @@ trust:
     fn organization_scope_targets_owner() {
         let manifest = parse(&MANIFEST.replace("scope: repository", "scope: organization"))
             .expect("valid organization manifest");
-        let plan = build(&manifest, Path::new("smolrunner.yml"));
+        let plan = build(&manifest, Path::new("glaeda.yml"));
         assert!(plan.actions[1].summary.ends_with("for example"));
     }
 }

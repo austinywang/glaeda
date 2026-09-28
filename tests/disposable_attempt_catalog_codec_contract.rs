@@ -1,4 +1,4 @@
-use smolrunner::disposable_attempt_catalog::{
+use glaeda::disposable_attempt_catalog::{
     DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION, DisposableAttemptCatalog,
     DisposableAttemptCatalogAction, DisposableAttemptCatalogCodecErrorKind,
     DisposableAttemptCatalogDocument, DisposableAttemptCatalogError,
@@ -8,19 +8,19 @@ use smolrunner::disposable_attempt_catalog::{
     MAX_DISPOSABLE_ATTEMPT_TOMBSTONES, MemoryDisposableAttemptCatalogStore,
     decode_disposable_attempt_catalog, encode_disposable_attempt_catalog,
 };
-use smolrunner::disposable_attempt_state::{
+use glaeda::disposable_attempt_state::{
     DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
-use smolrunner::disposable_prepared_template::{
+use glaeda::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
     decode_disposable_prepared_template, encode_disposable_prepared_template,
 };
-use smolrunner::disposable_worker_reconciler::{
+use glaeda::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
     DisposableWorkerResources,
 };
-use smolrunner::execution_admission::EpochMillis;
-use smolrunner::github_scale_set_protocol::{
+use glaeda::execution_admission::EpochMillis;
+use glaeda::github_scale_set_protocol::{
     ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
     ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };

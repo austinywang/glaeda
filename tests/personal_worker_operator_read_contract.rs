@@ -5,28 +5,28 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FlockOperation, flock};
-use smolrunner::execution_admission::{EpochMillis, ExecutionRequestId};
-use smolrunner::lima_observation::LimaInstanceName;
-use smolrunner::mac_availability::AvailabilityRequest;
-use smolrunner::operator_config::{
+use glaeda::execution_admission::{EpochMillis, ExecutionRequestId};
+use glaeda::lima_observation::LimaInstanceName;
+use glaeda::mac_availability::AvailabilityRequest;
+use glaeda::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
-use smolrunner::operator_error::OperatorErrorCode;
-use smolrunner::personal_worker_operator_read::{
+use glaeda::operator_error::OperatorErrorCode;
+use glaeda::personal_worker_operator_read::{
     PERSONAL_WORKER_OPERATOR_READ_SCHEMA_VERSION, PersonalWorkerOperatorReadErrorKind,
     PersonalWorkerOperatorReadService, PersonalWorkerSnapshotExpectation,
 };
-use smolrunner::personal_worker_operator_store::{
+use glaeda::personal_worker_operator_store::{
     PersonalWorkerInitializationInput, PersonalWorkerOperatorStore,
 };
-use smolrunner::personal_worker_queue::PersonalWorkerQueueGeneration;
-use smolrunner::personal_worker_read_model::{
+use glaeda::personal_worker_queue::PersonalWorkerQueueGeneration;
+use glaeda::personal_worker_read_model::{
     PersonalWorkerJobReadRequest, PersonalWorkerQueuePageRequest,
 };
-use smolrunner::personal_worker_store::PersonalWorkerStoreRevision;
-use smolrunner::verification_profile::VerificationProfileId;
+use glaeda::personal_worker_store::PersonalWorkerStoreRevision;
+use glaeda::verification_profile::VerificationProfileId;
+use rustix::fs::{FlockOperation, flock};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 

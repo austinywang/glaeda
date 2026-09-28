@@ -1440,7 +1440,7 @@ mod tests {
 
     #[test]
     fn disposable_noble_loader_cache_matches_the_closed_model() {
-        if std::env::var("SMOLRUNNER_ELF_PACKAGE_PROBE").as_deref() != Ok("github-hosted-ubuntu") {
+        if std::env::var("GLAEDA_DISPOSABLE_PROBE").as_deref() != Ok("1") {
             return;
         }
         let architecture = match std::env::consts::ARCH {

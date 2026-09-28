@@ -1,0 +1,20 @@
+// glaeda fleet-cas extension, served by the fleet store beside the LLVM
+// compilation-cache services. Not part of the Xcode protocol: node daemons
+// use it to fetch everything an index entry needs in one streamed call.
+syntax = "proto3";
+
+package glaeda.fleetcas.v1;
+
+service FleetCas {
+  // Stream every stored object reachable from the roots (the roots included),
+  // each once. Unknown IDs are skipped; the caller verifies every object.
+  rpc GetClosure(ClosureRequest) returns (stream ClosureObject) {}
+}
+
+message ClosureRequest { repeated bytes roots = 1; }
+
+// `object` is an encoded compilation_cache_service.cas.v1.CASObject.
+message ClosureObject {
+  bytes id = 1;
+  bytes object = 2;
+}

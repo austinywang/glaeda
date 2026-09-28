@@ -1,0 +1,27 @@
+{
+  "schema": "glaeda-cmux-fleet-enrollment/v1",
+  "nodeId": "cmux-example-mac-001",
+  "architecture": "arm64",
+  "os": {
+    "family": "macos",
+    "versionClass": "macos-26"
+  },
+  "hardwareCapabilityClass": "cmux-mac-build-large",
+  "supportedToolchainGenerations": [
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "allowedExecutionRoles": [
+    "cmux_macos_native_build"
+  ],
+  "operatorFleetScope": "cmux-founders",
+  "enrollmentGeneration": 1,
+  "glaedaGeneration": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "state": "enrolling",
+  "quarantineReason": null,
+  "roleProfiles": {
+    "cmux_macos_native_build": {
+      "id": "cmux.macos.dev-check",
+      "generation": 1
+    }
+  }
+}

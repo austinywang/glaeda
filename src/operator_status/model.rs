@@ -20,7 +20,7 @@ use crate::personal_worker_read_model::{
 };
 use crate::personal_worker_store::PersonalWorkerStoreRevision;
 
-pub const OPERATOR_STATUS_SCHEMA_VERSION: u8 = 2;
+pub const OPERATOR_STATUS_SCHEMA_VERSION: u8 = 3;
 pub const MAX_OPERATOR_STATUS_BLOCKERS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -265,8 +265,24 @@ pub enum OperatorTerminalResult {
     Failed { error: OperatorPublicError },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorTerminalScope {
+    LocalPersonalWorkerTerminal,
+}
+
+impl OperatorTerminalScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPersonalWorkerTerminal => "local_personal_worker_terminal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperatorTerminalSummary {
+    scope: OperatorTerminalScope,
     identity: ExecutionAdmissionIdentity,
     source: PersonalWorkerSourceIdentity,
     completed_at: EpochMillis,
@@ -284,6 +300,7 @@ impl OperatorTerminalSummary {
         result: OperatorTerminalResult,
     ) -> Self {
         Self {
+            scope: OperatorTerminalScope::LocalPersonalWorkerTerminal,
             identity,
             source,
             completed_at,
@@ -304,6 +321,11 @@ impl OperatorTerminalSummary {
             view.evidence_digest().clone(),
             result,
         )
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> OperatorTerminalScope {
+        self.scope
     }
 
     #[must_use]
@@ -487,14 +509,16 @@ impl fmt::Display for OperatorStatusReport {
             match terminal.result {
                 OperatorTerminalResult::Succeeded => writeln!(
                     formatter,
-                    "terminal: request={} result=succeeded completed_at={} evidence={}",
+                    "terminal: scope={} request={} result=succeeded completed_at={} evidence={}",
+                    terminal.scope.as_str(),
                     terminal.identity.request_id.as_str(),
                     terminal.completed_at.get(),
                     terminal.evidence_digest.as_str(),
                 )?,
                 OperatorTerminalResult::Failed { error } => writeln!(
                     formatter,
-                    "terminal: request={} result=failed completed_at={} evidence={} summary={}",
+                    "terminal: scope={} request={} result=failed completed_at={} evidence={} summary={}",
+                    terminal.scope.as_str(),
                     terminal.identity.request_id.as_str(),
                     terminal.completed_at.get(),
                     terminal.evidence_digest.as_str(),
@@ -1011,7 +1035,7 @@ mod tests {
         let human = report.render_human();
         assert!(human.contains("current=unobserved"));
         assert!(human.contains("worker activity: never"));
-        assert!(human.contains("next: smolrunner worker run-once"));
+        assert!(human.contains("next: glaeda worker run-once"));
     }
 
     #[test]
@@ -1248,8 +1272,20 @@ mod tests {
         )
         .expect("terminal");
         assert!(report.active_job().is_none());
-        assert!(report.latest_terminal().is_some());
-        assert!(report.render_human().contains("result=failed"));
+        let terminal = report.latest_terminal().expect("terminal summary");
+        assert_eq!(
+            terminal.scope(),
+            OperatorTerminalScope::LocalPersonalWorkerTerminal
+        );
+        let value = serde_json::to_value(&report).expect("JSON");
+        assert_eq!(value["schema_version"], json!(3));
+        assert_eq!(
+            value["latest_terminal"]["scope"],
+            json!("local_personal_worker_terminal")
+        );
+        let human = report.render_human();
+        assert!(human.contains("scope=local_personal_worker_terminal"));
+        assert!(human.contains("result=failed"));
     }
 
     #[test]

@@ -1,15 +1,17 @@
 # Disposable autoscaling CI
 
-This document is the product direction for SmolRunner. It supersedes the persistent personal-worker sequence in `PERSONAL_WORKER_ALPHA.md` and the rootless-Podman-first sequence in the older roadmap.
+This document is the product direction for Glaeda. It supersedes the persistent personal-worker sequence in `PERSONAL_WORKER_ALPHA.md` and the rootless-Podman-first sequence in the older roadmap.
+
+The checked-in `examples/lima/smolrunner-prepared-template.yaml` filename below is an exact existing template identity. Its owning migration lane will move that executable surface; this documentation lane preserves the filename while using Glaeda for the current product.
 
 ## Product outcome
 
-An operator enrolls a repository and leaves SmolRunner running. For each eligible GitHub Actions job, SmolRunner admits capacity, creates one isolated worker on the operator's Mac, registers a just-in-time runner, waits for exactly one job, records the result, destroys the worker, and returns the reserved capacity. Crashes, reboots, stale GitHub registrations, and partial provisioning are reconciled automatically.
+An operator enrolls a repository and leaves Glaeda running. For each eligible GitHub Actions job, Glaeda admits capacity, creates one isolated worker on the operator's Mac, registers a just-in-time runner, waits for exactly one job, records the result, destroys the worker, and returns the reserved capacity. Crashes, reboots, stale GitHub registrations, and partial provisioning are reconciled automatically.
 
 The first production path is:
 
 ```text
-queued GitHub job assigned to the SmolRunner scale set
+queued GitHub job assigned to the Glaeda scale set
 -> durable capacity reservation
 -> fresh Lima/VZ VM
 -> just-in-time GitHub runner registration
@@ -19,17 +21,17 @@ queued GitHub job assigned to the SmolRunner scale set
 -> reservation release and scale to zero
 ```
 
-GitHub Actions remains the scheduler and workflow language. SmolRunner does not interpret workflow steps or reimplement the runner protocol.
+GitHub Actions remains the scheduler and workflow language. Glaeda does not interpret workflow steps or reimplement the runner protocol.
 
 ## Actual threat model
 
-Repository content, workflow steps, actions, build scripts, dependencies, test code, and nested containers are hostile. This includes the operator's repositories and known open-source repositories. GitHub, the pinned official runner distribution, Lima, Apple Virtualization Framework, the pinned guest image, macOS, and SmolRunner's controller are trusted components whose security updates must be applied deliberately.
+Repository content, workflow steps, actions, build scripts, dependencies, test code, and nested containers are hostile. This includes the operator's repositories and known open-source repositories. GitHub, the pinned official runner distribution, Lima, Apple Virtualization Framework, the pinned guest image, macOS, and Glaeda's controller are trusted components whose security updates must be applied deliberately.
 
 The protected assets are the Mac host, host credentials and personal data, other workers, other network services, the controller's GitHub App credential, and the availability of the host and surrounding network.
 
 The realistic attacker goals are host escape, persistence after a job, theft of host or unrelated credentials, access to other workers, lateral movement to the LAN, abuse of outbound connectivity, and resource exhaustion. A job is allowed to corrupt its own guest completely. Destroying that guest is the recovery mechanism.
 
-The first release does not promise protection from a vulnerability in macOS or Apple Virtualization Framework, a malicious pinned guest image or official runner distribution, a compromised SmolRunner controller, or secrets intentionally supplied to that job by its GitHub workflow. Those are explicit trusted-computing-base and workflow-policy risks, not facts SmolRunner can prove away.
+The first release does not promise protection from a vulnerability in macOS or Apple Virtualization Framework, a malicious pinned guest image or official runner distribution, a compromised Glaeda controller, or secrets intentionally supplied to that job by its GitHub workflow. Those are explicit trusted-computing-base and workflow-policy risks, not facts Glaeda can prove away.
 
 ## Smallest credible security boundary
 
@@ -37,13 +39,13 @@ The following controls are release blockers.
 
 1. **One fresh VM per job.** Potentially hostile repository code never runs in the Mac host namespace or in a long-lived worker. The VM is destroyed after one job, timeout, cancellation, runner loss, or controller recovery.
 2. **No host integration.** The VM has no host filesystem mount, SSH-agent forwarding, credential socket, dynamic port forwarding, host environment inheritance, or container-control socket. Lima plain mode is the preferred starting configuration because it disables mounts, dynamic forwarding, built-in containerd, guest agent, Rosetta, and SSH-agent forwarding. Any required static control channel is explicit and controller-owned.
-3. **One just-in-time runner.** SmolRunner uses GitHub's supported runner scale-set and JIT/ephemeral interfaces with a unique runner identity. The runner receives at most one job. GitHub owns label matching and assignment; SmolRunner binds the actual assigned job from the scale-set lifecycle message before accepting terminal evidence. The official runner archive and guest template are pinned and verified outside the workload.
+3. **One just-in-time runner.** Glaeda uses GitHub's supported runner scale-set and JIT/ephemeral interfaces with a unique runner identity. The runner receives at most one job. GitHub owns label matching and assignment; Glaeda binds the actual assigned job from the scale-set lifecycle message before accepting terminal evidence. The official runner archive and guest template are pinned and verified outside the workload.
 4. **Credentials stay in the control plane.** A least-privilege GitHub App credential is stored on the Mac. Only the short-lived JIT configuration needed by the one runner enters the VM. It is never logged, persisted in public journals, exposed in argv, or reused. Workflow-provided job secrets remain GitHub/workflow responsibility.
 5. **Hostile-CI network policy.** Inbound connectivity is denied. Outbound internet needed for ordinary builds is allowed, while host, private, link-local, metadata, peer-worker, and controller networks are denied. The policy is enforced outside workload authority by a mature firewall or egress gateway. Connection/rate limits and project-specific exceptions follow after the base deny policy works.
 6. **Hard resource and concurrency ceilings.** Admission reserves CPU, memory, disk, and one concurrency slot before provisioning. The VM has fixed CPU, RAM, and disk limits plus a wall deadline. A host-wide budget prevents concurrent workers from exhausting the Mac. Zero admitted jobs means zero running worker VMs.
 7. **Durable lifecycle and recovery.** Every externally visible mutation has a durable attempt identity and checkpoint. Reconciliation is idempotent: it may finish cleanup, remove a stale runner, destroy an orphan VM, or retry a bounded provisioning failure, but never silently widens authority or starts a second worker for the same job.
 8. **Unprivileged guest workload.** The runner user has no sudo or equivalent guest administrative authority. Nested containers, when enabled, are rootless inside the disposable VM. Guest compromise is expected; the VM boundary, network policy, credentials policy, resource limits, and destruction contain it.
-9. **Bounded external diagnostics.** Runner lifecycle logs needed to diagnose ephemeral runners are copied to bounded controller-owned storage. Raw repository contents, environment dumps, job secrets, and arbitrary logs are not durable SmolRunner state.
+9. **Bounded external diagnostics.** Runner lifecycle logs needed to diagnose ephemeral runners are copied to bounded controller-owned storage. Raw repository contents, environment dumps, job secrets, and arbitrary logs are not durable Glaeda state.
 
 These controls are stronger and simpler than treating a rootless host container as the primary hostile-code boundary. A container backend can remain available later for lower-risk or high-throughput work, but it is not the default hostile-CI backend.
 
@@ -72,7 +74,7 @@ The initial cache policy is intentionally conservative: use GitHub Actions cache
 
 ## Delegated mature components
 
-SmolRunner deliberately delegates:
+Glaeda deliberately delegates:
 
 - workflow semantics, job routing, scale-set demand, message acknowledgement, JIT configuration, job tokens, and one-job runner behavior to GitHub Actions, the official [Runner Scale Set Client](https://github.com/actions/scaleset), and the official runner;
 - VM isolation and lifecycle to Apple Virtualization Framework through Lima;
@@ -86,13 +88,13 @@ SmolRunner deliberately delegates:
 - Mac service supervision to `launchd`;
 - initial cache/artifact transport to GitHub Actions.
 
-SmolRunner still owns the exact configuration of those components, admission, scoped credential acquisition, durable orchestration, drift handling, cleanup, and truthful reporting.
+Glaeda still owns the exact configuration of those components, admission, scoped credential acquisition, durable orchestration, drift handling, cleanup, and truthful reporting.
 
 ## Shortest milestones
 
 ### M1 — disposable-attempt control contract
 
-Add the small durable lifecycle that joins one scale-set capacity claim, one capacity reservation, one VM identity, one runner registration, and the actual GitHub job when GitHub assigns it. Clone authorization and clone start are separate durable checkpoints so a controller crash cannot replay creation. The pure reconciler never learns ownership from a VM that merely appears under the selected name: an unbound `CloneStarted` attempt is recovery debt regardless of whether one observation says present or absent, and cannot adopt, delete, release capacity, or accept late job evidence. The private clone transaction foundation holds the canonical store lock while it reopens the current reservation and prepared-template generation, freshly proves the exact source ready and stopped plus the target absent, and requires a live revision/claim/time-bound capacity and cancellation source immediately before both `CloneStarted` publication and the fixed command. Injected tests prove one bounded clone can bind only the finally reconfirmed post-command host observation. The public method is unusable until the Scale Set/capacity adapter supplies SmolRunner's crate-sealed source, so external callers cannot forge the live veto. The identity is only a durable drift token: every later mutation service must still freshly reconfirm matching descriptor-bound Lima host evidence immediately before a command. A command failure or controller death before that binding deliberately leaves unbound recovery debt and is never replayed. Automatic proof that a controller-killed clone process is quiescent remains required before that debt can be cleaned. Enforce host-wide concurrency and memory/disk ceilings before provisioning.
+Add the small durable lifecycle that joins one scale-set capacity claim, one capacity reservation, one VM identity, one runner registration, and the actual GitHub job when GitHub assigns it. Clone authorization and clone start are separate durable checkpoints so a controller crash cannot replay creation. The pure reconciler never learns ownership from a VM that merely appears under the selected name: an unbound `CloneStarted` attempt is recovery debt regardless of whether one observation says present or absent, and cannot adopt, delete, release capacity, or accept late job evidence. The private clone transaction foundation holds the canonical store lock while it reopens the current reservation and prepared-template generation, freshly proves the exact source ready and stopped plus the target absent, and requires a live revision/claim/time-bound capacity and cancellation source immediately before both `CloneStarted` publication and the fixed command. Injected tests prove one bounded clone can bind only the finally reconfirmed post-command host observation. The public method is unusable until the Scale Set/capacity adapter supplies Glaeda's crate-sealed source, so external callers cannot forge the live veto. The identity is only a durable drift token: every later mutation service must still freshly reconfirm matching descriptor-bound Lima host evidence immediately before a command. A command failure or controller death before that binding deliberately leaves unbound recovery debt and is never replayed. Automatic proof that a controller-killed clone process is quiescent remains required before that debt can be cleaned. Enforce host-wide concurrency and memory/disk ceilings before provisioning.
 
 Acceptance: deterministic tests cover duplicate observations, crash-after-each-checkpoint, cancellation, expiry, runner loss, orphan VM, stale GitHub runner, and scale-to-zero. The current coordinator supplies the usable live admission source and drives registration and teardown; an unbound ambiguous clone intentionally remains recovery debt until process quiescence can be proven.
 
@@ -209,7 +211,7 @@ bridge/executable/enrollment verification, automatic quiescence of an unbound am
 process, and the first physical GitHub/Lima acceptance run remain open. The hostile-CI network gate
 remains the production boundary before arbitrary repository code is an intended workload.
 
-Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
+Acceptance: an enrolled test repository targets the Glaeda scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
 ### M4 — hostile-CI network and nested-container policy
 
@@ -243,10 +245,10 @@ Run a known repository plus intentionally hostile fixtures repeatedly. Measure c
 
 ## Decision rule
 
-New proof or infrastructure belongs on the critical path only when it closes a realistic route from hostile CI to host compromise, persistence, secret theft, cross-worker access, dangerous network activity, resource exhaustion, or unrecoverable operation. If a mature boundary can own the property more simply, use it. The release criterion is an unattended, recoverable job lifecycle—not the number of host facts proven.
+New proof or implementation work belongs on the critical path only when it closes a realistic route from hostile CI to host compromise, persistence, secret theft, cross-worker access, dangerous network activity, resource exhaustion, or unrecoverable operation. If a mature boundary can own the property more simply, use it. The release criterion is an unattended, recoverable job lifecycle—not the number of host facts proven.
 
 ## Supported-interface basis
 
 - GitHub [recommends ephemeral runners for autoscaling](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#ephemeral-runners-for-autoscaling) because each runner receives one job and can then be wiped.
-- GitHub's [Runner Scale Set Client](https://github.com/actions/scaleset) is the supported standalone Go client for non-Kubernetes autoscalers. It supplies current assigned-job statistics, long-polling sessions, acknowledgement, and JIT configuration while leaving VM creation and destruction to SmolRunner.
-- Lima [plain mode](https://lima-vm.io/docs/config/plain/) disables filesystem mounts, dynamic port forwarding, built-in containerd, the guest agent, Rosetta, and SSH-agent forwarding. SmolRunner still needs an independently enforced outbound network policy because Lima's default user-mode network exposes the host gateway to the guest.
+- GitHub's [Runner Scale Set Client](https://github.com/actions/scaleset) is the supported standalone Go client for non-Kubernetes autoscalers. It supplies current assigned-job statistics, long-polling sessions, acknowledgement, and JIT configuration while leaving VM creation and destruction to Glaeda.
+- Lima [plain mode](https://lima-vm.io/docs/config/plain/) disables filesystem mounts, dynamic port forwarding, built-in containerd, the guest agent, Rosetta, and SSH-agent forwarding. Glaeda still needs an independently enforced outbound network policy because Lima's default user-mode network exposes the host gateway to the guest.

@@ -1,13 +1,13 @@
-use serde_json::Value;
-use smolrunner::artifact::{RepositoryRef, Sha256Digest};
-use smolrunner::execution_receipt::{
+use glaeda::artifact::{RepositoryRef, Sha256Digest};
+use glaeda::execution_receipt::{
     EXECUTION_RECEIPT_SCHEMA_VERSION, ExecutionReceipt, ExecutionReceiptAction,
     ExecutionReceiptActionOutcome, ExecutionReceiptContinuation, ExecutionReceiptDisposition,
     MAX_EXECUTION_RECEIPT_ACTIONS, ReceiptTimestamp, decode_execution_receipt,
     encode_execution_receipt,
 };
-use smolrunner::journal::{ExecutionLane, RollbackClass};
-use smolrunner::state::JournalId;
+use glaeda::journal::{ExecutionLane, RollbackClass};
+use glaeda::state::JournalId;
+use serde_json::Value;
 
 fn timestamp(value: &str) -> ReceiptTimestamp {
     ReceiptTimestamp::parse(value).expect("timestamp")
@@ -37,7 +37,7 @@ fn build_receipt(
     disposition: ExecutionReceiptDisposition,
     actions: Vec<ExecutionReceiptAction>,
     continuation: ExecutionReceiptContinuation,
-) -> Result<ExecutionReceipt, smolrunner::execution_receipt::ExecutionReceiptError> {
+) -> Result<ExecutionReceipt, glaeda::execution_receipt::ExecutionReceiptError> {
     ExecutionReceipt::new_host_preparation(
         JournalId::parse("host-prepare-0123456789abcdef").expect("journal"),
         RepositoryRef::parse("example/project").expect("repository"),

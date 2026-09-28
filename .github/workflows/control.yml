@@ -1,0 +1,44 @@
+name: OTA control
+
+# Pause or resume glaeda-update on every host. control.json has this one writer, in its own
+# concurrency group, so a promotion or a release never cancels a queued pause.
+# docs/GLAEDA_OTA.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      paused:
+        description: stop every host from updating
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ota-control
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PAUSED: ${{ inputs.paused }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Write control.json
+        run: |
+          mkdir -p channels
+          python3 scripts/glaeda_release.py control --paused "$PAUSED" > channels/control.json
+          gh release upload ota-channels channels/control.json --clobber
+          # fail loudly unless hosts now read exactly this
+          gh release download ota-channels --pattern control.json --output - | cmp - channels/control.json
+          cat channels/control.json >> "$GITHUB_STEP_SUMMARY"

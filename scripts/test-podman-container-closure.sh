@@ -845,6 +845,11 @@ $PROBE_GROUP_SHA  /etc/group"
   printf 'offline_image=exact stopped_create=closed account_files=image-owned cgroup=bounded apparmor=rootless-unavailable\n'
 }
 
+if [[ ${GLAEDA_DISPOSABLE_PROBE:-} != 1 ]]; then
+  printf 'error: disposable container probe requires the explicit dangerous integration gate\n' >&2
+  exit 1
+fi
+
 if [[ ${1:-} == --image-install-probe ]]; then
   run_image_install_probe
   exit 0
@@ -858,10 +863,6 @@ fi
 
 if [[ $EUID -ne 0 ]]; then
   printf 'error: disposable container probe must run as uid 0\n' >&2
-  exit 1
-fi
-if [[ ${SMOLRUNNER_DISPOSABLE_PROBE:-} != github-hosted-ubuntu ]]; then
-  printf 'error: disposable container probe requires the explicit hosted-CI gate\n' >&2
   exit 1
 fi
 
@@ -1150,6 +1151,7 @@ probe_install_unit_owned=1
   CONTAINERS_REGISTRIES_CONF="$probe_root/config/registries.conf" \
   CONTAINERS_STORAGE_CONF="$probe_root/config/image-storage.conf" \
   DBUS_SESSION_BUS_ADDRESS="unix:path=$probe_root/image-runtime/absent-user-bus" \
+  GLAEDA_DISPOSABLE_PROBE=1 \
   HOME="$probe_root/empty-home" \
   LC_ALL=C \
   LOGNAME="$probe_user" \
@@ -1224,6 +1226,7 @@ probe_unit_owned=1
   CONTAINERS_REGISTRIES_CONF="$probe_root/config/registries.conf" \
   CONTAINERS_STORAGE_CONF="$probe_root/config/storage.conf" \
   DBUS_SESSION_BUS_ADDRESS="unix:path=$probe_root/runtime/absent-user-bus" \
+  GLAEDA_DISPOSABLE_PROBE=1 \
   HOME="$probe_root/empty-home" \
   LC_ALL=C \
   LOGNAME="$probe_user" \

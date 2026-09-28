@@ -6,7 +6,7 @@
 
 The repository contains no identity-bearing compatibility command and accepts no `--runner-context` path. Repository code never opens an installation descriptor, runner receipt, workspace record, or cache identity source.
 
-`scripts/workspace_bootstrap/profile_bridge.py` is a pure mapper. It accepts an already validated `ValidatedRunnerContext` from a SmolRunner-owned adapter together with the repository receipt. It performs no file acquisition, JSON parsing, path selection, environment lookup, or readiness decision.
+`scripts/workspace_bootstrap/profile_bridge.py` is a pure mapper. It accepts an already validated `ValidatedRunnerContext` from a Glaeda-owned adapter together with the repository receipt. It performs no file acquisition, JSON parsing, path selection, environment lookup, or readiness decision.
 
 ## Typed input boundary
 
@@ -18,11 +18,11 @@ The trusted producer supplies:
 - a trusted evidence digest;
 - descriptor-derived provenance facts for protected-state acquisition and independent filesystem observation.
 
-The mapper emits either one bounded observation candidate or typed blockers. Its result deliberately contains no `ready` field. Only the SmolRunner-owned adapter may construct the merged #153 Rust observation types and decide whether the mapped observation proceeds to profile preflight.
+The mapper emits either one bounded observation candidate or typed blockers. Its result deliberately contains no `ready` field. Only the Glaeda-owned adapter may construct the merged #153 Rust observation types and decide whether the mapped observation proceeds to profile preflight.
 
 ## Required trusted producer
 
-A later SmolRunner-owned adapter must:
+A later Glaeda-owned adapter must:
 
 1. open the installation descriptor through the canonical descriptor-relative state root;
 2. resolve the enrolled workspace and cache from protected durable state;
@@ -75,4 +75,4 @@ These checks validate typed evidence supplied by the trusted adapter. They do no
 
 The compatibility fixture constructs typed contexts directly for pure mapping tests. It proves refusal for forged receipts, arbitrary identities, writable parents, wrong owner and mode, symlinked parents, hard links, replaced files, path races, and an otherwise valid repository-created document. It also asserts that the removed compatibility command stays absent and that the mapper contains no context-file acquisition path.
 
-Actual protected-state acquisition and race-resistant descriptor traversal belong to the later SmolRunner-owned adapter and require their own integration tests.
+Actual protected-state acquisition and race-resistant descriptor traversal belong to the later Glaeda-owned adapter and require their own integration tests.

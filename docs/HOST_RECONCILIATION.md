@@ -1,6 +1,6 @@
 # Host reconciliation
 
-SmolRunner separates desired state, observed state, proposed actions, and eventual execution. The separation is intentional: a setup script that immediately mutates the machine cannot reliably explain drift, partial completion, or rollback.
+Glaeda separates desired state, observed state, proposed actions, and eventual execution. The separation is intentional: a setup script that immediately mutates the machine cannot reliably explain drift, partial completion, or rollback.
 
 ## State model
 
@@ -21,7 +21,7 @@ The initial Linux filesystem probe reads only:
 - `/etc/subuid` and `/etc/subgid` for rootless-container mappings;
 - `/var/lib/systemd/linger/` for user lingering.
 
-It does not inspect a runner user's rootless Podman storage or query GitHub registration state. Those fields remain unknown until SmolRunner has an explicit run-as-user and GitHub-authentication design.
+It does not inspect a runner user's rootless Podman storage or query GitHub registration state. Those fields remain unknown until Glaeda has an explicit run-as-user and GitHub-authentication design.
 
 ## Command execution
 
@@ -46,7 +46,7 @@ No CLI path invokes the process executor for host mutation yet. Before adding `a
 3. how completed and remaining actions are recorded after partial failure;
 4. how root operations and runner-user operations are separated;
 5. how registration tokens are acquired, passed, and destroyed;
-6. how an existing non-SmolRunner installation is adopted without overwriting it;
+6. how an existing non-Glaeda installation is adopted without overwriting it;
 7. how package-manager and distribution differences are represented.
 
 Until those semantics exist, `doctor`, `plan`, and `host plan` are bounded read-only commands.

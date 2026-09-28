@@ -1,8 +1,8 @@
-use smolrunner::durable_journal::{
+use glaeda::durable_journal::{
     DurableExecutionError, JournalCheckpoint, JournalCheckpointFailure, JournalCheckpointPhase,
     execute_plan_durably,
 };
-use smolrunner::journal::{
+use glaeda::journal::{
     ActionFailure, ActionOutcome, ActionReceipt, ExecutionJournal, ExecutionLane,
     JOURNAL_SCHEMA_VERSION, JournalRecord, MutationExecutor, PlannedMutation, Preconditions,
     RollbackClass,

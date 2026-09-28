@@ -1180,6 +1180,11 @@ mod tests {
         else {
             panic!("migration must be required");
         };
+        let environment_program = command
+            .runner_environment_program()
+            .expect("reviewed environment program")
+            .to_str()
+            .expect("fixed reviewed path");
         assert_eq!(precondition_barriers.len(), 2);
         assert_eq!(
             command.spec().displayed_argv(),
@@ -1188,7 +1193,7 @@ mod tests {
                 "--user",
                 "project-runner",
                 "--",
-                "/usr/bin/env",
+                environment_program,
                 "--ignore-environment",
                 "HOME=/var/lib/project-runner",
                 "USER=project-runner",

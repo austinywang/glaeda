@@ -1,4 +1,4 @@
-module github.com/teamleaderleo/smolrunner/tools/scaleset-bridge
+module github.com/teamleaderleo/glaeda/tools/scaleset-bridge
 
 go 1.26.3
 

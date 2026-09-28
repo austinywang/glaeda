@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical one-command SmolRunner source-checkout front door."""
+"""Compatibility one-command SmolRunner source-checkout front door."""
 
 from __future__ import annotations
 

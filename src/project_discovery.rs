@@ -4,23 +4,20 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
-
 use crate::artifact::Sha256Digest;
 use crate::process::TimedCommandExecutor;
 use crate::project_catalog::{ProjectCatalog, ProjectCatalogIdentity, ProjectIdentity};
 use crate::project_checkout_observation::{
     ProjectCheckoutObservation, ProjectCheckoutObservationErrorKind, ProjectCheckoutObserver,
 };
+use crate::project_workspace_identity::{
+    ProjectWorkspaceFilesystemIdentityKind, ProjectWorkspaceIdentityGeneration,
+    project_workspace_filesystem_identity,
+};
+use serde::Serialize;
 
-pub const PROJECT_DISCOVERY_SCHEMA_VERSION: u8 = 1;
+pub const PROJECT_DISCOVERY_SCHEMA_VERSION: u8 = 2;
 pub const MAX_PROJECT_DISCOVERY_ENTRIES: usize = 512;
-
-const ROOT_ID_DOMAIN: &[u8] = b"smolrunner-project-discovery-root-v1\0";
-const ENTRY_ID_DOMAIN: &[u8] = b"smolrunner-project-discovery-entry-v1\0";
-const SHA256_PREFIX: &str = "sha256:";
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, PartialEq, Eq)]
 struct PrivateDiscoveryLocation {
@@ -196,6 +193,7 @@ pub struct ProjectDiscoverySummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectDiscoveryReport {
     schema_version: u8,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     root_id: Sha256Digest,
     catalog_identity: ProjectCatalogIdentity,
     entries: Vec<ProjectDiscoveryEntry>,
@@ -205,6 +203,11 @@ pub struct ProjectDiscoveryReport {
 }
 
 impl ProjectDiscoveryReport {
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
+    }
+
     #[must_use]
     pub const fn root_id(&self) -> &Sha256Digest {
         &self.root_id
@@ -281,7 +284,12 @@ pub fn discover_project_root(
     }
     let root_metadata = std::fs::metadata(root).map_err(|_| root_unavailable())?;
     let root_identity = FilesystemIdentity::from_metadata(&root_metadata);
-    let root_id = opaque_filesystem_id(ROOT_ID_DOMAIN, root_identity)?;
+    let identity_generation = observer.identity_generation();
+    let root_id = opaque_filesystem_id(
+        identity_generation,
+        ProjectWorkspaceFilesystemIdentityKind::DiscoveryRoot,
+        root_identity,
+    )?;
 
     let candidates = read_candidates(root)?;
     let initial_keys = candidates
@@ -297,6 +305,7 @@ pub fn discover_project_root(
             catalog,
             observer,
             executor,
+            identity_generation,
         ));
     }
 
@@ -305,6 +314,7 @@ pub fn discover_project_root(
     let summary = summarize(&entries)?;
     Ok(ProjectDiscoveryReport {
         schema_version: PROJECT_DISCOVERY_SCHEMA_VERSION,
+        identity_generation,
         root_id,
         catalog_identity: catalog.identity().clone(),
         entries,
@@ -366,6 +376,7 @@ fn discover_candidate(
     catalog: &ProjectCatalog,
     observer: &ProjectCheckoutObserver,
     executor: &impl TimedCommandExecutor,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
 ) -> ProjectDiscoveryEntry {
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -379,7 +390,12 @@ fn discover_candidate(
         }
     };
     let identity = FilesystemIdentity::from_metadata(&metadata);
-    let entry_id = opaque_filesystem_id(ENTRY_ID_DOMAIN, identity).ok();
+    let entry_id = opaque_filesystem_id(
+        identity_generation,
+        ProjectWorkspaceFilesystemIdentityKind::DiscoveryEntry,
+        identity,
+    )
+    .ok();
     let location = PrivateDiscoveryLocation::observed(path.clone(), identity);
     if metadata.file_type().is_symlink() {
         return ProjectDiscoveryEntry::classified(
@@ -581,22 +597,18 @@ fn increment(value: &mut u16) -> Result<(), ProjectDiscoveryError> {
 }
 
 fn opaque_filesystem_id(
-    domain: &[u8],
+    generation: ProjectWorkspaceIdentityGeneration,
+    kind: ProjectWorkspaceFilesystemIdentityKind,
     identity: FilesystemIdentity,
 ) -> Result<Sha256Digest, ProjectDiscoveryError> {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(identity.device.to_be_bytes());
-    hasher.update(identity.inode.to_be_bytes());
-    hasher.update(identity.owner.to_be_bytes());
-    let digest = hasher.finalize();
-    let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
-    value.push_str(SHA256_PREFIX);
-    for byte in digest {
-        value.push(char::from(HEX[usize::from(byte >> 4)]));
-        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    Sha256Digest::parse(&value).map_err(|_| invalid_identity())
+    project_workspace_filesystem_identity(
+        generation,
+        kind,
+        identity.device,
+        identity.inode,
+        identity.owner,
+    )
+    .map_err(|_| invalid_identity())
 }
 
 fn is_normalized_absolute_path(path: &Path) -> bool {
@@ -669,9 +681,8 @@ mod tests {
 
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
     use crate::project_catalog::ProjectCatalog;
-    use crate::project_checkout_observation::{
-        PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectCheckoutObserver,
-    };
+    use crate::project_checkout_observation::{ProjectCheckoutObserver, expected_git_timeout};
+    use crate::project_workspace_identity::ProjectWorkspaceIdentityGeneration;
 
     use super::{
         MAX_PROJECT_DISCOVERY_ENTRIES, ProjectDiscoveryEntryKind, ProjectDiscoveryErrorKind,
@@ -776,7 +787,7 @@ mod tests {
             spec: &CommandSpec,
             timeout: std::time::Duration,
         ) -> io::Result<ExecutionRecord> {
-            assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
+            assert_eq!(timeout, expected_git_timeout(spec));
             self.commands.borrow_mut().push(spec.clone());
             if let Some(root) = self.mutation_root.as_ref()
                 && !self.mutated.replace(true)
@@ -882,9 +893,23 @@ projects:
         assert!(recovery.source_ambiguous);
         assert!(recovery.local_only_state_present());
         assert_eq!(report.summary().catalogued_checkout_count, 1);
+        assert_eq!(
+            report.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::GlaedaV2
+        );
+        assert_eq!(
+            entry
+                .checkout
+                .as_ref()
+                .expect("checkout observation")
+                .identity_generation(),
+            report.identity_generation()
+        );
         assert_eq!(executor.commands.borrow().len(), 16);
 
         let json = serde_json::to_string(&report).expect("public report");
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"identity_generation\":\"glaeda_v2\""));
         assert!(!json.contains(root.path().to_string_lossy().as_ref()));
         assert!(!json.contains("secret-checkout-name"));
         assert!(!json.contains("private.txt"));

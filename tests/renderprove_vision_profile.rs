@@ -1,6 +1,6 @@
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::renderprove_vision_profile::*;
-use smolrunner::verification_profile::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::renderprove_vision_profile::*;
+use glaeda::verification_profile::{
     ConcurrencyPolicy, MemoryPolicy, RepositoryCommandId, RepositoryCommandIdentity,
     ResourceDefaults, TestedSourceIdentity, TimeoutPolicy, VerificationProfileId,
 };

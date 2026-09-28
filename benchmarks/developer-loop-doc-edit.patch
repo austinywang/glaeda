@@ -1,0 +1,9 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1434db4..ae43e71 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
++/// Benchmark fixture: one source-only edit with unchanged behavior.
+ /// Read-only observation of one configured official Actions runner.
+ pub mod actions_runner_readiness;
+ /// Pure recommendation-only adaptive CI pool routing from bounded evidence.

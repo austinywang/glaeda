@@ -6,7 +6,7 @@ helper="${repo_root}/scripts/macbook-runner-bootstrap.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 
-mkdir -p "${tmp}/bin"
+mkdir -p "${tmp}/bin" "${tmp}/home"
 touch "${tmp}/lima.yaml"
 log="${tmp}/limactl.log"
 
@@ -37,15 +37,27 @@ FAKE
 
 chmod +x "${tmp}/bin/uname" "${tmp}/bin/limactl"
 
+cat >"${tmp}/ambient-bash-env" <<'AMBIENT'
+printf 'ambient BASH_ENV reached the helper\n' >&2
+return 99
+AMBIENT
+export BASH_ENV="${tmp}/ambient-bash-env"
+
+helper_env=(
+  "PATH=${tmp}/bin:/usr/bin:/bin"
+  "HOME=${tmp}/home"
+  "LANG=C"
+  "LC_ALL=C"
+  "SMOLRUNNER_TEST_LOG=${log}"
+  "SMOLRUNNER_VM=smolrunner"
+  "SMOLRUNNER_GUEST_REPO=/home/lima/smolrunner"
+  "SMOLRUNNER_REPO_URL=https://github.com/teamleaderleo/smolrunner.git"
+  "SMOLRUNNER_REPO_REF=main"
+  "SMOLRUNNER_LIMA_CONFIG=${tmp}/lima.yaml"
+)
+
 run_helper() {
-  PATH="${tmp}/bin:${PATH}" \
-    SMOLRUNNER_TEST_LOG="${log}" \
-    SMOLRUNNER_VM="smolrunner" \
-    SMOLRUNNER_GUEST_REPO="/home/lima/smolrunner" \
-    SMOLRUNNER_REPO_URL="https://github.com/teamleaderleo/smolrunner.git" \
-    SMOLRUNNER_REPO_REF="main" \
-    SMOLRUNNER_LIMA_CONFIG="${tmp}/lima.yaml" \
-    bash "${helper}" "$@"
+  env -i "${helper_env[@]}" bash "${helper}" "$@"
 }
 
 : >"${log}"
@@ -56,7 +68,11 @@ if grep -q '^create' "${log}"; then
 fi
 
 : >"${log}"
-if SMOLRUNNER_TEST_SHELL_STATUS=1 run_helper bootstrap >/dev/null 2>&1; then
+if env -i \
+  "${helper_env[@]}" \
+  SMOLRUNNER_TEST_SHELL_STATUS=1 \
+  bash "${helper}" bootstrap >/dev/null 2>&1
+then
   printf 'unsafe guest preflight unexpectedly succeeded\n' >&2
   exit 1
 fi
@@ -75,14 +91,8 @@ do
   : >"${log}"
   name="${assignment%%=*}"
   value="${assignment#*=}"
-  if env \
-    PATH="${tmp}/bin:${PATH}" \
-    SMOLRUNNER_TEST_LOG="${log}" \
-    SMOLRUNNER_VM="smolrunner" \
-    SMOLRUNNER_GUEST_REPO="/home/lima/smolrunner" \
-    SMOLRUNNER_REPO_URL="https://github.com/teamleaderleo/smolrunner.git" \
-    SMOLRUNNER_REPO_REF="main" \
-    SMOLRUNNER_LIMA_CONFIG="${tmp}/lima.yaml" \
+  if env -i \
+    "${helper_env[@]}" \
     "${name}=${value}" \
     bash "${helper}" create >/dev/null 2>&1
   then

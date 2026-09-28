@@ -1,4 +1,4 @@
-"""Command-line output for the SmolRunner workspace preflight."""
+"""Command-line output for the Glaeda workspace preflight."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class SafeArgumentParser(argparse.ArgumentParser):
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = SafeArgumentParser(
         prog="./scripts/bootstrap",
-        description="Evaluate the SmolRunner checkout and emit a capability receipt.",
+        description="Evaluate the Glaeda checkout and emit a capability receipt.",
     )
     parser.add_argument("--output", choices=["human", "json"], default="human")
     parser.add_argument(
@@ -107,7 +107,7 @@ def render_human(receipt: dict[str, object]) -> str:
     assert isinstance(source, dict)
     assert isinstance(resources, dict)
     lines = [
-        f"SmolRunner workspace bootstrap: {heading}",
+        f"Glaeda workspace bootstrap: {heading}",
         f"Operation: {receipt['operation']}",
         f"Repository: {root['repository'] or 'unidentified'}",
         f"Source commit: {source['commit'] or 'unavailable'}",

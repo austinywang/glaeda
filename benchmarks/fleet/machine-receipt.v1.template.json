@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "document_type": "glaeda-owned-fleet-machine-receipt",
+  "status": "partial",
+  "machine_id": "replace-with-opaque-experiment-id",
+  "machine_config": null,
+  "purchase": {
+    "date": null,
+    "currency": null,
+    "all_in_price": null
+  },
+  "cpu": {
+    "vendor": null,
+    "model": null,
+    "topology": {
+      "physical_cores": null,
+      "logical_cpus": null,
+      "classes": []
+    }
+  },
+  "ram_bytes": null,
+  "internal_storage": {
+    "capacity_bytes": null,
+    "public_model": null,
+    "bus": null,
+    "filesystem": null
+  },
+  "platform": {
+    "os": null,
+    "os_version": null,
+    "kernel": null,
+    "xcode": null,
+    "rust_toolchain": null,
+    "python": null
+  },
+  "power_policy": null,
+  "filesystem": null,
+  "network_class": null,
+  "power": {
+    "measurement_status": "pending",
+    "idle_watts": null,
+    "load_watts": null,
+    "measurement_method": null
+  },
+  "thermal": {
+    "observation_status": "pending",
+    "sustained_minutes": null,
+    "max_temperature_c": null,
+    "throttling_observed": null,
+    "notes": null
+  },
+  "privacy": {
+    "serial_numbers_omitted": true,
+    "hostname_omitted": true,
+    "unrelated_host_details_omitted": true
+  }
+}

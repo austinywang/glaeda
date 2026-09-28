@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Run glaeda-worktree-reclaim over every main Git checkout directly under the projects root
+# (default ~/Projects, override with GLAEDA_PROJECTS_ROOT) that has linked worktrees.
+# Also deletes local branches whose work has landed and that no worktree has checked out
+# (--branches), since removing a worktree leaves its branch behind.
+# Extra arguments (for example --apply or --output json) pass through.
+# Dry run by default, exactly like the underlying command.
+# Installed into ~/.local/bin by scripts/glaeda-mini-setup.
+set -euo pipefail
+reclaim="${GLAEDA_WORKTREE_RECLAIM:-$HOME/.local/bin/glaeda-worktree-reclaim}"
+projects="${GLAEDA_PROJECTS_ROOT:-$HOME/Projects}"
+repositories=()
+for directory in "$projects"/*/; do
+  directory="${directory%/}"
+  [[ -d "$directory/.git" ]] || continue
+  linked=$(/usr/bin/git -C "$directory" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
+  (( linked > 1 )) || continue
+  repositories+=(--repository "$(cd "$directory" && pwd -P)")
+  (( ${#repositories[@]} < 64 )) || break  # the command accepts at most 32 repositories
+done
+(( ${#repositories[@]} > 0 )) || exit 0
+exec "$reclaim" --branches "$@" "${repositories[@]}"

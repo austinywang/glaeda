@@ -1,0 +1,1521 @@
+#!/usr/bin/env python3
+"""glaeda-cmux-runner: turn a cmux Mac mini into a GitHub Actions self-hosted runner.
+
+    glaeda-cmux-runner                                plan: what --apply would do (no side effects)
+    glaeda-cmux-runner --apply                        download, verify, register, load the LaunchAgent
+    glaeda-cmux-runner --uninstall                    plan removal
+    glaeda-cmux-runner --uninstall --apply            deregister and remove what --apply installed
+    glaeda-mini-setup --runner [...]                  same thing, through the mini setup front door
+
+Defaults register to --repo manaflow-ai/cmux. Use --org ORG for an organization runner.
+A fleet member passes --manifest M --member NAME instead of --labels: its class, availability and
+verified Xcodes become the labels, and a later change re-registers it in place (docs/CMUX_MINI_RUNNER.md 2c).
+
+What --apply does, all under $HOME and owned by the current user (no sudo):
+    1. downloads the official actions/runner osx-arm64 release (latest, or --runner-version),
+       verifies its SHA-256 against the release notes (and the asset digest when GitHub has one),
+       and unpacks it into ~/actions-runner-glaeda (or --runner-dir)
+    2. registers it with labels self-hosted,macOS,ARM64,glaeda-mini (+ --labels), persistent
+       (not ephemeral) so the _work tree keeps hot state between jobs
+    3. writes job hooks: job-started refuses fork pull requests and pull_request_target and
+       runs glaeda-disk pressure; job-completed runs disk pressure again (never fatal)
+    4. writes and loads ~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist
+    5. confirms the registration through the GitHub API
+
+The one-time registration token comes from `gh api -X POST .../registration-token` on stdout.
+It is never placed in any argv, written to disk, or printed. It reaches config.sh only through
+ACTIONS_RUNNER_INPUT_TOKEN in that one child's environment, which the runner reads and clears.
+
+A mini without gh (or without admin credentials on it) takes the token on stdin instead, minted
+on the operator's own machine, so no GitHub credential ever lands on the mini:
+
+    gh api -X POST repos/OWNER/REPO/actions/runners/registration-token --jq .token \
+      | ssh MINI glaeda-cmux-runner --apply --repo OWNER/REPO --token-stdin
+
+Without gh the release is read from the public API with curl, a name collision is left to
+config.sh (which refuses one), and step 5 is confirmed locally from the runner log instead.
+
+Routing is never automated. A --labels runner's plan prints the `gh variable set` commands that
+point cmux workflows at the glaeda-mini label, and the `gh variable delete` commands that roll back.
+A fleet member (--manifest, or a receipt that recorded one) prints no MACOS_RUNNER_* line: cmux's PR
+pool picker already routes to its pool labels, and those variables would bypass the picker. A trusted
+member prints the nightly variables (CI_SEED_TRUSTED_POOL, CI_NIGHTLY_TRUSTED_RUNNER) instead.
+The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
+
+Stale copies and label drift. On a host with an over-the-air release installed (glaeda-update), a copy
+of this script whose runner files differ from that release's and are older than it (by its
+.glaeda-source.json stamp, its release, or its git commit date; unknown counts as older) blocks: the
+plan says which copy to run instead, and the release's plan labels are compared with this copy's.
+--allow-stale overrides. The register step lists every label drift it sees: the receipt's or GitHub's
+registered labels against what this version would register.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import contextlib
+import datetime
+import hashlib
+import json
+import os
+import platform
+import plistlib
+import pwd
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any
+
+SCHEMA = "glaeda-cmux-runner/v1"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO = SCRIPT_DIR.parent
+HOOK_SOURCE = SCRIPT_DIR / "glaeda-cmux-runner-hook"
+RESERVATION_SOURCE = SCRIPT_DIR / "glaeda_reservation.py"  # the hook reads reservation markers with it
+LABEL = "com.teamleaderleo.glaeda.cmux-runner"
+DEFAULT_REPO = "manaflow-ai/cmux"
+BASE_LABELS = ("self-hosted", "macOS", "ARM64")
+MINI_LABEL = "glaeda-mini"
+# Fleet membership labels (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md) live in glaeda_fleet_labels.py
+# next to this script, shared with glaeda-mini-fleet. Only --manifest needs that file on the mini.
+LABELS_MODULE = "glaeda_fleet_labels.py"
+ROUTE_VARIABLES = ("MACOS_RUNNER_15", "MACOS_RUNNER_26", "MACOS_RUNNER_PR", "MACOS_RUNNER_DUAL_XCODE")
+RUNNER_RELEASE_API = "repos/actions/runner/releases"
+PLATFORM_ASSET = "osx-arm64"
+MARKER = ".glaeda-cmux-runner"
+HOOK_DIR = "glaeda-hooks"
+HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh held_dir
+DARWIN_REQUIRED = True
+RUN_TIMEOUT = 60
+CURL = "/usr/bin/curl"
+LAUNCHCTL = "/bin/launchctl"
+ONLINE_WAIT_S = 90
+WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+PUBLIC_API = "https://api.github.com/"
+TOKEN_RE = r"[A-Za-z0-9_.\-]+"
+LISTENING = "Listening for Jobs"
+IOS_SIM_JOB_LABEL = "glaeda-ios-sim"  # glaeda_fleet_labels.IOS_SIM_LABEL
+GATE_HELD = "glaeda-cmux-runner-gate: holding the listener off"  # the gate's line while the fleet has the host
+# Stale-copy check: the OTA install (glaeda-update) and the runner files a staged copy carries
+# (glaeda-cmux-runner-fleet STAGED). The stamp says where a staged copy came from.
+UPDATE_STATE = ".local/state/glaeda/update"
+RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+SOURCE_STAMP = ".glaeda-source.json"
+NO_RELEASE_CHECK = "GLAEDA_CMUX_RUNNER_NO_RELEASE_CHECK"  # set for the release copy's own plan (no recursion)
+RELEASE_TAG_RE = r"r-(\d{4})(\d{2})(\d{2})-[0-9a-f]{12}"
+DAY_RE = r"\d{4}-\d{2}-\d{2}"
+
+
+# ---------------------------------------------------------------- small helpers
+
+
+def sha256_bytes(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str | None:
+    try:
+        return sha256_bytes(path.read_bytes())
+    except OSError:
+        return None
+
+
+def run(argv: list[str], timeout: int = RUN_TIMEOUT, env: dict[str, str] | None = None,
+        cwd: Path | None = None) -> tuple[int, str]:
+    """Run a command. Never raises; a missing tool is (127, "")."""
+    try:
+        result = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout, env=env, cwd=cwd, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 127, str(error)[:400]
+    return result.returncode, result.stdout.strip()[:65536]
+
+
+def read_token(gh: str, endpoint: str) -> str | None:
+    """POST for a one-time token. Only stdout is kept, in memory; the token is not in argv."""
+    try:
+        result = subprocess.run(
+            [gh, "api", "-X", "POST", endpoint, "--jq", ".token"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=RUN_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    token = result.stdout.strip()
+    if result.returncode != 0 or not token or not re.fullmatch(TOKEN_RE, token):
+        return None
+    return token
+
+
+def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 900) -> tuple[int, str]:
+    """Run config.sh with the token only in that child's environment; scrub it from the output."""
+    env = dict(os.environ)
+    env["ACTIONS_RUNNER_INPUT_TOKEN"] = token
+    try:
+        # Own process group: config.sh runs Runner.Listener as a child, which would otherwise outlive
+        # a timeout, keep the token in its environment, and register behind our back.
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env, cwd=cwd, start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=10)
+            code, out = 124, f"config.sh timed out after {timeout} seconds; its process group was killed"
+    except OSError as error:
+        code, out = 127, str(error)
+    finally:
+        env.pop("ACTIONS_RUNNER_INPUT_TOKEN", None)
+    return code, out.replace(token, "***").strip()[-2000:]
+
+
+def which(name: str, extra: tuple[str, ...] = ()) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in extra:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def write_atomic(path: Path, data: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stage = path.with_name(f".{path.name}.cmux-runner.tmp")
+    stage.write_bytes(data)
+    os.chmod(stage, mode)
+    os.replace(stage, path)
+
+
+RUNNER_LABEL_PREFIX = "glaeda-runner-"
+
+
+def runner_label(name: str) -> str:
+    """The label only the runner registered as `name` carries (glaeda-runner-<name>, lowercase)."""
+    return RUNNER_LABEL_PREFIX + re.sub(r"[^a-z0-9._-]+", "-", name.lower())
+
+
+def default_name() -> str:
+    host = socket.gethostname().split(".")[0].lower()
+    host = re.sub(r"[^a-z0-9-]+", "-", host).strip("-") or "mac"
+    return f"{host}-glaeda"
+
+
+class Context:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+        self.uid = os.getuid()
+        real_home = Path(pwd.getpwuid(self.uid).pw_dir)
+        # A fake HOME (tests, rehearsals) must never reach the real launchd session.
+        self.sandbox = os.path.realpath(self.home) != os.path.realpath(real_home)
+        self.skip_launchctl = args.skip_launchctl or self.sandbox
+        self.apply = args.apply
+        self.org = args.org
+        self.repo = None if args.org else (args.repo or DEFAULT_REPO)
+        self.instance = args.instance or 0
+        self.gui_runner = False  # the member's gui runner (glaeda_fleet_labels.gui_label); set from --manifest
+        # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
+        self.suffix = f"-{self.instance}" if self.instance else ""
+        self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
+        self.name = args.name or default_name() + self.suffix
+        extra = [label.strip() for label in (args.labels or "").split(",") if label.strip()]
+        self.labels = list(dict.fromkeys([*BASE_LABELS, MINI_LABEL, *extra]))
+        # True when this run says what the labels must be (--labels or --manifest); otherwise a
+        # re-run keeps whatever the receipt registered and never asks for a relabel.
+        self.labels_requested = bool(extra)
+        self.member: dict[str, Any] | None = None
+        self.min_free_gib: float = args.min_free_gib or 0
+        self.capacity_units: int = args.capacity_units or 0
+        self.group = args.group
+        self.replace = args.replace
+        self.version = args.runner_version
+        self.pinned_sha = args.runner_sha256
+        self.route_repo = args.route_repo
+        self.runner_dir = (args.runner_dir or self.home / f"actions-runner-glaeda{self.suffix}").expanduser().absolute()
+        self.hook_dir = self.runner_dir / HOOK_DIR
+        self.gh = args.gh or which("gh", ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"))
+        self.gh_state = "missing" if self.gh is None else "logged in"
+        self.xcode_app = args.xcode_app
+        self.python = args.python or which("python3", ("/opt/homebrew/bin/python3", "/usr/bin/python3"))
+        self.agents = self.home / "Library/LaunchAgents"
+        self.logs = self.home / "Library/Logs"
+        self.state = self.home / ".local/state/glaeda/cmux-runner"
+        if self.instance:
+            self.state = self.state / f"instance-{self.instance}"
+        self.receipt_path = self.state / "receipt.json"
+        self.plist_path = self.agents / f"{self.label}.plist"
+        self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
+        self.token_stdin = args.token_stdin
+        self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
+
+    def take_token(self, endpoint: str) -> str | None:
+        """The stdin token when one was given (single use), otherwise a fresh one from gh."""
+        if self.token_stdin:
+            token, self.stdin_token = self.stdin_token, None
+            return token
+        return read_token(self.gh or "gh", endpoint)
+
+    @property
+    def scope_api(self) -> str:
+        return f"orgs/{self.org}" if self.org else f"repos/{self.repo}"
+
+    @property
+    def scope_url(self) -> str:
+        return f"https://github.com/{self.org or self.repo}"
+
+    def show(self, path: Path | str) -> str:
+        text, home = os.fspath(path), os.fspath(self.home)
+        return "~" + text[len(home):] if text == home or text.startswith(home + "/") else text
+
+
+def xcode_present(app: dict[str, Any]) -> bool:
+    """The manifest's Xcode is really here: a real directory whose xcodebuild reports that exact build."""
+    path, build = Path(str(app.get("path") or "")), str(app.get("build") or "")
+    if not path.is_absolute() or not build or not path.is_dir() or path.is_symlink():
+        return False
+    code, out = run(["/usr/bin/xcodebuild", "-version"],
+                    env={**os.environ, "DEVELOPER_DIR": os.fspath(path / "Contents/Developer")})
+    version = str(app.get("version") or "")
+    return (code == 0 and re.search(rf"^Build version {re.escape(build)}$", out, re.M) is not None
+            and re.search(rf"^Xcode {re.escape(version)}$", out, re.M) is not None)
+
+
+def ios_sim_present(apps: list[dict[str, Any]], builds: list[str]) -> bool | None:
+    """Every iOS simulator runtime build in builds (23F77) is available (simctl, read-only). Runtimes are shared by
+    every Xcode on the machine, so the member's first verified Xcode answers for all. None when simctl gives no
+    usable answer."""
+    developer = Path(str(apps[0].get("path") or "")) / "Contents/Developer"
+    code, out = run(["/usr/bin/xcrun", "simctl", "list", "runtimes", "-j"],
+                    env={**os.environ, "DEVELOPER_DIR": os.fspath(developer)})
+    if code != 0:
+        return None
+    try:
+        runtimes = json.loads(out[out.find("{"):]).get("runtimes")  # stderr is merged in; skip any warning
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(runtimes, list):
+        return None
+    have = {str(r.get("buildversion")) for r in runtimes
+            if isinstance(r, dict) and r.get("isAvailable") and r.get("platform") == "iOS"}
+    return all(b in have for b in builds)
+
+
+def fleet_labels() -> Any:
+    """The shared label rule, loaded from beside this script only when --manifest asks for it."""
+    path = SCRIPT_DIR / LABELS_MODULE
+    loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
+    spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = None
+                  ) -> tuple[dict[str, Any] | None, str | None]:
+    """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only.
+    prior_labels: what this runner registered with, so a simctl hiccup keeps the iOS label instead of
+    re-registering the runner without it."""
+    try:
+        rule = fleet_labels()
+    except Exception as error:  # noqa: BLE001  (missing, broken or stale module: explain, never a traceback)
+        return None, f"{LABELS_MODULE} must sit next to this script for --manifest ({type(error).__name__})"
+    def ios_sim_ok(apps: list[dict[str, Any]], builds: list[str]) -> bool:
+        found = ios_sim_present(apps, builds)
+        return found if found is not None else getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") in (prior_labels or [])
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
+
+
+def load_receipt(ctx: Context) -> dict[str, Any] | None:
+    try:
+        doc = json.loads(ctx.receipt_path.read_text())
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- GitHub reads
+
+
+def gh_json(ctx: Context, endpoint: str, public: bool = False) -> Any:
+    if ctx.gh is None and public:
+        code, out = run([CURL, "-fsSL", "--retry", "3", "-H", "Accept: application/vnd.github+json",
+                         PUBLIC_API + endpoint])
+    elif ctx.gh is None:
+        return None
+    else:
+        code, out = run([ctx.gh, "api", endpoint])
+    if code != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def resolve_release(ctx: Context) -> dict[str, Any]:
+    """Latest (or pinned) osx-arm64 runner: version, url, expected sha256. Read-only."""
+    endpoint = f"{RUNNER_RELEASE_API}/tags/v{ctx.version}" if ctx.version else f"{RUNNER_RELEASE_API}/latest"
+    release = gh_json(ctx, endpoint, public=True)
+    if not isinstance(release, dict):
+        return {"state": "blocked", "note": f"could not read {endpoint}"}
+    version = str(release.get("tag_name") or "").lstrip("v")
+    asset_name = f"actions-runner-{PLATFORM_ASSET}-{version}.tar.gz"
+    asset = next((a for a in release.get("assets") or [] if a.get("name") == asset_name), None)
+    if asset is None:
+        return {"state": "blocked", "note": f"release v{version} has no {asset_name}"}
+    body = str(release.get("body") or "")
+    match = re.search(rf"<!--\s*BEGIN SHA {re.escape(PLATFORM_ASSET)}\s*-->\s*([0-9a-f]{{64}})\s*<!--\s*END SHA", body)
+    notes_sha = match.group(1) if match else None
+    digest = str(asset.get("digest") or "")
+    digest_sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else None
+    if ctx.pinned_sha:
+        expected = ctx.pinned_sha.lower().removeprefix("sha256:")
+    else:
+        expected = notes_sha or digest_sha
+    if expected is None:
+        return {"state": "blocked", "note": f"release v{version} publishes no SHA-256 for {PLATFORM_ASSET}; pass --runner-sha256"}
+    for other in (notes_sha, digest_sha):
+        if other and other != expected:
+            return {"state": "blocked", "note": f"SHA-256 sources disagree for v{version}; refusing"}
+    return {"state": "ok", "version": version, "asset": asset_name,
+            "url": asset.get("browser_download_url"), "sha256": expected,
+            "shaSources": [n for n, v in (("releaseNotes", notes_sha), ("assetDigest", digest_sha), ("pinned", ctx.pinned_sha)) if v]}
+
+
+def lookup_runner(ctx: Context) -> tuple[bool, dict[str, Any] | None]:
+    """(query succeeded, runner with ctx.name or None). A failed query is not "absent"."""
+    # filtered by name: an org's list (hosted scale sets included) runs far past one page
+    doc = gh_json(ctx, f"{ctx.scope_api}/actions/runners?name={urllib.parse.quote(ctx.name)}&per_page=100")
+    if not isinstance(doc, dict) or not isinstance(doc.get("runners"), list):
+        return False, None
+    for runner in doc["runners"]:
+        if runner.get("name") == ctx.name:
+            return True, {"id": runner.get("id"), "status": runner.get("status"), "busy": runner.get("busy"),
+                          "labels": sorted(label.get("name") for label in runner.get("labels") or [])}
+    return True, None
+
+
+def find_runner(ctx: Context) -> dict[str, Any] | None:
+    return lookup_runner(ctx)[1]
+
+
+# ---------------------------------------------------------------- desired state
+
+
+def hook_wrappers(ctx: Context) -> dict[str, bytes]:
+    python = shlex.quote(ctx.python or "/usr/bin/python3")
+    hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
+    scope = f"--allowed-owner {shlex.quote(ctx.org)}" if ctx.org else f"--allowed-repo {shlex.quote(ctx.repo or '')}"
+    recycle = ""
+    if ctx.min_free_gib:
+        scope += f" --min-free-gib {ctx.min_free_gib:g}"
+    if ctx.member:  # a fleet member runs PR jobs only while it is an eligible node on its class toolchain
+        scope += f" --require-eligible --fleet-class {shlex.quote(ctx.member['hardware'])}"
+        if ctx.member.get("xcodeApps"):
+            scope += f" --toolchain-xcode {shlex.quote(ctx.member['xcodeApps'][0])}"
+        if ctx.member.get("trustedRef"):  # this mini holds a secret: only jobs on that branch, never PR code
+            scope += (f" --trusted-ref {shlex.quote(ctx.member['trustedRef'])}"
+                      f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
+        else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
+            scope += " --test-keychain"
+            # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)
+            recycle = " --recycle-testmanagerd"
+            scope += recycle
+    if ctx.capacity_units:  # every runner on this mini shares these units (the hook's capacity ledger)
+        scope += f" --capacity-units {int(ctx.capacity_units)}"
+        slots = int((ctx.member or {}).get("compileSlots") or 1)
+        if slots > 1:
+            scope += f" --compile-slots {slots}"
+        roots = int((ctx.member or {}).get("canonicalRoots") or 1)
+        if roots > 1:
+            # instance i prefers root i+1, so a root runner keeps compiling in the tree its warm labels name
+            scope += f" --canonical-roots {roots}"
+        # always, so the listener gate tells a root runner from a side runner (instance below the roots)
+        scope += f" --instance {ctx.instance}"
+        if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
+            scope += " --gui-runner"
+    started = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
+        "# before any step runs. A missing interpreter also exits non-zero, so this fails closed.\n"
+        f"exec {python} {hook} job-started {scope}\n"
+    )
+    completed = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner job-completed hook (generated, receipt-owned). Never fails the job.\n"
+        f"{python} {hook} job-completed || true\n"
+        "exit 0\n"
+    )
+    gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
+            + ("" if ctx.capacity_units else " --no-waiters"))
+    if ctx.capacity_units and IOS_SIM_JOB_LABEL in ctx.labels:
+        # the iOS picker sends 2-unit jobs (isolated builds, the simulator) to this label: listening with one
+        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7)
+        gate += " --fit-units 2"
+    listen = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner listener gate (generated, receipt-owned): the runner LaunchAgent's program. The\n"
+        "# hook's gate runs run.sh and stops an idle listener while the fleet has the host. If the gate cannot\n"
+        "# run, the runner runs without it, as it did before the gate. bash, like run.sh, stays the job's main\n"
+        "# program for macOS privacy grants.\n"
+        f"cd {shlex.quote(os.fspath(ctx.runner_dir))} || exit 1\n"
+        f"{gate} &\n"
+        "gate=$!\n"
+        "stopping=\n"
+        "trap 'stopping=1; kill -TERM \"$gate\" 2>/dev/null' TERM INT\n"
+        "while :; do\n"
+        "    wait \"$gate\"\n"
+        "    code=$?\n"
+        "    kill -0 \"$gate\" 2>/dev/null || break\n"
+        "done\n"
+        "[ -n \"$stopping\" ] && exit 0\n"
+        "[ \"$code\" -eq 0 ] && exit 0\n"
+        "# The gate died (a crash, a SIGKILL, a re-exec into a hook it cannot run). If its runner still runs,\n"
+        "# never start a second one beside it: stop the listener once it has no job, then exit 1 so launchd\n"
+        "# restarts this wrapper and a fresh gate. With no runner left, run it without the gate.\n"
+        f"dir={shlex.quote(os.fspath(ctx.runner_dir))}  # as the gate runs it, so pgrep matches its tree\n"
+        "tree=\"$dir/run|$dir/bin/Runner\\.(Listener|Worker)\"\n"
+        "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
+        "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
+        "    while [ -z \"$stopping\" ] && /usr/bin/pgrep -f \"$tree\" >/dev/null; do\n"
+        "        if ! /usr/bin/pgrep -f \"$dir/bin/Runner\\.Worker\" >/dev/null; then\n"
+        "            /usr/bin/pkill -INT -f \"$dir/bin/Runner\\.Listener\" ||\n"
+        "                /usr/bin/pkill -TERM -f \"$dir/run\"\n"
+        "        fi\n"
+        "        sleep 5\n"
+        "    done\n"
+        "    exit 1\n"
+        "fi\n"
+        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
+        "exec ./run.sh\n"
+    )
+    # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.
+    roots_n = int((ctx.member or {}).get("canonicalRoots") or 1)
+    capacity = shlex.quote(os.fspath(Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet") / "capacity"))
+    home = ctx.home if isinstance(getattr(ctx, "home", None), Path) else Path.home()
+    state = shlex.quote(os.fspath(home / ".local/state/glaeda/cmux-runner"))
+    dirs = f" --capacity-dir {capacity} --state-dir {state}"
+    root = (
+        "#!/bin/sh\n"
+        "# glaeda-canonical-root take ROOT [--wait SECONDS] [--switch] (generated, receipt-owned): hold canonical\n"
+        "# root ROOT (/private/tmp/cmux-ci[-N]) for the rest of this job; take-gui [--wait SECONDS] holds the\n"
+        "# mini's gui token (exit 3: gave way to a gui job waiting for this job's root). The job-started hook links\n"
+        "# it into the fleet bin.\n"
+        "usage() { echo 'usage: glaeda-canonical-root take ROOT [--wait SECONDS] [--switch]"
+        " | take-gui [--wait SECONDS]' >&2; exit 2; }\n"
+        "case \"${1:-}\" in\n"
+        "take) [ -n \"${2:-}\" ] || usage; root=$2; shift 2\n"
+        f"    exec {python} {hook} take-root --root \"$root\" --canonical-roots {roots_n}{dirs} \"$@\" ;;\n"
+        f"take-gui) shift; exec {python} {hook} take-gui{dirs}{recycle} \"$@\" ;;\n"
+        "*) usage ;;\n"
+        "esac\n"
+    )
+    return {"job-started.sh": started.encode(), "job-completed.sh": completed.encode(), "listen.sh": listen.encode(),
+            "glaeda-canonical-root": root.encode()}
+
+
+def agent_plist(ctx: Context) -> dict[str, Any]:
+    # Exactly cmux's workload PATH (cmux_fleet_bootstrap CMUX_WORKLOAD_TOOL_PATH): a tool under the
+    # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
+    path = WORKLOAD_PATH
+    return {
+        "Label": ctx.label,
+        # run.sh under the hook's listener gate (listen.sh): an idle runner stops listening while a fleet
+        # build holds or waits for the host, so GitHub routes its jobs elsewhere instead of here to be refused.
+        "ProgramArguments": [os.fspath(ctx.hook_dir / "listen.sh")],
+        "WorkingDirectory": os.fspath(ctx.runner_dir),
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ProcessType": "Interactive",
+        "SessionCreate": True,
+        "EnvironmentVariables": {
+            "ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(ctx.hook_dir / "job-started.sh"),
+            "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(ctx.hook_dir / "job-completed.sh"),
+            "PATH": path,
+        },
+        "StandardOutPath": os.fspath(ctx.log_path),
+        "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
+    }
+
+
+def desired_files(ctx: Context) -> dict[Path, tuple[bytes, int]]:
+    files = {ctx.hook_dir / "glaeda-cmux-runner-hook": (HOOK_SOURCE.read_bytes(), 0o755),
+             ctx.hook_dir / "glaeda_reservation.py": (RESERVATION_SOURCE.read_bytes(), 0o644)}
+    for name, data in hook_wrappers(ctx).items():
+        files[ctx.hook_dir / name] = (data, 0o755)
+    files[ctx.plist_path] = (plistlib.dumps(agent_plist(ctx), sort_keys=True), 0o644)
+    return files
+
+
+def owned_dir(ctx: Context, receipt: dict[str, Any] | None) -> bool:
+    """The runner directory is ours only if the receipt says so and the marker still matches."""
+    if not receipt or not receipt.get("runnerDirOwned") or receipt.get("runnerDir") != os.fspath(ctx.runner_dir):
+        return False
+    try:
+        return (ctx.runner_dir / MARKER).read_text().strip() == receipt.get("installId")
+    except OSError:
+        return False
+
+
+def launchctl_loaded(ctx: Context) -> bool | None:
+    if ctx.skip_launchctl:
+        return None
+    return run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{ctx.label}"])[0] == 0
+
+
+def held_marker(ctx: Context) -> Path:
+    """cmux_mini_fix.sh runner_hold's mark: this runner was stopped on purpose, and runner_release starts it."""
+    return ctx.home / HELD_DIR / ctx.runner_dir.name
+
+
+def launchctl_disabled(ctx: Context) -> bool | None:
+    """launchd's disabled override for this label (bootstrap refuses a disabled service with error 5)."""
+    if ctx.skip_launchctl:
+        return None
+    code, out = run([LAUNCHCTL, "print-disabled", f"gui/{ctx.uid}"])
+    if code != 0:
+        return None
+    found = re.search(r'"' + re.escape(ctx.label) + r'"\s*=>\s*(\w+)', out)
+    return bool(found) and found.group(1) in {"disabled", "true"}
+
+
+def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
+    """Enable the label if launchd has it disabled, then bootstrap it. The reason on failure, else None.
+
+    Callers never start a runner that runner_hold marked held, so a disabled label here is one nothing
+    means to keep stopped (a hand `launchctl disable`, or a hold whose mark is gone)."""
+    ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
+    if launchctl_disabled(ctx):
+        code, out = run([LAUNCHCTL, "enable", f"gui/{ctx.uid}/{ctx.label}"])
+        act["wasDisabled"], act["enabled"] = True, code == 0
+        ctx.enabled_label = code == 0  # the agent step records it too when a relabel started the runner
+        if code != 0:
+            act["bootstrapped"] = False
+            return "launchctl enable failed: " + out
+    code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", plist])
+    act["bootstrapped"] = code == 0
+    return None if code == 0 else "launchctl bootstrap failed: " + out
+
+
+def routing(ctx: Context) -> dict[str, Any]:
+    repo = shlex.quote(ctx.route_repo)
+    member = ctx.member
+    if not member:
+        return {
+            "route": [f"gh variable set {v} --body {MINI_LABEL} --repo {repo}" for v in ROUTE_VARIABLES],
+            "rollback": [f"gh variable delete {v} --repo {repo}" for v in ROUTE_VARIABLES],
+        }
+    if not member.get("trustedRef"):
+        # MACOS_RUNNER_* would send every PR job to the generic glaeda-mini label, past cmux's picker.
+        return {"route": [], "rollback": [],
+                "note": "fleet member: cmux's PR pool picker routes to its pool labels (CI_PR_POOL_OWNED, "
+                        "CI_OWNED_POOL_SLOTS); nothing is set per runner. Never set MACOS_RUNNER_* to glaeda-mini: "
+                        "that bypasses the picker"}
+    runner = next((label for label in ctx.labels if label.startswith(RUNNER_LABEL_PREFIX)), None)
+    pool = next(iter(member.get("pools") or []), None)
+    note = ("trusted member: only cmux's nightly app build and seed run here, while CI_PR_POOL_OWNED is 1 and "
+            "both variables below name it; PR jobs never do. Never set MACOS_RUNNER_* to glaeda-mini")
+    if not (runner and pool):
+        return {"route": [], "rollback": [], "note": note + " (this instance carries no runner label)"}
+    return {"route": [f"gh variable set CI_SEED_TRUSTED_POOL --body {shlex.quote(pool)} --repo {repo}",
+                      f"gh variable set CI_NIGHTLY_TRUSTED_RUNNER --body {shlex.quote(runner)} --repo {repo}"],
+            "rollback": [f"gh variable delete CI_NIGHTLY_TRUSTED_RUNNER --repo {repo}"],
+            "note": note}
+
+
+# ---------------------------------------------------------------- stale copies and label drift
+
+
+def day(text: object) -> str | None:
+    found = re.match(DAY_RE, str(text or ""))
+    return found.group(0) if found else None
+
+
+def script_source(script_dir: Path) -> dict[str, Any] | None:
+    """Where this copy of the runner scripts came from: {date, source, tag, via}, or None when unknown.
+    Its stamp (written by whoever staged it), else the OTA release it sits in, else its git checkout."""
+    try:
+        stamp = json.loads((script_dir / SOURCE_STAMP).read_text())
+    except (OSError, ValueError):
+        stamp = None
+    if isinstance(stamp, dict) and day(stamp.get("date")):
+        return {"date": day(stamp["date"]), "source": str(stamp.get("source") or "")[:40],
+                "tag": str(stamp.get("tag") or "") or None, "via": f"stamp by {str(stamp.get('by') or '?')[:40]}"}
+    try:
+        release = json.loads((script_dir.parent.parent / "release.json").read_text())
+        found = re.fullmatch(RELEASE_TAG_RE, str(release.get("tag")))
+    except (OSError, ValueError, AttributeError):
+        found = None
+    if found:
+        return {"date": "-".join(found.groups()), "source": str(release.get("source") or "")[:40],
+                "tag": found.group(0), "via": "release"}
+    if (script_dir.parent / ".git").exists():
+        code, out = run(["env", "TZ=UTC", "git", "-C", os.fspath(script_dir.parent), "log", "-1",
+                          "--format=%H %cd", "--date=format-local:%Y-%m-%d"])  # UTC, like release tags
+        parts = out.split() if code == 0 else []
+        if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40}", parts[0]) and day(parts[1]):
+            return {"date": parts[1], "source": parts[0], "tag": None, "via": "git"}
+    return None
+
+
+def installed_release(home: Path) -> dict[str, Any] | None:
+    """The release glaeda-update installed here, with its copy of the runner scripts, or None."""
+    root = home / UPDATE_STATE
+    try:
+        tag = str(json.loads((root / "state.json").read_text()).get("current") or "")
+    except (OSError, ValueError, AttributeError):
+        return None
+    found = re.fullmatch(RELEASE_TAG_RE, tag)
+    scripts = root / "generations" / tag / "glaeda/scripts"
+    if not found or not (scripts / "glaeda-cmux-runner").is_file():
+        return None
+    return {"tag": tag, "date": "-".join(found.groups()), "scripts": scripts}
+
+
+def copy_check(ctx: Context) -> dict[str, Any] | None:
+    """How this copy compares with the installed release: None when there is none, or it is this copy."""
+    if os.environ.get(NO_RELEASE_CHECK):
+        return None
+    release = installed_release(ctx.home)
+    if release is None or os.path.realpath(release["scripts"]) == os.path.realpath(SCRIPT_DIR):
+        return None
+    if all(sha256_file(SCRIPT_DIR / name) == sha256_file(release["scripts"] / name) for name in RUNNER_FILES):
+        return None
+    own = script_source(SCRIPT_DIR)
+    stale = own is None or own["date"] < release["date"] or bool(own.get("tag") and own["tag"] != release["tag"])
+    return {"state": "stale" if stale else "differs", "release": release["tag"], "copy": own,
+            "releaseScript": ctx.show(release["scripts"] / "glaeda-cmux-runner"),
+            "releaseScriptPath": os.fspath(release["scripts"] / "glaeda-cmux-runner")}
+
+
+def release_plan_labels(script: str, argv: list[str]) -> list[str] | None:
+    """The labels the release's copy would register for these same arguments: its read-only plan."""
+    plan: list[str] = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg == "--output":
+            skip = True
+        elif arg not in ("--apply", "--allow-stale") and not arg.startswith("--output="):
+            plan.append(arg)
+    python = sys.executable or "/usr/bin/python3"
+    code, out = run([python, script, *plan, "--output", "json"], timeout=180,
+                    env={**os.environ, NO_RELEASE_CHECK: "1"})
+    try:
+        doc = json.loads(out[out.find("{"):])
+        reg = next(a for a in doc.get("actions", []) if a.get("kind") == "register")
+    except (ValueError, StopIteration, AttributeError):
+        return None
+    labels = reg.get("labels")
+    return labels if isinstance(labels, list) else None
+
+
+def label_drift(against: str, registered: list[str], wanted: list[str]) -> dict[str, Any] | None:
+    """How `wanted` (this version's labels) differs from `registered`; None when they match."""
+    added = sorted(set(wanted) - set(registered))
+    removed = sorted(set(registered) - set(wanted))
+    if not (added or removed):
+        return None
+    return {"against": against, "added": added, "removed": removed}
+
+
+def drift_text(drift: dict[str, Any]) -> str:
+    return " ".join([*(f"+{label}" for label in drift["added"]), *(f"-{label}" for label in drift["removed"])])
+
+
+# ---------------------------------------------------------------- plan
+
+
+def receipt_conflict(ctx: Context, receipt: dict[str, Any] | None) -> str | None:
+    """A live receipt for another directory, name or scope: this run must not touch or replace it."""
+    if not receipt:
+        return None
+    reg = receipt.get("registration") or {}
+    theirs = (receipt.get("runnerDir"), reg.get("name"), reg.get("scope"))
+    if not receipt.get("runnerDirOwned") and not reg:
+        return None
+    mine = (os.fspath(ctx.runner_dir), ctx.name if reg else None, (ctx.org or ctx.repo) if reg else None)
+    if theirs == mine:
+        return None
+    return (f"this Mac already has a runner install ({theirs[1] or 'unregistered'} on {theirs[2] or '?'} in "
+            f"{ctx.show(theirs[0] or '?')}); run --uninstall --apply first")
+
+
+def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
+    conflict = receipt_conflict(ctx, receipt)
+    if conflict:
+        return [{"kind": "receipt", "path": os.fspath(ctx.receipt_path), "state": "blocked", "note": conflict}]
+    actions: list[dict[str, Any]] = []
+    ours = owned_dir(ctx, receipt)
+    configured = (ctx.runner_dir / ".runner").is_file()
+    exists = ctx.runner_dir.exists()
+
+    if ours:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "unchanged", "owned": True})
+    elif exists:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "blocked", "owned": False,
+                        "note": "exists and is not owned by this command; pick --runner-dir or remove it"})
+    else:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "create", "owned": False})
+    blocked_dir = actions[-1]["state"] == "blocked"
+
+    if ours and (ctx.runner_dir / "config.sh").is_file():
+        actions.append({"kind": "download", "state": "unchanged",
+                        "version": (receipt or {}).get("runnerVersion"), "note": "installed; the runner self-updates"})
+    else:
+        rel = resolve_release(ctx)
+        act = {"kind": "download", **rel}
+        act["state"] = "create" if rel["state"] == "ok" else "blocked"
+        if blocked_dir:
+            act["state"] = "blocked"
+        actions.append(act)
+
+    reg = {"kind": "register", "scope": ctx.org or ctx.repo, "name": ctx.name, "labels": ctx.labels,
+           "ephemeral": False}
+    registered = ((receipt or {}).get("registration") or {}) if ours else {}
+    had = registered.get("labels")
+    # This install registered that name before and lost its local .runner (an interrupted relabel):
+    # registering again replaces its own server-side entry instead of colliding with it.
+    own_name = bool(ours and not configured and registered.get("owned") and registered.get("name") == ctx.name)
+    if ours and configured and ctx.labels_requested and had is not None and sorted(had) != sorted(ctx.labels):
+        # GitHub fixes labels at registration, and the labels API needs an admin token the mini does
+        # not hold, so relabelling re-registers this same runner in place with --replace.
+        reg.update(state="relabel", previousLabels=had)
+        if ctx.gh is None and not ctx.token_stdin:
+            reg.update(state="blocked", note="labels changed; pipe a registration token to --token-stdin to re-register")
+        elif runner_busy(ctx):
+            reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+    elif ours and configured:
+        reg.update(state="unchanged")
+    elif ctx.gh is None and not ctx.token_stdin:
+        reg.update(state="blocked", note="needs gh logged in as an admin, or a token through --token-stdin")
+    elif blocked_dir:
+        reg.update(state="blocked", note="runner directory is not ours")
+    elif ctx.gh is None:
+        reg.update(state="create", note="no gh here: config.sh refuses a name that is already registered")
+    else:
+        existing = find_runner(ctx)
+        if existing and own_name and not ctx.replace and registered.get("runnerId") not in (None, existing.get("id")):
+            reg.update(state="blocked", existing=existing,
+                       note=f"{ctx.name} is now registered as id {existing.get('id')}, not this install's "
+                            f"{registered.get('runnerId')}; another machine may hold the name. If it was "
+                            "this install's own interrupted --replace, pass --replace")
+        elif existing and not (ctx.replace or own_name):
+            reg.update(state="blocked", existing=existing,
+                       note=f"a runner named {ctx.name} is already registered; pass --name or --replace")
+        else:
+            reg.update(state="create", existing=existing)
+    if own_name and reg["state"] == "create":
+        reg.update(replace=True, note="re-registers this install's own name with --replace")
+    drifts = []
+    if ours and configured and had is not None:
+        drifts.append(label_drift("receipt", had, ctx.labels))
+        if ctx.gh is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
+            listed, found = lookup_runner(ctx)
+            if listed and found is not None:
+                drifts.append(label_drift("github", found.get("labels") or [], ctx.labels))
+    if any(drifts):
+        reg["drift"] = [d for d in drifts if d]
+        if reg["state"] == "unchanged":
+            reg["note"] = ("registered labels differ from what this version would register; pass --manifest and "
+                           "--member (or --labels) to re-register")
+    actions.append(reg)
+
+    prior = {a.get("path"): a.get("ownedSha256") for a in (receipt or {}).get("actions", [])
+             if a.get("kind") in {"hook", "agent"} and a.get("owned")}
+    for path, (data, mode) in desired_files(ctx).items():
+        kind = "agent" if path == ctx.plist_path else "hook"
+        current, want = sha256_file(path), sha256_bytes(data)
+        if current is None:
+            state = "create"
+        elif current == want and (path.stat().st_mode & 0o777) == mode:
+            state = "unchanged"
+        elif prior.get(os.fspath(path)) == current or (kind == "hook" and ours):
+            state = "update"
+        else:
+            state = "blocked"
+        if kind == "hook" and blocked_dir:
+            state = "blocked"
+        owned = prior.get(os.fspath(path)) is not None and prior.get(os.fspath(path)) == current
+        act = {"kind": kind, "path": os.fspath(path), "state": state, "sha256": want, "previousSha256": current,
+               "mode": oct(mode), "owned": owned, "ownedSha256": current if owned else None}
+        if state == "blocked" and not blocked_dir:
+            act["note"] = "exists and was not written by this command"
+        if kind == "agent":
+            act["label"] = ctx.label
+            act["loaded"] = launchctl_loaded(ctx)
+            act["launchctl"] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
+            act["held"] = held_marker(ctx).is_file()
+            act["disabled"] = launchctl_disabled(ctx)
+            if act["disabled"] and not act["held"] and not act.get("note"):
+                act["note"] = "launchd has this label disabled with no hold mark; --apply enables it before bootstrap"
+        actions.append(act)
+    actions.append({"kind": "verify", "state": "pending", "note": f"GET {ctx.scope_api}/actions/runners, name {ctx.name}"})
+    return actions
+
+
+def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    if receipt is None:
+        return [{"kind": "note", "state": "kept",
+                 "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"}]
+    owned = {a.get("path"): a.get("ownedSha256") for a in receipt.get("actions", [])
+             if a.get("kind") in {"hook", "agent"} and a.get("owned")}
+    plist = os.fspath(ctx.plist_path)
+    current = sha256_file(ctx.plist_path)
+    if current is None:
+        state, note = "absent", ""
+    elif owned.get(plist) == current:
+        state, note = "remove", ""
+    else:
+        state, note = "kept", "not installed by this command, or changed since"
+    actions.append({"kind": "agent", "label": ctx.label, "path": plist, "state": state, "note": note,
+                    "loaded": launchctl_loaded(ctx)})
+
+    ours = owned_dir(ctx, receipt)
+    registered = receipt.get("registration") or {}
+    local = local_runner(ctx) if ours else None
+    if registered.get("owned") and ours:
+        actions.append({"kind": "deregister", "state": "remove", "scope": registered.get("scope"),
+                        "name": registered.get("name"), "runnerId": registered.get("runnerId")})
+    elif local and getattr(ctx, "unreadable_registration", False):
+        return [{"kind": "deregister", "state": "blocked", "path": os.fspath(ctx.runner_dir / ".runner"),
+                 "note": "a .runner here has no github.com URL or name to deregister by; remove it by hand"}]
+    elif local:
+        # config.sh finished after this command gave up on it: the directory is ours, so is its .runner
+        actions.append({"kind": "deregister", "state": "remove", "name": local.get("agentName"),
+                        "runnerId": local.get("agentId"), "note": "registered by an interrupted --apply"})
+    else:
+        actions.append({"kind": "deregister", "state": "kept",
+                        "note": "no registration owned by this command in this runner directory"})
+    if ours:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "remove",
+                        "note": "runner, hooks and _work (hot state) go with it"})
+    else:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir),
+                        "state": "absent" if not ctx.runner_dir.exists() else "kept",
+                        "note": "" if not ctx.runner_dir.exists() else "not owned by this command (receipt or marker mismatch)"})
+    return actions
+
+
+# ---------------------------------------------------------------- apply
+
+
+def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> None:
+    ctx.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stage = ctx.state / f".{act['asset']}.part"
+    stage.unlink(missing_ok=True)
+    code, out = run([CURL, "-fsSL", "--retry", "3", "-o", os.fspath(stage), act["url"]], timeout=900)
+    if code != 0:
+        act["state"], act["note"] = "failed", f"download failed: {out[-300:]}"
+        return
+    got = sha256_file(stage)
+    if got != "sha256:" + act["sha256"]:
+        stage.unlink(missing_ok=True)
+        act["state"], act["note"] = "failed", f"SHA-256 mismatch: got {got}, want sha256:{act['sha256']}"
+        return
+    ctx.runner_dir.mkdir(parents=True, exist_ok=True, mode=0o755)  # a rerun after a failed unpack
+    # The marker lands first, so a failed unpack still leaves a directory this command owns.
+    (ctx.runner_dir / MARKER).write_text(install_id + "\n")
+    tar = which("tar", ("/usr/bin/tar",)) or "tar"
+    code, out = run([tar, "-xzf", os.fspath(stage), "-C", os.fspath(ctx.runner_dir)], timeout=600)
+    stage.unlink(missing_ok=True)
+    if code != 0 or not (ctx.runner_dir / "config.sh").is_file():
+        act["state"], act["note"] = "failed", f"unpack failed: {out[-300:]}"
+        return
+    act["applied"] = True
+
+
+def register(ctx: Context, act: dict[str, Any]) -> None:
+    token = ctx.take_token(f"{ctx.scope_api}/actions/runners/registration-token")
+    if token is None:
+        act["state"], act["note"] = "failed", "could not obtain a registration token (needs repo or org admin)"
+        return
+    argv = [os.fspath(ctx.runner_dir / "config.sh"), "--unattended", "--url", ctx.scope_url,
+            "--name", ctx.name, "--labels", ",".join(l for l in ctx.labels if l not in BASE_LABELS),
+            "--work", "_work"]
+    if ctx.org and ctx.group:
+        argv += ["--runnergroup", ctx.group]
+    if ctx.replace or act.get("replace"):
+        argv.append("--replace")
+    code, out = run_with_token(argv, token, ctx.runner_dir)
+    del token
+    act["argv"] = argv
+    if code != 0 or not (ctx.runner_dir / ".runner").is_file():
+        act["state"], act["note"] = "failed", f"config.sh failed: {out[-400:]}"
+        return
+    act["applied"] = True
+    act["runnerId"] = (local_runner(ctx) or {}).get("agentId")
+
+
+# Newer runners also keep a migrated identity (.runner_migrated, .credentials_migrated) and try it
+# first; left behind, it would point the Listener at the agent id --replace just deleted.
+LOCAL_REGISTRATION = (".runner", ".credentials", ".credentials_rsaparams", ".runner_migrated",
+                      ".credentials_migrated")
+
+
+def runner_busy(ctx: Context) -> bool:
+    """A Runner.Worker from this install means a job is running right now."""
+    return run(["/usr/bin/pgrep", "-f", os.fspath(ctx.runner_dir / "bin/Runner.Worker")])[0] == 0
+
+
+def relabel(ctx: Context, act: dict[str, Any]) -> None:
+    """Re-register this runner under the same name with the manifest's labels. _work stays."""
+    if runner_busy(ctx):
+        act["state"], act["note"] = "failed", "the runner started a job; nothing changed, re-run when idle"
+        return
+    if not ctx.skip_launchctl:
+        bootout(ctx)
+        ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
+    for name in LOCAL_REGISTRATION:
+        (ctx.runner_dir / name).unlink(missing_ok=True)
+    act["replace"] = True
+    register(ctx, act)
+    if act["state"] == "failed":
+        act["note"] += ("; the old registration is still on GitHub and this runner is stopped: re-run with a "
+                        "fresh token (it re-registers the same name with --replace)")
+        return
+    if not ctx.skip_launchctl and not held_marker(ctx).is_file():  # a held runner stays stopped
+        why = start_agent(ctx, act, os.fspath(ctx.plist_path))
+        ctx.agent_started = why is None  # the agent step must not bootstrap it a second time
+        if why:
+            act["state"], act["note"] = "failed", ("re-registered, but " + why)[:400]
+
+
+def bootout(ctx: Context, wait_s: float = 5.0) -> None:
+    run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{ctx.label}"])
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline and run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{ctx.label}"])[0] == 0:
+        time.sleep(0.25)
+
+
+def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict[str, Any]) -> None:
+    # A plan with any blocked step applies nothing, so a half-installed runner never exists.
+    failed = any(a["state"] == "blocked" for a in actions)
+    for act in actions:
+        act.setdefault("applied", False)
+        if failed:
+            if act["state"] in {"create", "update", "pending"}:
+                act["state"], act["note"] = "skipped", "an earlier step was blocked or failed"
+            continue
+        kind, state = act["kind"], act["state"]
+        if state == "blocked":
+            failed = True
+            continue
+        if kind == "dir" and state == "create":
+            receipt_doc["runnerDirOwned"] = True  # set before anything lands inside it
+        elif kind == "download" and state == "create":
+            download_and_unpack(ctx, act, receipt_doc["installId"])
+            if act["state"] != "failed":
+                receipt_doc["runnerVersion"] = act["version"]
+        elif kind == "register" and state == "create":
+            register(ctx, act)
+            if act["state"] != "failed":
+                receipt_doc["registration"] = {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org),
+                                               "name": ctx.name, "labels": ctx.labels,
+                                               "runnerId": act.get("runnerId")}
+        elif kind == "register" and state == "relabel":
+            relabel(ctx, act)
+            if act["state"] != "failed":
+                receipt_doc["registration"] = {**(receipt_doc.get("registration") or {}), "labels": ctx.labels,
+                                               "runnerId": act.get("runnerId"), "owned": True}
+                act["state"] = "updated"
+        elif kind == "register" and state == "unchanged" and not receipt_doc.get("registration"):
+            adopted = adopt_registration(ctx)
+            if adopted:
+                receipt_doc["registration"] = adopted
+                act["note"] = "adopted the registration an interrupted --apply finished in this directory"
+        elif kind == "agent" and state == "update" and act.get("loaded") and not ctx.skip_launchctl \
+                and runner_busy(ctx):  # a bootout now would cancel the job; the next --apply updates it
+            act["state"], act["note"] = "failed", "the runner has a job; nothing changed, re-run when idle"
+        elif kind in {"hook", "agent"} and state in {"create", "update"}:
+            data, mode = desired_files(ctx)[Path(act["path"])]
+            if kind == "agent" and (act.get("loaded") or getattr(ctx, "agent_started", False)):
+                bootout(ctx)  # loaded at plan time, or started since by a relabel
+                act["loaded"] = ctx.agent_started = False
+            write_atomic(Path(act["path"]), data, mode)
+            act["applied"] = act["owned"] = True
+            act["ownedSha256"] = act["sha256"]
+        if kind == "agent" and hasattr(ctx, "agent_started") and not act.get("applied"):
+            act["loaded"] = ctx.agent_started  # relabel stopped this unchanged plist, and started it unless held
+        if kind == "agent" and act["state"] in {"create", "update", "unchanged"} and not ctx.skip_launchctl \
+                and not act.get("loaded"):
+            if act.get("held"):
+                ctx.held = True
+                act["note"] = (f"held by runner_hold ({ctx.show(held_marker(ctx))}); not started. "
+                               "cmux_mini_fix.sh runner_release starts it")
+            else:
+                why = start_agent(ctx, act, act["path"])
+                if why:
+                    act["state"], act["note"] = "failed", why[:400]
+        if kind == "agent" and getattr(ctx, "enabled_label", False):
+            act["wasDisabled"] = act["enabled"] = True
+        if act["state"] == "failed":
+            failed = True
+        if kind == "verify":
+            held = getattr(ctx, "held", False)
+            verify(ctx, act, wait=not ctx.skip_launchctl and not held)
+            if held and act["state"] == "ok":
+                act["note"] = "; ".join(filter(None, [act.get("note"), "held: registered but not started"]))
+            registration = receipt_doc.get("registration")
+            if registration and registration.get("runnerId") is None:  # receipts from before .runner ids
+                registration["runnerId"] = (local_runner(ctx) or {}).get("agentId")
+
+
+def local_runner(ctx: Context) -> dict[str, Any] | None:
+    """What the runner itself recorded at registration (.runner is JSON, sometimes with a BOM)."""
+    try:
+        doc = json.loads((ctx.runner_dir / ".runner").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def adopt_registration(ctx: Context) -> dict[str, Any] | None:
+    """An earlier --apply timed out while config.sh kept going and registered anyway. Only called for
+    a directory this command owns (marker + receipt), and only for the exact name and scope asked for."""
+    local = local_runner(ctx)
+    if not local or local.get("agentName") != ctx.name:
+        return None
+    if str(local.get("gitHubUrl") or "").rstrip("/").lower() != ctx.scope_url.lower():
+        return None
+    return {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org), "name": ctx.name,
+            "labels": ctx.labels, "runnerId": local.get("agentId"), "adopted": True}
+
+
+def verify_local(ctx: Context, act: dict[str, Any], wait: bool) -> None:
+    """No gh: trust .runner for the identity and the runner's own log for being online."""
+    local = local_runner(ctx)
+    if local is None or local.get("agentName") != ctx.name:
+        act["state"], act["note"] = "failed", "no .runner for this name; registration did not complete"
+        return
+    offset = getattr(ctx, "log_offset", None)
+    deadline = time.monotonic() + (ONLINE_WAIT_S if wait else 0)
+    online = held = False
+    while offset is not None:
+        try:
+            with ctx.log_path.open("rb") as log:
+                log.seek(offset)
+                text = log.read()
+                online, held = LISTENING.encode() in text, GATE_HELD.encode() in text
+        except OSError:
+            pass
+        if online or held or time.monotonic() >= deadline:
+            break
+        time.sleep(3)
+    status = "online" if online else "held off by the listener gate" if held else "unknown"
+    act["runner"] = {"id": local.get("agentId"), "status": status, "source": "local"}
+    if held and not online:
+        act["state"] = "ok"
+        act["note"] = ("registered; the listener gate is holding it off while a fleet build has the host, "
+                       f"and it starts listening once the host is free (see {ctx.show(ctx.log_path)})")
+        return
+    if offset is not None and not online:
+        act["state"], act["note"] = "failed", f"runner did not log '{LISTENING}' within {ONLINE_WAIT_S}s; see {ctx.show(ctx.log_path)}"
+        return
+    act["state"] = "ok"
+    act["note"] = ("online per the runner log" if online else "registered locally") + \
+        f"; no gh here, so confirm labels from an admin machine: gh api {ctx.scope_api}/actions/runners"
+
+
+def gate_holding(ctx: Context) -> bool:
+    """The listener gate logged, since this --apply started the agent, that it is holding the runner off."""
+    offset = getattr(ctx, "log_offset", None)
+    if offset is None:
+        return False
+    try:
+        with ctx.log_path.open("rb") as log:
+            log.seek(offset)
+            return GATE_HELD.encode() in log.read()
+    except OSError:
+        return False
+
+
+def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
+    if ctx.gh is None:
+        verify_local(ctx, act, wait)
+        return
+    deadline = time.monotonic() + (ONLINE_WAIT_S if wait else 0)
+    while True:
+        found = find_runner(ctx)
+        if found and (found.get("status") == "online" or time.monotonic() >= deadline or gate_holding(ctx)):
+            break
+        if not found and time.monotonic() >= deadline:
+            break
+        time.sleep(3)
+    if not found:
+        act["state"], act["note"] = "failed", f"GitHub does not list a runner named {ctx.name}"
+        return
+    missing = [label for label in ctx.labels if label not in (found.get("labels") or [])]
+    act.update(runner=found, state="ok" if not missing else "failed",
+               note="" if not missing else "missing labels: " + ",".join(missing))
+    if found.get("status") != "online" and act["state"] == "ok":
+        act["note"] = f"registered, status {found.get('status')}" + (
+            "; the listener gate is holding it off while a fleet build has the host" if gate_holding(ctx) else "")
+
+
+def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    for act in actions:
+        act["applied"] = False
+        if act["state"] != "remove":
+            continue
+        if act["kind"] == "agent":
+            if not ctx.skip_launchctl:
+                bootout(ctx)
+            Path(act["path"]).unlink()
+            act["applied"] = True
+            if held_marker(ctx).is_file():  # a later install of this directory must not start out held
+                held_marker(ctx).unlink()
+                act["heldMarkRemoved"] = True
+        elif act["kind"] == "deregister":
+            token = ctx.take_token(f"{ctx.scope_api}/actions/runners/remove-token")
+            code, out = (1, "no removal token")
+            if token is not None:
+                code, out = run_with_token([os.fspath(ctx.runner_dir / "config.sh"), "remove"], token, ctx.runner_dir)
+                del token
+            if code == 0:
+                act["applied"] = True
+                continue
+            if ctx.gh is None:
+                act["state"], act["note"] = "failed", f"deregistration failed: {out[-300:]}"
+                continue
+            listed, runner = lookup_runner(ctx)
+            owned_id = act.get("runnerId")
+            if runner and owned_id is not None and runner.get("id") == owned_id:
+                code2, out2 = run([ctx.gh, "api", "-X", "DELETE", f"{ctx.scope_api}/actions/runners/{int(runner['id'])}"])
+                if code2 == 0:
+                    act["applied"], act["note"] = True, "config.sh remove failed; deleted by id through the API"
+                    continue
+                out = out2
+            elif runner:
+                out = (f"GitHub lists {ctx.name} as id {runner.get('id')}, not this install's id {owned_id}; "
+                       "another machine may own that name now, so it is not deleted")
+            elif listed and runner is None:
+                act["applied"], act["note"] = True, "GitHub no longer lists this runner"
+                continue
+            act["state"], act["note"] = "failed", f"deregistration failed: {out[-300:]}"
+        elif act["kind"] == "dir":
+            if any(a["kind"] == "deregister" and a["state"] == "failed" for a in actions):
+                act["state"], act["note"] = "kept", "kept because deregistration failed; rerun after fixing it"
+                continue
+            shutil.rmtree(act["path"])
+            act["applied"] = True
+
+
+# ---------------------------------------------------------------- output
+
+
+def preflight(ctx: Context) -> dict[str, Any]:
+    checks: dict[str, dict[str, Any]] = {}
+
+    def check(name: str, ok: bool | None, value: object, note: str = "", blocking: bool = False) -> None:
+        level = "ok" if ok else ("info" if ok is None else ("block" if blocking else "warn"))
+        checks[name] = {"level": level, "value": value, "note": note if level != "ok" else ""}
+
+    arch = platform.machine()
+    check("appleSilicon", arch == "arm64" or not DARWIN_REQUIRED, arch, "the runner build is osx-arm64", True)
+    # Never blocking here: the steps that need a token block themselves (register, deregister),
+    # so an installed runner can be re-checked or re-applied on a mini with no gh.
+    if ctx.gh:
+        check("gh", True, f"{ctx.gh} (logged in)")
+    elif ctx.token_stdin:
+        check("gh", None, ctx.gh_state, "token from stdin; release read with curl, runner confirmed locally")
+    else:
+        check("gh", False, ctx.gh_state, "gh auth login as an admin, or pipe a token to --token-stdin")
+    check("python", ctx.python is not None, ctx.python or "missing", "hooks need python3", True)
+    if ctx.xcode_app:
+        # cmux jobs pick Xcode by path (CMUX_CI_XCODE_APP*), not by xcode-select, so the path must exist
+        # as a real directory: a symlinked Xcode breaks compilation-cache replay (swift#92545).
+        app = Path(ctx.xcode_app)
+        version = run(["/usr/bin/xcodebuild", "-version"], env={**os.environ, "DEVELOPER_DIR": os.fspath(
+            app / "Contents/Developer")})[1].replace("\n", " ") if app.is_dir() and not app.is_symlink() else ""
+        check("xcodeApp", bool(version) and "Build version" in version, version or f"{app} missing or a symlink",
+              "cmux jobs routed here will fail; install that Xcode at exactly this path")
+    copy = getattr(ctx, "copy", None)
+    if copy is not None:
+        own = copy.get("copy") or {}
+        what = f"{own.get('via')} {own.get('source', '')[:12]} {own.get('date')}" if own else "unknown source"
+        if copy["state"] == "stale":
+            check("scriptCopy", False, f"older than release {copy['release']} ({what})",
+                  f"run {copy['releaseScript']} instead, stage main (fleet runner relabel), or pass --allow-stale",
+                  blocking=not ctx.allow_stale)
+        else:
+            check("scriptCopy", None, f"differs from release {copy['release']} ({what})", "not older; used as is")
+    disk = which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),))
+    check("glaedaDisk", disk is not None or None, disk or "not installed",
+          "optional: glaeda-mini-setup --apply installs it; hooks skip disk pressure without it")
+    return {"checks": checks, "blocking": sorted(n for n, c in checks.items() if c["level"] == "block")}
+
+
+def render(ctx: Context, receipt: dict[str, Any]) -> str:
+    mode = receipt["mode"]
+    lines = [f"glaeda-cmux-runner: {mode.upper()}" + ("" if receipt["applied"] else " (nothing changed; add --apply to act)")]
+    if ctx.sandbox:
+        lines.append(f"  sandbox HOME {ctx.home}: launchctl is never called")
+    lines.append(f"target: {ctx.scope_url}  name {ctx.name}  labels {','.join(ctx.labels)}")
+    lines.append("preflight")
+    for name, c in receipt["preflight"]["checks"].items():
+        note = f"  ({c['note']})" if c["note"] else ""
+        lines.append(f"  {c['level']:<5} {name:<13} {c['value']}{note}")
+    lines.append("actions")
+    for act in receipt["actions"]:
+        target = act.get("label") or act.get("version") or act.get("name") or ctx.show(act.get("path", "")) or ""
+        if act["kind"] == "download" and act.get("sha256"):
+            target = f"v{act.get('version')} sha256:{act['sha256'][:12]}..."
+        note = f"  ({act['note']})" if act.get("note") else ""
+        lines.append(f"  {act['state']:<9} {act['kind']:<10} {target}{note}")
+        for drift in act.get("drift") or []:
+            lines.append(f"            label drift ({'GitHub' if drift['against'] == 'github' else 'receipt'}): "
+                         f"registered labels differ from what this version would register: {drift_text(drift)}")
+    copy = receipt.get("scriptCopy")
+    if copy and copy.get("labelDrift"):
+        lines.append(f"label drift (release {copy['release']}): the installed release would register "
+                     f"{drift_text(copy['labelDrift'])} against this copy")
+    elif copy and copy.get("releaseLabels") is None and copy["state"] == "stale":
+        lines.append(f"label drift (release {copy['release']}): unknown; its plan did not run")
+    if mode == "install":
+        route = receipt["routing"]
+        if route.get("note"):
+            lines.append(f"routing: {route['note']}")
+        if route["route"]:
+            lines.append(f"route cmux jobs to this runner (printed only; run one at a time, {ctx.route_repo} admin):")
+            lines.extend(f"  {c}" for c in route["route"])
+            lines.append("rollback (jobs fall back to Blacksmith immediately):")
+            lines.extend(f"  {c}" for c in route["rollback"])
+    lines.append("ready: " + ("yes" if receipt["ready"] else "no, blocking: " + ", ".join(receipt["blocking"])))
+    if receipt["applied"]:
+        written = ctx.state / "uninstall-receipt.json" if mode == "uninstall" else ctx.receipt_path
+        lines.append(f"receipt: {ctx.show(written)}")
+    return "\n".join(lines)
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="glaeda-cmux-runner", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--apply", action="store_true", help="make the changes (default is plan only)")
+    p.add_argument("--uninstall", action="store_true", help="deregister and remove what --apply installed")
+    p.add_argument("--output", choices=("human", "json"), default="human")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--repo", help=f"register to OWNER/REPO (default {DEFAULT_REPO})")
+    scope.add_argument("--org", help="register to an organization instead")
+    p.add_argument("--group", help="runner group (with --org)")
+    p.add_argument("--labels", help=f"extra comma-separated labels beyond {','.join(BASE_LABELS)},{MINI_LABEL}")
+    p.add_argument("--manifest", type=Path, help="fleet manifest (cmuxterm-hq build-fleet/mini-fleet.json); labels "
+                   "come from --member's class, availability and present Xcodes instead of --labels")
+    p.add_argument("--min-free-gib", type=float, help="job-started refuses a job below this much free disk "
+                   "(default: the manifest's disk.min_free_gib with --manifest, else no floor)")
+    p.add_argument("--member", help="this machine's key in the manifest's hosts table (default name <member>-glaeda)")
+    p.add_argument("--name", help="runner name (default: <short hostname>-glaeda, plus -K for --instance K)")
+    p.add_argument("--instance", type=int, default=0,
+                   help="which of this mini's runners (0 keeps the original paths; K > 0 gets its own "
+                        "~/actions-runner-glaeda-K, LaunchAgent, receipt and name <member>-glaeda-K)")
+    p.add_argument("--capacity-units", type=int,
+                   help="weighted capacity the job-started hook shares across this mini's runners "
+                        "(default: the manifest class's capacityUnits with --manifest, else one job at a time)")
+    p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
+    p.add_argument("--runner-dir", type=Path, help="install directory (default ~/actions-runner-glaeda)")
+    p.add_argument("--runner-version", help="pin a runner version such as 2.328.0 (default latest)")
+    p.add_argument("--runner-sha256", help="pin the expected SHA-256 of the tarball")
+    p.add_argument("--route-repo", default=DEFAULT_REPO, help="repository whose variables the printed routing commands set")
+    p.add_argument("--gh", help="gh binary (default: PATH)")
+    p.add_argument("--token-stdin", action="store_true",
+                   help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
+                        "without --apply, plan that path")
+    p.add_argument("--python", help="interpreter the job hooks run (default: python3 on PATH)")
+    p.add_argument("--xcode-app", help="check the Xcode that routed jobs select (the value of the repo's "
+                   "CMUX_CI_XCODE_APP_PR variable, such as /Applications/Xcode_26.6.app); a warning, never a block")
+    p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
+    p.add_argument("--allow-stale", action="store_true",
+                   help="apply from a copy older than the installed OTA release (default: that blocks)")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser().parse_args(argv)
+    if DARWIN_REQUIRED and platform.system() != "Darwin":
+        print("glaeda-cmux-runner: macOS only", file=sys.stderr)
+        return 2
+    if args.instance < 0 or args.instance > 63:
+        print("glaeda-cmux-runner: --instance must be 0 to 63", file=sys.stderr)
+        return 2
+    if args.org and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", args.org):
+        print("glaeda-cmux-runner: --org must be an organization login", file=sys.stderr)
+        return 2
+    if args.repo and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+", args.repo):
+        print("glaeda-cmux-runner: --repo must be OWNER/REPO", file=sys.stderr)
+        return 2
+    if args.manifest and args.labels:
+        print("glaeda-cmux-runner: --labels and --manifest are exclusive; labels come from one source", file=sys.stderr)
+        return 2
+    if bool(args.manifest) != bool(args.member):
+        print("glaeda-cmux-runner: --manifest and --member go together", file=sys.stderr)
+        return 2
+    ctx = Context(args)
+    if args.manifest:
+        try:
+            manifest = json.loads(args.manifest.expanduser().read_text())
+        except (OSError, ValueError) as error:
+            print(f"glaeda-cmux-runner: cannot read manifest: {type(error).__name__}", file=sys.stderr)
+            return 2
+        early = load_receipt(ctx)
+        member, why = member_labels(manifest, args.member,
+                                    ((early or {}).get("registration") or {}).get("labels") or [])
+        if member is None:
+            print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
+            return 2
+        ctx.member = member
+        if not args.min_free_gib:
+            ctx.min_free_gib = float(member.get("minFreeGib") or 0)
+        if ctx.instance >= int(member.get("runners") or 1):
+            print(f"glaeda-cmux-runner: {args.member} is class {member['class']} with {member.get('runners')} "
+                  f"runner(s); instance {ctx.instance} is beyond that", file=sys.stderr)
+            return 2
+        if not args.capacity_units:
+            ctx.capacity_units = int(member.get("capacityUnits") or 0)
+        runners_n = int(member.get("runners") or 1)
+        # the last instance is the gui runner when guiRunners is 1: only the gui pool label, no root or side one
+        ctx.gui_runner = ctx.instance >= runners_n - int(member.get("guiRunners") or 0)
+        is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner
+        roots = (member.get("guiPools", []) if ctx.gui_runner
+                 else member.get("rootPools", []) if is_root else member.get("sidePools", []))
+        # The gui runner leaves out the pool and iOS simulator labels: a pool-label or iOS job must never take
+        # the one runner a mini's GUI jobs wait for, and the picker's live count of the pool's runners stays
+        # the root and side runners it can route to.
+        own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
+               if ctx.gui_runner else member["labels"])
+        ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
+        ctx.labels_requested = True
+        if not args.name:
+            ctx.name = f"{args.member}-glaeda{ctx.suffix}"
+        if is_root:
+            # A static handle on this one root runner (cmux's warm affinity): the picker reads which runner
+            # kept a warm build and names it in runs-on, so no job ever writes a runner label.
+            ctx.labels.append(runner_label(ctx.name))
+    if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
+        token = sys.stdin.readline(4096).strip()
+        if not re.fullmatch(TOKEN_RE, token):
+            print("glaeda-cmux-runner: --token-stdin read no usable token", file=sys.stderr)
+            return 2
+        ctx.stdin_token = token
+        del token
+    if ctx.gh and run([ctx.gh, "auth", "status"])[0] != 0:
+        ctx.gh, ctx.gh_state = None, "installed, not logged in"  # a logged-out gh is no gh
+    prior = load_receipt(ctx)
+    if args.uninstall and prior:
+        # Uninstall acts only on what the receipt recorded; flags cannot point it elsewhere.
+        if prior.get("runnerDir"):
+            ctx.runner_dir = Path(prior["runnerDir"])
+            ctx.hook_dir = ctx.runner_dir / HOOK_DIR
+        reg = prior.get("registration") or {}
+        if reg.get("name"):
+            ctx.name = reg["name"]
+        if reg.get("scope"):
+            ctx.org, ctx.repo = (reg["scope"], None) if reg.get("org") else (None, reg["scope"])
+        elif not reg and owned_dir(ctx, prior):
+            # an interrupted --apply registered without recording it: .runner says where
+            local = local_runner(ctx) or {}
+            scope = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+)(?:/([A-Za-z0-9._-]+))?/?",
+                                 str(local.get("gitHubUrl") or ""))
+            if local.get("agentName") and scope:
+                ctx.name = str(local["agentName"])
+                ctx.org, ctx.repo = (None, f"{scope[1]}/{scope[2]}") if scope[2] else (scope[1], None)
+            elif local:
+                ctx.unreadable_registration = True
+    if not args.uninstall and owned_dir(ctx, prior):
+        registered = (prior or {}).get("registration") or {}
+        kept = (prior or {}).get("member")
+        if ctx.member is None and isinstance(kept, dict) and kept.get("hardware"):
+            # a plain re-run keeps the member's gate, capacity and disk floor, not just its labels
+            ctx.member = kept
+            if not args.capacity_units:
+                ctx.capacity_units = int(kept.get("capacityUnits") or 0)
+            if not args.min_free_gib:
+                ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
+        # a re-run that names nothing keeps what this install registered, not the hostname default
+        if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
+            ctx.labels = registered["labels"]
+        if not args.name and not args.member and registered.get("name"):
+            ctx.name = registered["name"]
+    ctx.allow_stale = args.allow_stale
+    ctx.copy = None if args.uninstall else copy_check(ctx)
+    if ctx.copy is not None and ctx.copy["state"] == "stale":
+        labels = release_plan_labels(ctx.copy["releaseScriptPath"], raw_argv)
+        ctx.copy["releaseLabels"] = labels
+        if labels is not None:
+            ctx.copy["labelDrift"] = label_drift("release", ctx.labels, labels)
+    pre = preflight(ctx)
+    doc: dict[str, Any] = {
+        "schema": SCHEMA,
+        "mode": "uninstall" if args.uninstall else "install",
+        "applied": args.apply,
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "sandboxHome": ctx.sandbox,
+        "runnerDir": os.fspath(ctx.runner_dir),
+        "installId": (prior or {}).get("installId") if owned_dir(ctx, prior) else secrets.token_hex(16),
+        "runnerDirOwned": owned_dir(ctx, prior),
+        "runnerVersion": (prior or {}).get("runnerVersion") if owned_dir(ctx, prior) else None,
+        "registration": (prior or {}).get("registration") if owned_dir(ctx, prior) else None,
+        "preflight": pre,
+        "member": ctx.member or ((prior or {}).get("member") if owned_dir(ctx, prior) else None),
+    }
+    if ctx.copy is not None:
+        doc["scriptCopy"] = {k: v for k, v in ctx.copy.items() if k != "releaseScriptPath"}
+    if args.uninstall:
+        actions = plan_uninstall(ctx, prior)
+        if ctx.gh is None and not ctx.token_stdin and \
+                any(a["kind"] == "deregister" and a["state"] == "remove" for a in actions):
+            for act in actions:  # removing the agent or directory without deregistering strands the runner
+                if act["state"] == "remove":
+                    act["state"], act["note"] = "blocked", "deregistering needs gh as an admin, or --token-stdin"
+        if args.apply:
+            apply_uninstall(ctx, actions)
+    else:
+        actions = plan_install(ctx, prior)
+        if args.apply and pre["blocking"]:
+            for act in actions:
+                if act["state"] in {"create", "update", "relabel"}:
+                    act["state"], act["note"] = "blocked", "preflight blocks: " + ", ".join(pre["blocking"])
+        if args.apply:
+            apply_install(ctx, actions, doc)
+        doc["routing"] = routing(ctx)
+    doc["actions"] = actions
+    doc["blocking"] = ([] if args.uninstall else pre["blocking"]) + [f"{a['kind']}:{a.get('path') or a.get('name') or ''}".rstrip(":")
+                                         for a in actions if a.get("state") in {"blocked", "failed"}]
+    doc["ready"] = not doc["blocking"]
+    failed = any(a.get("state") == "failed" for a in actions)
+    if args.apply:
+        ctx.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        data = (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode()
+        if args.uninstall:
+            write_atomic(ctx.state / "uninstall-receipt.json", data, 0o600)
+            if prior is not None and doc["ready"]:  # a blocked or failed uninstall keeps the receipt for a re-run
+                os.replace(ctx.receipt_path, ctx.state / "receipt.uninstalled.json")
+        elif receipt_conflict(ctx, prior) is None and (doc["runnerDirOwned"] or any(a.get("owned") for a in actions)):
+            write_atomic(ctx.receipt_path, data, 0o600)
+    if args.output == "json":
+        print(json.dumps(doc, indent=2, sort_keys=True))
+    else:
+        print(render(ctx, doc))
+    return 1 if failed or (args.apply and not doc["ready"]) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

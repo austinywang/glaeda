@@ -5,23 +5,25 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::fs::{File, OpenOptions};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::io::Seek;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsFd;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+#[cfg(target_os = "linux")]
+use rustix::fs::Mode;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -75,6 +77,26 @@ impl GitHubAppKeychainConfig {
             installation_id,
             service: service.to_owned(),
             account: account.to_owned(),
+        })
+    }
+
+    pub(crate) fn new_without_keychain(
+        github_config_url: &str,
+        client_id: &str,
+        installation_id: u64,
+    ) -> Result<Self, ScaleSetBridgeError> {
+        if !valid_github_config_url(github_config_url)
+            || !bounded_token(client_id, 100)
+            || installation_id == 0
+        {
+            return Err(ScaleSetBridgeError::new("invalid_github_app_identity"));
+        }
+        Ok(Self {
+            github_config_url: github_config_url.to_owned(),
+            client_id: client_id.to_owned(),
+            installation_id,
+            service: String::new(),
+            account: String::new(),
         })
     }
 }
@@ -211,14 +233,96 @@ fn load_keychain_private_key(
     GitHubAppPrivateKey::parse(bytes)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+fn load_private_key_file(
+    path: &Path,
+    expected_digest: &Sha256Digest,
+) -> Result<GitHubAppPrivateKey, ScaleSetBridgeError> {
+    if !canonical_absolute_path(path) {
+        return Err(ScaleSetBridgeError::new(
+            "invalid_github_app_private_key_path",
+        ));
+    }
+    let path_before = std::fs::symlink_metadata(path)
+        .map_err(|_| ScaleSetBridgeError::new("github_app_private_key_unavailable"))?;
+    validate_private_key_metadata(&path_before)?;
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| ScaleSetBridgeError::new("github_app_private_key_unavailable"))?;
+    let mut file = File::from(descriptor);
+    let before = file
+        .metadata()
+        .map_err(|_| ScaleSetBridgeError::new("github_app_private_key_unavailable"))?;
+    validate_private_key_metadata(&before)?;
+    if !same_private_key_metadata(&path_before, &before) {
+        return Err(ScaleSetBridgeError::new("github_app_private_key_changed"));
+    }
+
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    if file.read_to_end(&mut bytes).is_err() || bytes.len() as u64 != before.len() {
+        bytes.zeroize();
+        return Err(ScaleSetBridgeError::new(
+            "github_app_private_key_unavailable",
+        ));
+    }
+    let observed = format!("sha256:{:x}", Sha256::digest(&bytes));
+    if observed != expected_digest.as_str() {
+        bytes.zeroize();
+        return Err(ScaleSetBridgeError::new(
+            "github_app_private_key_digest_mismatch",
+        ));
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| ScaleSetBridgeError::new("github_app_private_key_unavailable"))?;
+    let path_after = std::fs::symlink_metadata(path)
+        .map_err(|_| ScaleSetBridgeError::new("github_app_private_key_unavailable"))?;
+    if !same_private_key_metadata(&before, &after)
+        || !same_private_key_metadata(&before, &path_after)
+    {
+        bytes.zeroize();
+        return Err(ScaleSetBridgeError::new("github_app_private_key_changed"));
+    }
+    GitHubAppPrivateKey::parse(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_key_metadata(metadata: &std::fs::Metadata) -> Result<(), ScaleSetBridgeError> {
+    let mode = metadata.mode();
+    if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > MAX_PRIVATE_KEY_BYTES as u64
+        || !matches!(mode & 0o7777, 0o400 | 0o600)
+    {
+        return Err(ScaleSetBridgeError::new("unsafe_github_app_private_key"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn same_private_key_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.mode() == right.mode()
+        && left.nlink() == right.nlink()
+        && left.len() == right.len()
+}
+
+#[cfg(unix)]
 struct VerifiedBridgeProgram {
     file: File,
     snapshot: BridgeProgramSnapshot,
     digest: Sha256Digest,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl VerifiedBridgeProgram {
     fn open(config: &ScaleSetBridgeConfig) -> Result<Self, ScaleSetBridgeError> {
         verify_protected_bridge_path(&config.program)?;
@@ -269,7 +373,7 @@ impl VerifiedBridgeProgram {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct BridgeProgramSnapshot {
     dev: u64,
@@ -281,7 +385,7 @@ struct BridgeProgramSnapshot {
     size: u64,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl BridgeProgramSnapshot {
     fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, ScaleSetBridgeError> {
         let mode = metadata.mode();
@@ -315,7 +419,7 @@ impl BridgeProgramSnapshot {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn verify_protected_bridge_path(path: &Path) -> Result<(), ScaleSetBridgeError> {
     if path != Path::new(BRIDGE_PROGRAM) {
         return Err(ScaleSetBridgeError::new("invalid_bridge_program"));
@@ -334,7 +438,7 @@ fn verify_protected_bridge_path(path: &Path) -> Result<(), ScaleSetBridgeError> 
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn require_bridge_digest(
     file: &mut File,
     expected: &Sha256Digest,
@@ -786,6 +890,23 @@ pub(crate) struct ScaleSetBridgeClient {
 }
 
 impl ScaleSetBridgeClient {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn connect_from_private_key_file(
+        config: ScaleSetBridgeConfig,
+        private_key_path: &Path,
+        private_key_digest: &Sha256Digest,
+    ) -> Result<Self, ScaleSetBridgeError> {
+        let verified_program = VerifiedBridgeProgram::open(&config)?;
+        let private_key = load_private_key_file(private_key_path, private_key_digest)?;
+        verified_program.confirm(&config.program)?;
+        let mut transport = ChildBridgeTransport::spawn(&config.program)?;
+        if let Err(error) = verified_program.confirm(&config.program) {
+            transport.poison();
+            return Err(error);
+        }
+        Self::connect_with_transport(config, private_key, Box::new(transport))
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn connect_from_keychain(
         config: ScaleSetBridgeConfig,

@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: scripts/benchmark-developer-loop --output RECEIPT.json
+       scripts/benchmark-developer-loop --print-command
+
+Run the repository-owned resident-eligible Rust developer-loop workload.
+The command does not edit the source tree; apply the checked-in fixture first
+when measuring edit-to-result latency.
+EOF
+}
+
+output=
+print_command=false
+while (($#)); do
+  case "$1" in
+    --output)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      output=$2
+      shift 2
+      ;;
+    --print-command)
+      print_command=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'error: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+excluded_tests=(
+  durable_lane_execution::tests::runner_user_command_without_verified_evidence_fails_before_process_execution
+  host_preparation_execution::tests::execution::freshly_planned_migration_phase_executes_only_runner_migration
+  host_preparation_execution::tests::execution::mapping_phase_stops_at_barrier_without_migration
+  host_preparation_plan::tests::freshly_matching_report_may_emit_migration_only
+  host_preparation_plan::tests::json_and_human_output_exclude_commands_environment_and_raw_evidence
+  host_preparation_plan::tests::mapping_change_stops_before_migration_and_requires_both_authorities
+  host_readiness::tests::host_plan_has_one_barriered_source_for_subordinate_mutations
+  host_readiness::tests::missing_host_state_remains_required
+  lane_command::tests::runner_user_commands_have_exact_runuser_boundary_and_environment
+  lane_executable::tests::runner_git_command_verifies_outer_and_inner_reviewed_programs_when_present
+  lane_executor::tests::invalid_runner_evidence_fails_before_privilege_or_process_execution
+  lane_executor::tests::lane_mismatch_fails_before_any_evidence_or_process_work
+  lane_executor::tests::runner_evidence_mismatch_fails_before_privilege_or_process_execution
+  lane_executor::tests::runner_executor_delivers_exact_sealed_environment_boundary
+  rootless_podman_config_observation::tests::linux_reader_enforces_no_follow_metadata_and_size_policy
+  subordinate_id::tests::mapping_changes_require_fresh_reads_and_runner_user_migration
+)
+
+command=(cargo test --quiet --locked --lib --bins --)
+for test_name in "${excluded_tests[@]}"; do
+  command+=(--skip "$test_name")
+done
+
+if $print_command; then
+  printf '%s\0' "${command[@]}" | jq -Rs 'split("\u0000")[:-1]'
+  exit 0
+fi
+
+test -n "$output" || { usage >&2; exit 2; }
+command -v jq >/dev/null || { printf 'error: jq is required\n' >&2; exit 2; }
+test -x /usr/bin/time || { printf 'error: /usr/bin/time is required\n' >&2; exit 2; }
+
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root"
+source_commit=$(git rev-parse HEAD)
+source_tree=$(git rev-parse 'HEAD^{tree}')
+source_diff_digest=$(git diff --no-ext-diff --binary HEAD -- src Cargo.toml Cargo.lock | sha256sum | cut -d' ' -f1)
+source_dirty=false
+git diff --quiet -- src Cargo.toml Cargo.lock || source_dirty=true
+rustc_version=$(rustc --version)
+cargo_version=$(cargo --version)
+logical_cpu_count=$(getconf _NPROCESSORS_ONLN)
+build_jobs=${CARGO_BUILD_JOBS:-default}
+command_digest=$(printf '%s\0' "${command[@]}" | sha256sum | cut -d' ' -f1)
+excluded_json=$(printf '%s\n' "${excluded_tests[@]}" | jq -R . | jq -s .)
+
+scratch=$(mktemp -d)
+timing_file="$scratch/timing"
+command_output="$scratch/command-output"
+receipt_tmp="${output}.tmp.$$"
+cleanup() {
+  rm -f "$receipt_tmp"
+  rm -rf "$scratch"
+}
+trap cleanup EXIT
+
+set +e
+/usr/bin/time --quiet -f '%e\t%U\t%S\t%M\t%x' -o "$timing_file" "${command[@]}" \
+  >"$command_output" 2>&1
+exit_code=$?
+set -e
+command cat "$command_output"
+IFS=$'\t' read -r elapsed_seconds user_seconds system_seconds max_rss_kib timed_exit_code < "$timing_file"
+test "$exit_code" = "$timed_exit_code" || {
+  printf 'error: command/time exit-code mismatch\n' >&2
+  exit 2
+}
+
+IFS=$'\t' read -r summary_count passed_count failed_count ignored_count measured_count filtered_count < <(
+  awk '
+    BEGIN { OFS = "\t" }
+    /^test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out;/ {
+      summaries += 1
+      passed += $4
+      failed += $6
+      ignored += $8
+      measured += $10
+      filtered += $12
+    }
+    END { print summaries + 0, passed + 0, failed + 0, ignored + 0, measured + 0, filtered + 0 }
+  ' "$command_output"
+)
+inventory_disposition=observed
+inventory_error=false
+if ((summary_count == 0)); then
+  inventory_disposition=unavailable
+  summary_count_json=null
+  selected_count_json=null
+  executed_count_json=null
+  passed_count_json=null
+  failed_count_json=null
+  ignored_count_json=null
+  measured_count_json=null
+  filtered_count_json=null
+  if ((exit_code == 0)); then
+    inventory_error=true
+  fi
+else
+  summary_count_json=$summary_count
+  selected_count_json=$((passed_count + failed_count + ignored_count + measured_count))
+  executed_count_json=$((passed_count + failed_count + measured_count))
+  passed_count_json=$passed_count
+  failed_count_json=$failed_count
+  ignored_count_json=$ignored_count
+  measured_count_json=$measured_count
+  filtered_count_json=$filtered_count
+  if ((
+    exit_code == 0
+    && (
+      selected_count_json == 0
+      || failed_count != 0
+      || measured_count != 0
+      || passed_count != executed_count_json
+      || selected_count_json != executed_count_json + ignored_count
+      || filtered_count != ${#excluded_tests[@]}
+    )
+  )); then
+    inventory_error=true
+  fi
+fi
+
+jq -n \
+  --arg document_type glaeda-developer-loop-benchmark \
+  --arg benchmark_id resident-eligible-rust-edit-v1 \
+  --arg source_commit "$source_commit" \
+  --arg source_tree "$source_tree" \
+  --arg source_diff_digest "sha256:$source_diff_digest" \
+  --argjson source_dirty "$source_dirty" \
+  --arg inventory_disposition "$inventory_disposition" \
+  --arg rustc_version "$rustc_version" \
+  --arg cargo_version "$cargo_version" \
+  --arg build_jobs "$build_jobs" \
+  --arg command_digest "sha256:$command_digest" \
+  --argjson excluded_tests "$excluded_json" \
+  --argjson logical_cpu_count "$logical_cpu_count" \
+  --argjson elapsed_seconds "$elapsed_seconds" \
+  --argjson user_seconds "$user_seconds" \
+  --argjson system_seconds "$system_seconds" \
+  --argjson max_rss_kib "$max_rss_kib" \
+  --argjson exit_code "$exit_code" \
+  --argjson summary_count "$summary_count_json" \
+  --argjson selected_count "$selected_count_json" \
+  --argjson executed_count "$executed_count_json" \
+  --argjson passed_count "$passed_count_json" \
+  --argjson failed_count "$failed_count_json" \
+  --argjson ignored_count "$ignored_count_json" \
+  --argjson measured_count "$measured_count_json" \
+  --argjson filtered_count "$filtered_count_json" \
+  '{
+    schema_version: 2,
+    document_type: $document_type,
+    benchmark_id: $benchmark_id,
+    authority: "performance_observation_only",
+    source: {
+      commit: $source_commit,
+      tree: $source_tree,
+      tracked_workload_dirty: $source_dirty,
+      tracked_workload_diff_digest: $source_diff_digest
+    },
+    toolchain: {
+      rustc: $rustc_version,
+      cargo: $cargo_version
+    },
+    resources: {
+      logical_cpu_count: $logical_cpu_count,
+      cargo_build_jobs: $build_jobs
+    },
+    workload: {
+      command_digest: $command_digest,
+      excluded_host_fact_test_count: ($excluded_tests | length),
+      excluded_host_fact_tests: $excluded_tests,
+      test_inventory: {
+        disposition: $inventory_disposition,
+        source: "rust_test_terminal_summaries_v1",
+        summary_count: $summary_count,
+        selected_test_count: $selected_count,
+        executed_test_count: $executed_count,
+        passed_test_count: $passed_count,
+        failed_test_count: $failed_count,
+        ignored_test_count: $ignored_count,
+        measured_test_count: $measured_count,
+        filtered_out_test_count: $filtered_count
+      }
+    },
+    result: {
+      elapsed_seconds: $elapsed_seconds,
+      user_cpu_seconds: $user_seconds,
+      system_cpu_seconds: $system_seconds,
+      max_rss_kib: $max_rss_kib,
+      exit_code: $exit_code,
+      resource_accounting: "gnu-time-child-tree"
+    }
+  }' > "$receipt_tmp"
+mv "$receipt_tmp" "$output"
+if $inventory_error; then
+  printf 'error: successful workload did not produce a consistent test inventory\n' >&2
+  exit 2
+fi
+exit "$exit_code"

@@ -1,4 +1,4 @@
-"""One-command, read-only SmolRunner checkout readiness journey."""
+"""One-command, read-only Glaeda checkout readiness journey."""
 
 from __future__ import annotations
 
@@ -16,10 +16,14 @@ from pathlib import Path
 
 from .cli import blocked_internal_receipt
 from .probe import child_environment
-from .receipt import build_receipt
+from .receipt import (
+    RECEIPT_TYPE as WORKSPACE_RECEIPT_TYPE,
+    SCHEMA_VERSION as WORKSPACE_SCHEMA_VERSION,
+    build_receipt,
+)
 
-SCHEMA_VERSION = 1
-RECEIPT_TYPE = "smolrunner-front-door-readiness-receipt"
+SCHEMA_VERSION = 2
+RECEIPT_TYPE = "glaeda-front-door-readiness-receipt"
 MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 DOCTOR_TIMEOUT_SECONDS = 180
 VALID_BOOTSTRAP_STATES = {"ready", "ready_with_declared_deviations", "blocked"}
@@ -29,13 +33,13 @@ VALID_DOCTOR_STATUSES = {"pass", "warn", "fail"}
 class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
         self.print_usage(sys.stderr)
-        self.exit(2, "smolrunner arguments are invalid\n")
+        self.exit(2, "glaeda arguments are invalid\n")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = SafeArgumentParser(
-        prog="./smolrunner",
-        description="Evaluate the checkout and host through one SmolRunner readiness journey.",
+        prog="./glaeda",
+        description="Evaluate the checkout and host through one Glaeda readiness journey.",
     )
     parser.add_argument("command", nargs="?", choices=["doctor"])
     parser.add_argument("--output", choices=["human", "json"], default="human")
@@ -158,9 +162,9 @@ def _bootstrap_receipt() -> dict[str, object]:
 def _valid_bootstrap_receipt(receipt: object) -> bool:
     if not isinstance(receipt, dict):
         return False
-    if receipt.get("schema_version") != 1:
+    if receipt.get("schema_version") != WORKSPACE_SCHEMA_VERSION:
         return False
-    if receipt.get("receipt_type") != "smolrunner-workspace-capability-receipt":
+    if receipt.get("receipt_type") != WORKSPACE_RECEIPT_TYPE:
         return False
     if receipt.get("state") not in VALID_BOOTSTRAP_STATES:
         return False
@@ -321,7 +325,7 @@ def render_human(report: dict[str, object]) -> str:
     assert isinstance(doctor, dict)
     assert isinstance(bootstrap, dict)
     lines = [
-        f"SmolRunner: {verdict}",
+        f"Glaeda: {verdict}",
         f"Bootstrap: {bootstrap['state']}",
         f"Doctor: {doctor['overall'] if doctor['evaluated'] else 'not evaluated'}",
     ]
@@ -334,9 +338,9 @@ def render_human(report: dict[str, object]) -> str:
     if blockers:
         lines.append("Blockers: " + ", ".join(str(item) for item in blockers))
     if report["next_action"] == "none":
-        lines.append("Next: ready for SmolRunner work.")
+        lines.append("Next: ready for Glaeda work.")
     else:
-        lines.append("Next: resolve the blocker above, then rerun ./smolrunner.")
+        lines.append("Next: resolve the blocker above, then rerun ./glaeda.")
     return "\n".join(lines) + "\n"
 
 

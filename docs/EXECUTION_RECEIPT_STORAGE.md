@@ -1,10 +1,12 @@
 # Durable execution receipt storage
 
-SmolRunner stores validated execution receipt v1 documents beneath one installation at:
+Glaeda stores validated legacy SmolRunner execution receipt v1 documents beneath one installation at:
 
 ```text
 installations/INSTALLATION_ID/receipts/EXECUTION_ID.json
 ```
+
+The receipt schema and identity remain the exact v1 SmolRunner contract during the rename. A successor identity requires its own versioned migration.
 
 Receipts use their own managed directory. They are not placed beside journal files with a suffix because journal IDs permit dots, which would allow a valid journal identity to collide with a receipt filename.
 

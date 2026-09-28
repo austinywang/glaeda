@@ -1,0 +1,1358 @@
+#!/usr/bin/env python3
+"""glaeda-route: Glaeda's CI routing for cmux (glaeda#1174). docs/GLAEDA_ROUTE.md is the contract.
+
+    glaeda-route state        [--pools FILE] [--runners FILE] [--manifest M] [--repo O/R]
+    glaeda-route publish      [--pools FILE] [--runners FILE] [--manifest M] [--repo O/R] [--yes]
+    glaeda-route check        --state FILE [--max-age SECONDS]
+    glaeda-route route        --kind K --priority pr|dev|nightly|warm --slots N --xcode V --default LABEL
+    glaeda-route agent        [--repo O/R] [--ledger-repo O/R] [--no-publish]
+    glaeda-route init-ledger  [--ledger-repo O/R] [--yes]
+
+Order for every job: std (48 GB) minis, then light (16 GB) minis, then Blacksmith, then GitHub-hosted.
+Glaeda answers only for the owned pools; the caller's default is the Blacksmith label, and the
+caller's own expression keeps GitHub-hosted for repositories without Blacksmith.
+
+`state` builds the pool-state document (glaeda-pool-state/v1) from two observations:
+
+  * the fleet: `glaeda-mini-fleet pools` (declared and conforming members per pool label, and, once
+    the probe reports them, members held by a reservation or by the fleet host lock), or --pools FILE;
+  * GitHub: the repository's self-hosted runners (online, busy, labels), or --runners FILE.
+
+A member counts as idle only when both agree: the fleet saw it reachable with the pool's exact Xcode,
+not reserved and not holding the host lock, and GitHub shows its runner (`<member>-glaeda`) online,
+not busy and carrying the pool label. The document carries counts only, never host names, because
+cmux workflow logs are public. `publish` writes it to the repository variable GLAEDA_POOL_STATE
+(dry run without --yes); `check` applies the reader rules to a saved document.
+
+`route` runs inside the workflow (a small Linux step) and prints one runs-on target. It reads the
+pool state from vars.GLAEDA_POOL_STATE, refuses owned machines to anything but a trusted same-repo
+attempt-1 run, and reserves slots in the ledger (a JSON file on a branch of a private state
+repository) with a compare-and-swap commit, so no two runs are ever given the same slot. Any error,
+a stale or missing state, or a ledger race lost CAS_ATTEMPTS times answers with --default. It always
+exits 0: routing never fails a job.
+
+`agent` is one tick of the always-on side: publish the state, then watch every live reservation,
+release it when its jobs start or its run ends, and rescue a run whose pool job waited RESCUE_SECONDS
+with no runner (or was refused at start): cancel it, then re-run it once it has finished. The re-run
+is attempt 2, which `route` never sends to an owned machine. GitHub never re-routes a queued job, so
+this is the only way off a busy pool. Run it every 20 s from launchd or a systemd timer, never on
+cmux-lawrence. No endpoint listens anywhere: every call is outbound to the GitHub API.
+
+Credentials never come from argv and are never printed or written: GLAEDA_ROUTE_TOKEN or
+GLAEDA_LEDGER_TOKEN in the environment, a token file only its owner can read, or a GitHub App id and
+key file (the JWT is signed by /usr/bin/openssl and exchanged for a one-repository installation
+token). The repository credential needs Actions read and write, Administration read, Variables read
+and write and Pull requests read on the routed repository; the ledger credential needs Contents
+read and write on the state repository only."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import dataclasses
+import datetime as dt
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+STATE_SCHEMA = "glaeda-pool-state/v1"
+DEFAULT_REPO = "manaflow-ai/cmux"
+STATE_VARIABLE = "GLAEDA_POOL_STATE"
+# Readers treat an older document as missing. The publisher runs every 20 s, so two missed runs
+# still leave a fresh document.
+MAX_AGE_SECONDS = 60
+# Future skew tolerated between the publisher's clock and a reader's.
+MAX_SKEW_SECONDS = 30
+# Leo's order for every job type: std (48 GB) minis, then light (16 GB), then Blacksmith, then
+# GitHub-hosted. Only the owned classes are pools here; overflow belongs to the caller.
+CLASS_ORDER = ("std", "light")
+POOL_LABEL = re.compile(r"glaeda-(std|light|xl)-xcode-([0-9]+(?:\.[0-9]+)*)")
+RUNNER_SUFFIX = "-glaeda"
+MINI_FLEET = SCRIPT_DIR / "glaeda-mini-fleet"
+POOLS_TIMEOUT = 40
+API = "https://api.github.com"
+HTTP_TIMEOUT = 10
+OPENSSL = "/usr/bin/openssl"
+USER_AGENT = "glaeda-route"
+# The reservation ledger lives in a private state repository, never in cmux itself.
+LEDGER_SCHEMA = "glaeda-route-ledger/v1"
+DEFAULT_LEDGER_REPO = "manaflow-ai/glaeda-route-state"
+LEDGER_BRANCH = "ledger"
+LEDGER_FILE = "ledger.json"
+PRIORITIES = ("pr", "dev", "nightly", "warm")
+HIGH = ("pr", "dev")
+LOW = ("nightly", "warm")
+# Low-priority work takes an owned pool only while this many slots stay free for pull requests.
+LOW_PRIORITY_RESERVE = 1
+STATES = ("held", "rescuing", "released", "rescued", "failed")
+LIVE_STATES = ("held", "rescuing")
+TRUSTED_EVENTS = ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch")
+MAX_SLOTS = 10
+# Overflow load: running and queued jobs per Blacksmith label, from the repository's in-flight runs.
+# A run's jobs are re-listed only when its updated_at moves, so a quiet tick costs two requests.
+OVERFLOW_PREFIX = "blacksmith-"
+OVERFLOW_RUN_LOOKUPS = 10
+# A cached run's jobs are listed again after this long even when its updated_at has not moved,
+# since a job taking a runner is not documented to touch the run.
+OVERFLOW_RELIST_SECONDS = 150
+# Overflow listing stops while the credential has fewer requests than this left, so the rescue
+# watch that shares it always has budget.
+OVERFLOW_RATE_FLOOR = 1500
+OVERFLOW_STATUSES = ("queued", "in_progress")
+# A reservation holds its slots until its jobs start; the agent releases it sooner. The hold only
+# bounds a reservation the agent never saw.
+HOLD_SECONDS = 900
+# A pool job queued this long with no runner is rescued. cmux runs its own rescue at 30 s
+# (CI_OWNED_POOL_RESCUE_SECONDS); an idle owned runner picks a job up within a few seconds.
+RESCUE_SECONDS = 30
+FORCE_CANCEL_SECONDS = 90
+CANCEL_GIVE_UP_SECONDS = 180
+KEEP_SECONDS = 3600
+# The agent stops watching a run this long after its reservation (cmux#14234 watched for 60 min).
+WATCH_LIMIT_SECONDS = 2 * 3600
+MAX_RESERVATIONS = 400
+CAS_ATTEMPTS = 4
+ROUTE_DEADLINE_SECONDS = 12
+# Wall-clock limit on the whole route command, token minting included: past it the caller's default
+# is answered, so a hung openssl or socket read never fails the asking job.
+ROUTE_WALL_SECONDS = 20
+
+
+class Failure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- time
+
+
+def utc(ts: float) -> str:
+    return dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_utc(value: Any) -> float | None:
+    """Seconds since the epoch for an RFC 3339 UTC string with a zone, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+# ---------------------------------------------------------------- pool state
+
+
+def pool_key(label: str) -> tuple[int, tuple[int, ...]] | None:
+    """Sort key for an owned pool label: class rank first, then the newest Xcode."""
+    match = POOL_LABEL.fullmatch(label)
+    if not match or match.group(1) not in CLASS_ORDER:
+        return None
+    version = tuple(int(part) for part in match.group(2).split("."))
+    return CLASS_ORDER.index(match.group(1)), tuple(-part for part in version)
+
+
+def member_of(runner_name: str) -> str | None:
+    """The fleet member a runner belongs to: glaeda-cmux-runner names it `<member>-glaeda`."""
+    if not runner_name.endswith(RUNNER_SUFFIX) or len(runner_name) <= len(RUNNER_SUFFIX):
+        return None
+    return runner_name[: -len(RUNNER_SUFFIX)]
+
+
+def runner_rows(runners: Any) -> list[dict[str, Any]]:
+    """Normalize the GitHub runners listing (a page object or a bare list) into typed rows."""
+    items = runners.get("runners") if isinstance(runners, dict) else runners
+    if not isinstance(items, list):
+        raise Failure("runners: not a GitHub runners listing")
+    rows = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        labels = [str(label.get("name")) if isinstance(label, dict) else str(label)
+                  for label in item.get("labels") or []]
+        rows.append({"name": item["name"], "online": item.get("status") == "online",
+                     "busy": item.get("busy") is True, "labels": labels})
+    return rows
+
+
+def build_state(pools_doc: Any, runners: Any, *, repo: str, now: float,
+                runners_observed_at: float | None = None) -> dict[str, Any]:
+    """The glaeda-pool-state/v1 document. Pure: both observations are arguments."""
+    if not isinstance(pools_doc, dict) or not isinstance(pools_doc.get("pools"), dict):
+        raise Failure("pools: not a glaeda-mini-fleet pools document")
+    rows = runner_rows(runners)
+    fleet_at = pools_doc.get("observed_at")
+    fleet_at = float(fleet_at) if isinstance(fleet_at, (int, float)) and not isinstance(fleet_at, bool) else None
+    github_at = runners_observed_at if runners_observed_at is not None else now
+    # The document is as old as its oldest input; a fleet with nothing reachable has no
+    # observation time, and then nothing in it is idle anyway.
+    observed = min(t for t in (fleet_at, github_at) if t is not None)
+    labels = sorted((label for label in pools_doc["pools"] if pool_key(label)), key=pool_key)
+    pools: dict[str, Any] = {}
+    # A runner that carries two pool labels (two verified Xcodes) is capacity in the first pool of
+    # the order only, so it is never offered to two runs at once.
+    counted: set[str] = set()
+    for rank, label in enumerate(labels):
+        entry = pools_doc["pools"][label]
+        if not isinstance(entry, dict):
+            raise Failure(f"pools: {label} is not an object")
+        eligible = {str(m) for m in entry.get("conforming") or []}
+        reserved = {str(m) for m in entry.get("reserved") or []}
+        locked = {str(m) for m in entry.get("busy") or []}
+        eligible -= reserved | locked
+        mine = [row for row in rows if label in row["labels"]]
+        online = [row for row in mine if row["online"]]
+        busy = [row for row in online if row["busy"]]
+        idle = [row for row in online if not row["busy"] and member_of(row["name"]) in eligible
+                and row["name"] not in counted]
+        counted.update(row["name"] for row in idle)
+        match = POOL_LABEL.fullmatch(label)
+        pools[label] = {
+            "class": match.group(1),
+            "xcode": match.group(2),
+            "rank": rank,
+            "declared": len(entry.get("declared") or []),
+            "conforming": len(eligible),
+            "reserved": len(reserved),
+            "locked": len(locked),
+            "runners": len(mine),
+            "online": len(online),
+            "busy": len(busy),
+            "idle": len(idle),
+        }
+    return {
+        "schema": STATE_SCHEMA,
+        "repo": repo,
+        "generated_at": utc(now),
+        "observed_at": utc(observed),
+        "max_age_seconds": MAX_AGE_SECONDS,
+        "order": labels,
+        "pools": pools,
+    }
+
+
+def overflow_load(jobs: Any) -> dict[str, dict[str, int]]:
+    """Running and queued jobs per overflow (Blacksmith) label. Pure: the jobs are an argument.
+
+    A job counts on the first Blacksmith label it asks for; a job with none is not overflow load.
+    """
+    load: dict[str, dict[str, int]] = {}
+    for job in jobs or []:
+        if not isinstance(job, dict) or job.get("status") not in OVERFLOW_STATUSES:
+            continue
+        label = next((str(x) for x in job.get("labels") or [] if str(x).startswith(OVERFLOW_PREFIX)), None)
+        if label is None:
+            continue
+        entry = load.setdefault(label, {"running": 0, "queued": 0})
+        entry["running" if job["status"] == "in_progress" else "queued"] += 1
+    return dict(sorted(load.items()))
+
+
+def overflow_section(jobs: Any, *, observed_at: float, complete: bool) -> dict[str, Any]:
+    return {"observed_at": utc(observed_at), "complete": complete, "pools": overflow_load(jobs)}
+
+
+COUNT_FIELDS = ("declared", "conforming", "reserved", "locked", "runners", "online", "busy", "idle")
+
+
+def validate_state(doc: Any, *, now: float, repo: str | None = None,
+                   max_age: int = MAX_AGE_SECONDS) -> tuple[bool, str]:
+    """(usable, reason): the rules every reader applies before routing to an owned pool."""
+    if not isinstance(doc, dict):
+        return False, "no pool state"
+    if doc.get("schema") != STATE_SCHEMA:
+        return False, f"pool state schema is {doc.get('schema')!r}, not {STATE_SCHEMA}"
+    if repo is not None and str(doc.get("repo") or "").lower() != repo.lower():
+        return False, f"pool state is for {doc.get('repo')!r}, not {repo}"
+    generated, observed = parse_utc(doc.get("generated_at")), parse_utc(doc.get("observed_at"))
+    if generated is None or observed is None:
+        return False, "pool state is undated"
+    if generated > now + MAX_SKEW_SECONDS or observed > generated + MAX_SKEW_SECONDS:
+        return False, "pool state is dated in the future"
+    age = now - observed
+    if age > max_age:
+        return False, f"pool state is stale ({int(age)} s old, limit {max_age} s)"
+    pools, order = doc.get("pools"), doc.get("order")
+    if not isinstance(pools, dict) or not isinstance(order, list) or not all(isinstance(x, str) for x in order) \
+            or sorted(order) != sorted(pools):
+        return False, "pool state is malformed (order and pools disagree)"
+    for label, entry in pools.items():
+        if not pool_key(str(label)) or not isinstance(entry, dict):
+            return False, f"pool state names an unknown pool {label!r}"
+        for field in COUNT_FIELDS:
+            value = entry.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return False, f"pool state {label}.{field} is not a count"
+        if entry["idle"] > entry["online"] or entry["busy"] > entry["online"]:
+            return False, f"pool state {label} counts more idle or busy runners than online ones"
+    overflow = doc.get("overflow")
+    if overflow is not None:
+        if not isinstance(overflow, dict) or parse_utc(overflow.get("observed_at")) is None \
+                or not isinstance(overflow.get("complete"), bool) or not isinstance(overflow.get("pools"), dict):
+            return False, "pool state overflow section is malformed"
+        for label, entry in overflow["pools"].items():
+            if not str(label).startswith(OVERFLOW_PREFIX) or not isinstance(entry, dict):
+                return False, f"pool state overflow names an unknown pool {label!r}"
+            for field in ("running", "queued"):
+                value = entry.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    return False, f"pool state overflow {label}.{field} is not a count"
+    return True, f"pool state from {doc['generated_at']} ({int(age)} s old)"
+
+
+# ---------------------------------------------------------------- credentials
+
+
+def read_secret_file(path: Path) -> str:
+    """A token or key file: a regular file, not a symlink, readable by its owner only."""
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise Failure(f"{path}: {error.strerror}") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise Failure(f"{path}: not a regular file")
+    if info.st_mode & 0o077:
+        raise Failure(f"{path}: readable by group or others; chmod 600 it")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def app_jwt(app_id: str, key_file: Path, now: float,
+            run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+    """A GitHub App JWT signed by /usr/bin/openssl; the key stays in its file."""
+    read_secret_file(key_file)  # permission check only
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    claims = {"iat": int(now) - 60, "exp": int(now) + 540, "iss": str(app_id)}
+    payload = b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode()
+    proc = run([OPENSSL, "dgst", "-sha256", "-sign", os.fspath(key_file)], input=signing_input,
+               capture_output=True, timeout=20, check=False, env={"PATH": "/usr/bin:/bin"})
+    if proc.returncode != 0 or not proc.stdout:
+        raise Failure("openssl could not sign the GitHub App JWT (check the key file)")
+    return f"{header}.{payload}.{b64url(proc.stdout)}"
+
+
+# ---------------------------------------------------------------- GitHub
+
+
+class GitHub:
+    """A small REST client. The token lives in a header only; errors never echo it."""
+
+    def __init__(self, token: str, opener: Callable[..., Any] | None = None, *,
+                 deadline: float | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+        self._token = token
+        self._open = opener or urllib.request.urlopen
+        self.deadline, self._clock = deadline, clock
+        # X-RateLimit-Remaining from the last answer that carried it; None until one does.
+        self.remaining: int | None = None
+
+    def call(self, method: str, path: str, body: Any = None, *, auth: str = "Bearer") -> tuple[int, Any]:
+        timeout = HTTP_TIMEOUT
+        if self.deadline is not None:
+            timeout = min(HTTP_TIMEOUT, self.deadline - self._clock())
+            if timeout <= 0.5:
+                raise Failure("out of time")
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"{API}{path}", data=data, method=method, headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"{auth} {self._token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": USER_AGENT,
+            **({"Content-Type": "application/json"} if data is not None else {}),
+        })
+        try:
+            with self._open(request, timeout=timeout) as response:
+                raw = response.read()
+                remaining = (getattr(response, "headers", None) or {}).get("X-RateLimit-Remaining")
+                if isinstance(remaining, str) and remaining.isdigit():
+                    self.remaining = int(remaining)
+                return response.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as error:
+            try:
+                detail = json.loads(error.read() or b"{}")
+            except (ValueError, OSError):
+                detail = {}
+            finally:
+                error.close()
+            return error.code, detail if isinstance(detail, dict) else {}
+
+    def ok(self, method: str, path: str, body: Any = None) -> Any:
+        status, data = self.call(method, path, body)
+        if status >= 300:
+            message = data.get("message") if isinstance(data, dict) else None
+            raise Failure(f"GitHub {method} {path.split('?')[0]}: {status} {message or ''}".strip())
+        return data
+
+    def runners(self, repo: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for page in range(1, 11):
+            data = self.ok("GET", f"/repos/{repo}/actions/runners?per_page=100&page={page}")
+            batch = (data or {}).get("runners") or []
+            rows.extend(batch)
+            if len(batch) < 100:
+                return rows
+        raise Failure("runners: more than 1000 runners; refusing a partial listing")
+
+    def active_jobs(self, repo: str, cache: dict[str, Any], *, now: float) -> tuple[list[dict[str, Any]], bool]:
+        """Every job of the repository's queued and in-progress runs, and whether the listing is whole.
+
+        `cache` maps a run id to {"key": "<attempt>:<updated_at>", "at": listed-at, "jobs": [...]}
+        (labels and status only). A run is listed again when its key moves or its entry is older than
+        OVERFLOW_RELIST_SECONDS, at most OVERFLOW_RUN_LOOKUPS runs a call (oldest entry first), and
+        not at all while the rate budget is under OVERFLOW_RATE_FLOOR. Runs no longer in flight drop.
+        """
+        runs: dict[str, dict[str, Any]] = {}
+        complete = True
+        for status in ("queued", "in_progress"):
+            for page in range(1, 4):
+                data = self.ok("GET", f"/repos/{repo}/actions/runs?status={status}&per_page=100&page={page}")
+                batch = (data or {}).get("workflow_runs") or []
+                for run in batch:
+                    # A run that moved from queued to in progress between the two listings is one run.
+                    if isinstance(run, dict) and isinstance(run.get("id"), int):
+                        runs[str(run["id"])] = run
+                if len(batch) < 100:
+                    break
+            else:
+                complete = False
+
+        def key(run: dict[str, Any]) -> str:
+            return f"{run.get('run_attempt') or 1}:{run.get('updated_at') or ''}"
+
+        def due(run_id: str) -> bool:
+            entry = cache.get(run_id)
+            return not (isinstance(entry, dict) and entry.get("key") == key(runs[run_id])
+                        and isinstance(entry.get("at"), (int, float)) and now - entry["at"] < OVERFLOW_RELIST_SECONDS
+                        and isinstance(entry.get("jobs"), list))
+
+        stale = [run_id for run_id in runs if due(run_id)]
+        # Never listed first, then the oldest listing.
+        stale.sort(key=lambda run_id: (cache.get(run_id) or {}).get("at", 0) if isinstance(cache.get(run_id), dict) else 0)
+        lookups = 0
+        for run_id in stale:
+            if lookups >= OVERFLOW_RUN_LOOKUPS or (self.remaining is not None and self.remaining < OVERFLOW_RATE_FLOOR):
+                complete = False
+                break
+            lookups += 1
+            run = runs[run_id]
+            listed: list[dict[str, Any]] = []
+            for page in range(1, 6):
+                data = self.ok("GET", f"/repos/{repo}/actions/runs/{run_id}/attempts/"
+                                      f"{run.get('run_attempt') or 1}/jobs?per_page=100&page={page}")
+                batch = [job for job in (data or {}).get("jobs") or [] if isinstance(job, dict)]
+                listed.extend({"status": job.get("status"), "labels": [str(x) for x in job.get("labels") or []]}
+                              for job in batch)
+                if len(batch) < 100:
+                    break
+            else:
+                complete = False
+            cache[run_id] = {"key": key(run), "at": now, "jobs": listed}
+        jobs: list[dict[str, Any]] = []
+        for run_id in runs:
+            entry = cache.get(run_id)
+            if isinstance(entry, dict) and isinstance(entry.get("jobs"), list):
+                jobs.extend(entry["jobs"])
+            else:
+                complete = False
+        for run_id in [run_id for run_id in cache if run_id not in runs]:
+            del cache[run_id]
+        return jobs, complete
+
+    def set_variable(self, repo: str, name: str, value: str) -> str:
+        status, _ = self.call("PATCH", f"/repos/{repo}/actions/variables/{name}", {"name": name, "value": value})
+        if status == 404:
+            self.ok("POST", f"/repos/{repo}/actions/variables", {"name": name, "value": value})
+            return "created"
+        if status >= 300:
+            raise Failure(f"GitHub PATCH variable {name}: {status}")
+        return "updated"
+
+
+def installation_token(app_id: str, key_file: Path, repo: str, now: float,
+                       opener: Callable[..., Any] | None = None,
+                       run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+    """An installation token for the App's installation on `repo`, limited to that repository."""
+    jwt = GitHub(app_jwt(app_id, key_file, now, run), opener)
+    installation = jwt.ok("GET", f"/repos/{repo}/installation")
+    token = jwt.ok("POST", f"/app/installations/{int(installation['id'])}/access_tokens",
+                   {"repositories": [repo.split("/", 1)[1]]})
+    value = (token or {}).get("token")
+    if not isinstance(value, str) or not value:
+        raise Failure("GitHub returned no installation token")
+    return value
+
+
+def resolve_token(env: dict[str, str], repo: str, now: float, *, app_id: str | None,
+                  app_key_file: Path | None, token_file: Path | None, env_name: str,
+                  opener: Callable[..., Any] | None = None) -> str:
+    """One credential, from the first source given: a GitHub App key, a token file, or the environment."""
+    if app_id or app_key_file:
+        if not (app_id and app_key_file):
+            raise Failure("an App id and its key file go together")
+        return installation_token(app_id, app_key_file, repo, now, opener)
+    if token_file:
+        return read_secret_file(token_file)
+    token = env.get(env_name, "")
+    if not token:
+        raise Failure(f"no credentials for {repo}: set {env_name}, a token file, or an App id with its key file")
+    return token
+
+
+# ---------------------------------------------------------------- inputs
+
+
+def load_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise Failure(f"{path}: {error}") from None
+
+
+def fleet_pools(args: argparse.Namespace) -> Any:
+    if args.pools:
+        return load_json(args.pools)
+    argv = [sys.executable, os.fspath(MINI_FLEET), "pools"]
+    if args.manifest:
+        argv += ["--manifest", os.fspath(args.manifest)]
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=POOLS_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        raise Failure(f"glaeda-mini-fleet pools took over {POOLS_TIMEOUT} s") from None
+    if proc.returncode != 0:
+        tail = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+        raise Failure(f"glaeda-mini-fleet pools: {tail[:200]}")
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        raise Failure("glaeda-mini-fleet pools printed no JSON") from None
+
+
+def current_state(args: argparse.Namespace, env: dict[str, str], now: Callable[[], float],
+                  client: Callable[[], GitHub]) -> dict[str, Any]:
+    pools_doc = fleet_pools(args)
+    if args.runners:
+        runners, at = load_json(args.runners), None
+    else:
+        at = now()
+        runners = client().runners(args.repo)
+    doc = build_state(pools_doc, runners, repo=args.repo, now=now(), runners_observed_at=at)
+    if getattr(args, "overflow_load", False):
+        cache_file: Path = args.overflow_cache
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+            cache = cache if isinstance(cache, dict) else {}
+        except (OSError, ValueError):
+            cache = {}
+        at = now()
+        try:
+            jobs, complete = client().active_jobs(args.repo, cache, now=at)
+        except (Failure, urllib.error.URLError, OSError, ValueError) as error:
+            # The owned pools still publish; readers without an overflow section keep their own source.
+            print(f"glaeda-route: overflow load unavailable: {str(error)[:160]}", file=sys.stderr)
+        else:
+            doc["overflow"] = overflow_section(jobs, observed_at=at, complete=complete)
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps(cache, sort_keys=True), encoding="utf-8")
+                os.replace(tmp, cache_file)
+            except OSError as error:
+                print(f"glaeda-route: could not save the overflow cache ({type(error).__name__})", file=sys.stderr)
+    return doc
+
+
+# ---------------------------------------------------------------- ledger
+
+
+class Conflict(Exception):
+    """The ledger moved between our read and our write; read again and redo the decision."""
+
+
+def empty_ledger() -> dict[str, Any]:
+    return {"schema": LEDGER_SCHEMA, "reservations": []}
+
+
+RESERVATION_FIELDS = {
+    "id": str, "repo": str, "run_id": int, "run_attempt": int, "head_sha": str, "kind": str,
+    "priority": str, "pool": str, "slots": int, "started": int, "state": str,
+    "created_at": str, "hold_until": str,
+}
+
+
+OPTIONAL_TIMES = ("started_at", "ended_at")
+
+
+def valid_reservation(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if any(entry.get(field) is not None and parse_utc(entry.get(field)) is None for field in OPTIONAL_TIMES):
+        return False
+    for field, kind in RESERVATION_FIELDS.items():
+        value = entry.get(field)
+        if not isinstance(value, kind) or isinstance(value, bool):
+            return False
+    return (entry["state"] in STATES and entry["priority"] in PRIORITIES and pool_key(entry["pool"]) is not None
+            and 1 <= entry["slots"] <= MAX_SLOTS and 0 <= entry["started"]
+            and parse_utc(entry["created_at"]) is not None and parse_utc(entry["hold_until"]) is not None)
+
+
+def check_ledger(doc: Any) -> dict[str, Any]:
+    if not isinstance(doc, dict) or doc.get("schema") != LEDGER_SCHEMA:
+        raise Failure(f"ledger: schema is not {LEDGER_SCHEMA}")
+    entries = doc.get("reservations")
+    if not isinstance(entries, list) or not all(valid_reservation(entry) for entry in entries):
+        raise Failure("ledger: a reservation is malformed")
+    if len({entry["id"] for entry in entries}) != len(entries):
+        raise Failure("ledger: duplicate reservation ids")
+    return doc
+
+
+class Ledger:
+    """The reservation ledger: one JSON file on one branch of a private state repository.
+
+    Every write is a compare-and-swap: a new commit whose parent is the head we read, then a
+    fast-forward-only ref update (force: false). If anyone moved the branch in between, GitHub
+    rejects the update as not a fast forward (422) and the caller reads again. So two routers can
+    never both take the last free slot.
+    """
+
+    def __init__(self, api: GitHub, repo: str, branch: str = LEDGER_BRANCH) -> None:
+        self.api, self.repo, self.branch = api, repo, branch
+
+    def read(self) -> tuple[str, dict[str, Any]]:
+        ref = self.api.ok("GET", f"/repos/{self.repo}/git/ref/heads/{self.branch}")
+        head = str(((ref or {}).get("object") or {}).get("sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise Failure("ledger: branch head is not a commit id")
+        status, data = self.api.call("GET", f"/repos/{self.repo}/contents/{LEDGER_FILE}?ref={head}")
+        if status == 404:
+            return head, empty_ledger()
+        if status >= 300 or not isinstance(data, dict) or data.get("encoding") != "base64":
+            raise Failure(f"ledger: could not read {LEDGER_FILE} ({status})")
+        try:
+            doc = json.loads(base64.b64decode(str(data.get("content") or "")).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise Failure("ledger: not JSON") from None
+        return head, check_ledger(doc)
+
+    def commit(self, doc: dict[str, Any], message: str, parents: list[str]) -> str:
+        text = json.dumps(check_ledger(doc), indent=1, sort_keys=True) + "\n"
+        tree = self.api.ok("POST", f"/repos/{self.repo}/git/trees",
+                           {"tree": [{"path": LEDGER_FILE, "mode": "100644", "type": "blob", "content": text}]})
+        commit = self.api.ok("POST", f"/repos/{self.repo}/git/commits",
+                             {"message": message, "tree": tree["sha"], "parents": parents})
+        return str(commit["sha"])
+
+    def write(self, head: str, doc: dict[str, Any], message: str) -> str:
+        sha = self.commit(doc, message, [head])
+        status, data = self.api.call("PATCH", f"/repos/{self.repo}/git/refs/heads/{self.branch}",
+                                     {"sha": sha, "force": False})
+        if status in (409, 422):
+            raise Conflict(str((data or {}).get("message") or status))
+        if status >= 300:
+            raise Failure(f"ledger: ref update failed ({status})")
+        return sha
+
+    def init(self) -> str:
+        status, _ = self.api.call("GET", f"/repos/{self.repo}/git/ref/heads/{self.branch}")
+        if status == 200:
+            return "exists"
+        sha = self.commit(empty_ledger(), "glaeda-route: empty reservation ledger", [])
+        self.api.ok("POST", f"/repos/{self.repo}/git/refs", {"ref": f"refs/heads/{self.branch}", "sha": sha})
+        return "created"
+
+
+def prune(doc: dict[str, Any], now: float) -> dict[str, Any]:
+    """Drop finished reservations older than KEEP_SECONDS, then the oldest finished ones beyond
+    MAX_RESERVATIONS. Live reservations are never dropped: losing one would hand its slots out
+    twice. The route refuses to add to a ledger that already holds MAX_RESERVATIONS live ones."""
+    live_entries = [r for r in doc["reservations"] if r["state"] in LIVE_STATES]
+    done = [r for r in doc["reservations"] if r["state"] not in LIVE_STATES
+            and now - (parse_utc(r.get("ended_at") or r["created_at"]) or 0) < KEEP_SECONDS]
+    done.sort(key=lambda r: r["created_at"])
+    room = max(0, MAX_RESERVATIONS - len(live_entries))
+    kept = live_entries + (done[-room:] if room else [])
+    kept.sort(key=lambda r: r["created_at"])
+    return {**doc, "reservations": kept}
+
+
+def mutate(ledger: Ledger, change: Callable[[dict[str, Any]], dict[str, Any] | None], message: str,
+           *, sleep: Callable[[float], None] = time.sleep, first: tuple[str, dict[str, Any]] | None = None
+           ) -> dict[str, Any] | None:
+    """Read, change, compare-and-swap, retrying on a lost race. `change` returns None for no write."""
+    for attempt in range(CAS_ATTEMPTS):
+        head, doc = first if (first and attempt == 0) else ledger.read()
+        new = change(json.loads(json.dumps(doc)))
+        if new is None:
+            return None
+        try:
+            ledger.write(head, new, message)
+            return new
+        except Conflict:
+            sleep(0.25 * (attempt + 1))
+    raise Failure(f"ledger: lost the race {CAS_ATTEMPTS} times")
+
+
+# ---------------------------------------------------------------- route decision
+
+
+@dataclasses.dataclass(frozen=True)
+class Request:
+    repo: str
+    event: str
+    head_repo: str
+    run_id: int
+    run_attempt: int
+    head_sha: str
+    kind: str
+    priority: str
+    slots: int
+    xcode: str
+    default: str
+
+    @property
+    def reservation_id(self) -> str:
+        return f"{self.repo.lower()}#{self.run_id}.{self.run_attempt}/{self.kind}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Decision:
+    runs_on: str
+    owned: bool
+    reason: str
+    pool: str = ""
+    reservation: str = ""
+    new: dict[str, Any] | None = None
+
+
+def xcode_version(value: str) -> str:
+    """'26.6' or an Xcode app path such as /Applications/Xcode_26.6.app -> '26.6', else ''."""
+    value = (value or "").strip()
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", value):
+        return value
+    match = re.search(r"/Xcode_([0-9]+(?:\.[0-9]+)*)\.app/?$", value)
+    return match.group(1) if match else ""
+
+
+def untrusted(req: Request, allowed_repos: tuple[str, ...]) -> str | None:
+    """Why this run may not use an owned machine, or None. Forks never; trusted same-repo refs only."""
+    if req.repo.lower() not in {repo.lower() for repo in allowed_repos}:
+        return f"{req.repo or 'unknown repository'} is not routed by Glaeda"
+    if req.event not in TRUSTED_EVENTS:
+        return f"{req.event or 'unknown'} events never take an owned machine"
+    if req.event == "pull_request" and req.head_repo.lower() != req.repo.lower():
+        return "fork pull requests never take an owned machine"
+    if req.run_attempt != 1:
+        return f"attempt {req.run_attempt} is a retry; retries run on overflow"
+    if req.priority not in PRIORITIES:
+        return f"unknown priority {req.priority!r}"
+    if not 1 <= req.slots <= MAX_SLOTS:
+        return f"slots must be 1 to {MAX_SLOTS}"
+    if not re.fullmatch(r"[0-9a-f]{40}", req.head_sha):
+        return "head commit unknown"
+    return None
+
+
+def live(entry: dict[str, Any], now: float) -> bool:
+    return entry["state"] == "held" and (parse_utc(entry["hold_until"]) or 0) > now
+
+
+def pending(entry: dict[str, Any], now: float, observed_at: float | None = None) -> int:
+    """Slots a reservation still takes from the pool state's `idle` count.
+
+    A held reservation takes the slots whose jobs have not started. A job that started after the
+    pool state was observed still shows as idle there, so until the state is newer than that
+    start (or than the reservation's end), every slot counts: over-counting for one publish
+    interval only sends a run to Blacksmith, under-counting would send it to a busy runner.
+    A rescuing reservation keeps its slots: its pool was busy.
+    """
+    seen = observed_at if observed_at is not None else now
+    if entry["state"] == "rescuing":
+        return entry["slots"]
+    if entry["state"] == "held":
+        started_at = parse_utc(entry.get("started_at"))
+        if started_at is not None and started_at >= seen:
+            return entry["slots"]
+        if not live(entry, now):
+            return 0
+        return max(0, entry["slots"] - entry["started"])
+    ended_at = parse_utc(entry.get("ended_at"))
+    return entry["slots"] if ended_at is not None and ended_at >= seen else 0
+
+
+def default(req: Request, reason: str) -> Decision:
+    return Decision(req.default, False, reason)
+
+
+def decide(state: Any, ledger: dict[str, Any], req: Request, *, now: float,
+           allowed_repos: tuple[str, ...] = (DEFAULT_REPO,), max_age: int = MAX_AGE_SECONDS) -> Decision:
+    """The one route decision. Pure: the fleet state, the ledger and the clock are arguments."""
+    why = untrusted(req, allowed_repos)
+    if why:
+        return default(req, why)
+    usable, why = validate_state(state, now=now, repo=req.repo, max_age=max_age)
+    if not usable:
+        return default(req, why)
+    rid = req.reservation_id
+    earlier = next((r for r in ledger["reservations"] if r["id"] == rid), None)
+    if earlier is not None:
+        if live(earlier, now):
+            return Decision(earlier["pool"], True, "this run already holds a reservation", earlier["pool"], rid)
+        return default(req, f"this run's reservation is {earlier['state']}")
+    version = xcode_version(req.xcode)
+    pools = [label for label in state["order"] if POOL_LABEL.fullmatch(label).group(2) == version] if version else []
+    if not pools:
+        return default(req, f"no owned pool carries Xcode {version or '(none given)'}")
+    if sum(1 for r in ledger["reservations"] if r["state"] in LIVE_STATES) >= MAX_RESERVATIONS:
+        return default(req, "the reservation ledger is full")
+    observed = parse_utc(state["observed_at"])
+    held = {label: sum(pending(r, now, observed) for r in ledger["reservations"] if r["pool"] == label)
+            for label in pools}
+    free = {label: state["pools"][label]["idle"] - held[label] for label in pools}
+    need = req.slots
+    if req.priority in LOW:
+        waiting = sum(pending(r, now) for r in ledger["reservations"] if r["priority"] in HIGH)
+        if waiting:
+            return default(req, f"{waiting} pull request or dev slot(s) still wait for owned machines")
+        need += LOW_PRIORITY_RESERVE
+    seen = ", ".join(f"{label} {free[label]} free" for label in pools)
+    for label in pools:
+        if free[label] >= need:
+            stamp = utc(now)
+            entry = {"id": rid, "repo": req.repo, "run_id": req.run_id, "run_attempt": req.run_attempt,
+                     "head_sha": req.head_sha, "kind": req.kind, "priority": req.priority, "pool": label,
+                     "slots": req.slots, "started": 0, "state": "held", "created_at": stamp,
+                     "hold_until": utc(now + HOLD_SECONDS)}
+            return Decision(label, True, f"{label} has {free[label]} free of {state['pools'][label]['idle']} idle"
+                                         f" ({seen})", label, rid, entry)
+    return default(req, f"no owned pool has {need} free ({seen})")
+
+
+def route(req: Request, state_text: str, ledger: Ledger | None, *, now: Callable[[], float],
+          sleep: Callable[[float], None] = time.sleep, allowed_repos: tuple[str, ...] = (DEFAULT_REPO,)) -> Decision:
+    """Decide and reserve. Any error, a missing or stale state, or a ledger race lost too often
+    answers with the caller's default (Blacksmith). Never raises."""
+    try:
+        state = json.loads(state_text) if state_text.strip() else None
+    except ValueError:
+        state = None
+    try:
+        first = decide(state, empty_ledger(), req, now=now(), allowed_repos=allowed_repos)
+    except Exception as error:  # noqa: BLE001 - a malformed state must answer the default, not crash
+        return default(req, f"pool state is malformed ({type(error).__name__})")
+    if not first.owned:
+        return first  # no ledger call when the state alone says no
+    if ledger is None:
+        return default(req, "no ledger credentials")
+    deadline = now() + ROUTE_DEADLINE_SECONDS
+    try:
+        for attempt in range(CAS_ATTEMPTS):
+            if now() > deadline:
+                break
+            head, doc = ledger.read()
+            decision = decide(state, doc, req, now=now(), allowed_repos=allowed_repos)
+            if decision.new is None:
+                return decision
+            try:
+                ledger.write(head, prune({**doc, "reservations": [*doc["reservations"], decision.new]}, now()),
+                             f"reserve {decision.pool} x{req.slots} for {decision.reservation}")
+                return decision
+            except Conflict:
+                sleep(0.2 * (attempt + 1))
+        return default(req, "the reservation ledger stayed busy")
+    except Exception as error:  # noqa: BLE001 - routing never fails a job
+        # Public logs: name the failure, not the private repository or API path.
+        detail = str(error) if isinstance(error, Failure) and str(error).startswith("ledger:") else type(error).__name__
+        return default(req, f"ledger unavailable ({detail[:120]})")
+
+
+# ---------------------------------------------------------------- rescue agent
+
+
+SETUP_STEPS = {"Set up job", "Set up runner", "Complete job", "Complete runner"}
+
+
+def job_labels(job: dict[str, Any]) -> list[str]:
+    return [str(label) for label in job.get("labels") or []]
+
+
+def refused_at_start(job: dict[str, Any]) -> bool:
+    """A job the runner's job-started hook refused: it failed on a runner before any real step ran."""
+    if job.get("status") != "completed" or job.get("conclusion") != "failure" or not job.get("runner_name"):
+        return False
+    steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+    real = [s for s in steps if s.get("name") not in SETUP_STEPS and s.get("conclusion") not in (None, "skipped")]
+    return not real
+
+
+def run_jobs(api: GitHub, repo: str, run_id: int, attempt: int) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for page in range(1, 4):
+        data = api.ok("GET", f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100&page={page}")
+        batch = [job for job in (data or {}).get("jobs") or [] if isinstance(job, dict)]
+        found.extend(batch)
+        if len(batch) < 100:
+            break
+    return found
+
+
+def trusted_run(run: dict[str, Any], entry: dict[str, Any]) -> str | None:
+    """Why GitHub's own record of the run does not match the reservation, or None. The ledger is a
+    claim; the agent acts only on what GitHub confirms."""
+    repo = str((run.get("repository") or {}).get("full_name") or "")
+    head = str((run.get("head_repository") or {}).get("full_name") or "")
+    if repo.lower() != entry["repo"].lower():
+        return "the run belongs to another repository"
+    if run.get("event") not in TRUSTED_EVENTS:
+        return f"the run is a {run.get('event')} run"
+    if run.get("event") == "pull_request" and head.lower() != repo.lower():
+        return "the run is a fork pull request"
+    if run.get("head_sha") != entry["head_sha"]:
+        return "the run's head commit differs from the reservation"
+    return None
+
+
+def pull_moved(api: GitHub, repo: str, run: dict[str, Any]) -> str:
+    """For a pull request run: why the pull request no longer wants this run, or ''."""
+    if run.get("event") != "pull_request":
+        return ""
+    pulls = [p for p in run.get("pull_requests") or [] if isinstance(p, dict) and p.get("number")]
+    if len(pulls) != 1:
+        return "the run does not name exactly one pull request"
+    pull = api.ok("GET", f"/repos/{repo}/pulls/{int(pulls[0]['number'])}")
+    if pull.get("state") != "open":
+        return "the pull request is closed"
+    if (pull.get("head") or {}).get("sha") != run.get("head_sha"):
+        return "the pull request has a newer head, whose own run replaces this one"
+    return ""
+
+
+def pool_jobs(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str, float],
+              rescue_seconds: int) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """(started, waiting, stuck, refused) for the reservation's pool jobs, as GitHub lists them.
+
+    A job's wait counts from the latest of its creation, the reservation, and the first time the
+    agent saw it waiting, so a job created before its `needs` finished never counts as late.
+    """
+    jobs = [job for job in run_jobs(api, entry["repo"], entry["run_id"], entry["run_attempt"])
+            if entry["pool"] in job_labels(job)]
+    started = sum(1 for job in jobs if job.get("runner_name"))
+    waiting = [job for job in jobs if job.get("status") in ("queued", "waiting") and not job.get("runner_name")]
+    for job in waiting:
+        seen.setdefault(f"job:{job.get('id')}", now)
+    reserved_at = parse_utc(entry["created_at"]) or now
+
+    def queued_for(job: dict[str, Any]) -> float:
+        since = max(parse_utc(job.get("created_at")) or now, seen.get(f"job:{job.get('id')}", now), reserved_at)
+        return now - since
+
+    stuck = [job for job in waiting if queued_for(job) >= rescue_seconds]
+    refused = [job for job in jobs if refused_at_start(job)]
+    return started, waiting, stuck, refused
+
+
+def stuck_reason(entry: dict[str, Any], stuck: list[dict[str, Any]], refused: list[dict[str, Any]],
+                 rescue_seconds: int) -> str:
+    names = ", ".join(sorted(str(job.get("name") or job.get("id")) for job in (stuck or refused)))
+    if stuck:
+        return f"{names} queued on {entry['pool']} for {rescue_seconds} s with no runner"
+    return f"{names} refused at start on {entry['pool']}"
+
+
+def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str, float],
+              rescue_seconds: int = RESCUE_SECONDS,
+              persist: Callable[[], None] = lambda: None) -> dict[str, Any] | None:
+    """One look at one live reservation. Returns field updates, or None when nothing changed.
+
+    held: count the pool jobs that started (their slots stop counting once the pool state is newer
+    than the start), and watch until the run finishes, is re-run, or passes WATCH_LIMIT_SECONDS. A
+    pool job queued with no runner for rescue_seconds, or refused by the runner's job-started hook,
+    moves the reservation to `rescuing` once GitHub confirms the run and, for a pull request, that
+    it is open at the same head. Nothing is cancelled yet: the state is written first.
+    rescuing: the ledger is only a claim, so every effect is re-checked against GitHub. If this
+    agent has not cancelled the run, it cancels only a trusted run that is still stuck. If it has,
+    it force-cancels after FORCE_CANCEL_SECONDS and gives up after CANCEL_GIVE_UP_SECONDS. A run
+    that finished is re-run only if this agent cancelled it and it ended `cancelled`, and (for a pull
+    request) the pull request is still open at that head. The re-run is attempt 2, and the route
+    never gives a retry an owned machine, so it lands on overflow as a whole run.
+    """
+    repo, run_id, attempt = entry["repo"], entry["run_id"], entry["run_attempt"]
+    run = api.ok("GET", f"/repos/{repo}/actions/runs/{run_id}")
+    if int(run.get("run_attempt") or 0) != attempt:
+        return {"state": "rescued" if entry["state"] == "rescuing" else "released",
+                "note": "someone else re-ran the run"}
+    why = trusted_run(run, entry)
+    if entry["state"] == "rescuing":
+        if why:
+            return {"state": "failed", "note": f"not rescued: {why}"}
+        key = f"cancel:{repo.lower()}#{run_id}.{attempt}"
+        mine = seen.get(key)
+        if run.get("status") != "completed":
+            if mine is None:
+                _, _, stuck, refused = pool_jobs(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
+                if not (stuck or refused):
+                    return {"state": "released", "note": "no pool job is stuck any more"}
+                moved = pull_moved(api, repo, run)
+                if moved:
+                    return {"state": "released", "note": f"not rescued: {moved}"}
+                api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")
+                seen[key] = now
+                persist()  # the re-run depends on this record; keep it even if the tick dies next
+                return {"cancel_at": utc(now)}
+            waited = now - mine
+            if waited >= CANCEL_GIVE_UP_SECONDS:
+                return {"state": "failed", "note": f"the run did not finish {CANCEL_GIVE_UP_SECONDS} s after cancel"}
+            if waited >= FORCE_CANCEL_SECONDS and not entry.get("forced"):
+                api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/force-cancel")
+                return {"forced": True}
+            return None
+        if mine is None:
+            return {"state": "released", "note": "the run finished before this agent cancelled it"}
+        if run.get("conclusion") != "cancelled":
+            return {"state": "released", "note": f"the run finished on its own ({run.get('conclusion')})"}
+        moved = pull_moved(api, repo, run)
+        if moved:
+            return {"state": "released", "note": f"cancelled, not re-run: {moved}"}
+        api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/rerun")
+        return {"state": "rescued", "note": f"re-ran run {run_id}; attempt {attempt + 1} runs on overflow"}
+    if run.get("status") == "completed":
+        return {"state": "released", "note": "the run finished"}
+    started, _, stuck, refused = pool_jobs(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
+    if stuck or refused:
+        if why:
+            return {"state": "released", "note": f"not rescued: {why}"}
+        moved = pull_moved(api, repo, run)
+        if moved:
+            return {"state": "released", "note": f"not rescued: {moved}"}
+        return {"state": "rescuing", "note": stuck_reason(entry, stuck, refused, rescue_seconds), "started": started}
+    if now - (parse_utc(entry["created_at"]) or now) >= WATCH_LIMIT_SECONDS:
+        return {"state": "released", "started": started, "note": "watch limit reached"}
+    if started != entry["started"]:
+        return {"started": started, "started_at": utc(now)}
+    return None
+
+
+TERMINAL = ("released", "rescued", "failed")
+
+
+def apply_updates(doc: dict[str, Any], updates: dict[str, tuple[str, dict[str, Any]]], now: float
+                  ) -> dict[str, Any] | None:
+    """Apply each update only to a reservation still in the state it was observed in."""
+    changed = False
+    for entry in doc["reservations"]:
+        update = updates.get(entry["id"])
+        if update and entry["state"] == update[0]:
+            entry.update(update[1])
+            if entry["state"] in TERMINAL and not entry.get("ended_at"):
+                entry["ended_at"] = utc(now)
+            changed = True
+    pruned = prune(doc, now)
+    if len(pruned["reservations"]) != len(doc["reservations"]):
+        changed = True
+    return pruned if changed else None
+
+
+def agent_tick(api: GitHub, ledger: Ledger, *, repo: str, now: float, seen: dict[str, float],
+               log: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
+               rescue_seconds: int = RESCUE_SECONDS, persist: Callable[[], None] = lambda: None) -> dict[str, Any]:
+    """Watch every live reservation for `repo` once, and record what changed in the ledger.
+
+    A reservation that becomes `rescuing` is written first and cancelled second, in the same tick,
+    so a lost write never leaves a cancelled run without its re-run.
+    """
+    first = ledger.read()
+
+    def look(entries: list[dict[str, Any]]) -> dict[str, tuple[str, dict[str, Any]]]:
+        updates: dict[str, tuple[str, dict[str, Any]]] = {}
+        for entry in entries:
+            try:
+                update = watch_one(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds, persist=persist)
+            except (Failure, urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as error:
+                log(f"{entry['id']}: watch failed ({type(error).__name__}: {str(error)[:160]})")
+                continue
+            if update:
+                updates[entry["id"]] = (entry["state"], update)
+                log(f"{entry['id']}: {update.get('state', entry['state'])}"
+                    + (f" ({update['note']})" if update.get("note") else ""))
+        return updates
+
+    def mine(doc: dict[str, Any]) -> list[dict[str, Any]]:
+        return [e for e in doc["reservations"] if e["state"] in LIVE_STATES and e["repo"].lower() == repo.lower()]
+
+    updates = look(mine(first[1]))
+    written = mutate(ledger, lambda fresh: apply_updates(fresh, updates, now),
+                     f"agent: {len(updates)} reservation update(s)", sleep=sleep, first=first)
+    rescuing = {rid for rid, (_, update) in updates.items() if update.get("state") == "rescuing"}
+    second: dict[str, tuple[str, dict[str, Any]]] = {}
+    if written is not None and rescuing:
+        second = look([e for e in mine(written) if e["id"] in rescuing and e["state"] == "rescuing"])
+        if second:
+            mutate(ledger, lambda fresh: apply_updates(fresh, second, now),
+                   f"agent: cancelled {len(second)} run(s)", sleep=sleep)
+    for key in [key for key, at in seen.items() if now - at > KEEP_SECONDS]:
+        del seen[key]
+    return {"watched": len(mine(first[1])), "updated": len(updates) + len(second), "written": written is not None}
+
+
+def load_seen(path: Path) -> dict[str, float]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float))} if isinstance(data, dict) else {}
+
+
+def save_seen(path: Path, seen: dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(seen, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- main
+
+
+def request_from(args: argparse.Namespace, env: dict[str, str]) -> Request:
+    def number(name: str) -> int:
+        value = (env.get(name) or "").strip()
+        return int(value) if value.isdigit() else 0
+
+    return Request(
+        repo=env.get("GITHUB_REPOSITORY", ""), event=env.get("GITHUB_EVENT_NAME", ""),
+        head_repo=env.get("HEAD_REPO", ""), run_id=number("GITHUB_RUN_ID"), run_attempt=number("GITHUB_RUN_ATTEMPT"),
+        head_sha=(env.get("HEAD_SHA") or "").strip().lower(), kind=args.kind, priority=args.priority,
+        slots=args.slots, xcode=args.xcode or "", default=args.default)
+
+
+def emit_route(decision: Decision, env: dict[str, str]) -> None:
+    print(f"runs-on: {decision.runs_on or '(caller default)'}; owned: {str(decision.owned).lower()}; "
+          f"why: {decision.reason}")
+    if env.get("GITHUB_OUTPUT"):
+        with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"runs_on={decision.runs_on}\nowned={str(decision.owned).lower()}\n"
+                         f"pool={decision.pool}\nreservation={decision.reservation}\n"
+                         f"reason={decision.reason.replace(chr(10), ' ')}\n")
+    if env.get("GITHUB_STEP_SUMMARY"):
+        with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+            handle.write("### Glaeda route\n\n"
+                         f"- runs-on: `{decision.runs_on or 'caller default'}`\n"
+                         f"- owned: `{str(decision.owned).lower()}`\n"
+                         f"- why: {decision.reason}\n"
+                         + (f"- reservation: `{decision.reservation}`\n" if decision.reservation else ""))
+
+
+def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
+         now: Callable[[], float] = time.time, opener: Callable[..., Any] | None = None,
+         sleep: Callable[[float], None] = time.sleep) -> int:
+    env = dict(os.environ if env is None else env)
+    parser = argparse.ArgumentParser(prog="glaeda-route", description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def repo_credentials(cmd: argparse.ArgumentParser) -> None:
+        cmd.add_argument("--token-file", type=Path, help="token for --repo (else GLAEDA_ROUTE_TOKEN)")
+        cmd.add_argument("--app-id", help="GitHub App installed on --repo")
+        cmd.add_argument("--app-key-file", type=Path)
+
+    def ledger_credentials(cmd: argparse.ArgumentParser) -> None:
+        cmd.add_argument("--ledger-repo", default=DEFAULT_LEDGER_REPO)
+        cmd.add_argument("--ledger-token-file", type=Path, help="token for --ledger-repo (else GLAEDA_LEDGER_TOKEN)")
+        cmd.add_argument("--ledger-app-id", help="GitHub App installed on --ledger-repo only")
+        cmd.add_argument("--ledger-app-key-file", type=Path)
+
+    def fleet_inputs(cmd: argparse.ArgumentParser) -> None:
+        cmd.add_argument("--manifest", type=Path, help="fleet manifest for glaeda-mini-fleet pools")
+        cmd.add_argument("--pools", type=Path, help="read a glaeda-mini-fleet pools document instead of probing")
+        cmd.add_argument("--runners", type=Path, help="read a GitHub runners listing instead of the API")
+        cmd.add_argument("--overflow-load", action=argparse.BooleanOptionalAction, default=cmd.prog.endswith("agent"),
+                         help="also publish running and queued jobs per Blacksmith label (default on for agent)")
+        cmd.add_argument("--overflow-cache", type=Path,
+                         default=Path.home() / ".local/state/glaeda/route/overflow-jobs.json")
+
+    for name in ("state", "publish"):
+        cmd = sub.add_parser(name)
+        cmd.add_argument("--repo", default=DEFAULT_REPO)
+        fleet_inputs(cmd)
+        repo_credentials(cmd)
+        if name == "publish":
+            cmd.add_argument("--variable", default=STATE_VARIABLE)
+            cmd.add_argument("--yes", action="store_true", help="write the variable (default: print what would be written)")
+    check = sub.add_parser("check")
+    check.add_argument("--state", type=Path, required=True)
+    check.add_argument("--repo")
+    check.add_argument("--max-age", type=int, default=MAX_AGE_SECONDS)
+    rt = sub.add_parser("route", help="decide runs-on for this run and reserve owned slots (always exits 0)")
+    rt.add_argument("--kind", required=True, help="what asks, e.g. ci-macos, nightly-warm (part of the reservation id)")
+    rt.add_argument("--priority", required=True, choices=PRIORITIES)
+    rt.add_argument("--slots", type=int, default=1, help="owned machines the run needs at once")
+    rt.add_argument("--xcode", help="Xcode version or app path the jobs pin (owned pools are per Xcode)")
+    rt.add_argument("--default", required=True, help="runs-on when Glaeda says no: the caller's Blacksmith label")
+    rt.add_argument("--state", type=Path, help="pool state file (else the GLAEDA_POOL_STATE environment variable)")
+    rt.add_argument("--allowed-repo", action="append", help=f"repositories Glaeda routes (default {DEFAULT_REPO})")
+    ledger_credentials(rt)
+    ag = sub.add_parser("agent", help="publish the pool state and watch, release and rescue reservations")
+    ag.add_argument("--repo", default=DEFAULT_REPO)
+    ag.add_argument("--no-publish", action="store_true", help="only watch reservations")
+    ag.add_argument("--variable", default=STATE_VARIABLE)
+    ag.add_argument("--seen-file", type=Path,
+                    default=Path.home() / ".local/state/glaeda/route/first-seen.json")
+    ag.add_argument("--rescue-seconds", type=int, default=RESCUE_SECONDS)
+    fleet_inputs(ag)
+    repo_credentials(ag)
+    ledger_credentials(ag)
+    init = sub.add_parser("init-ledger", help="create the empty ledger branch (dry run without --yes)")
+    init.add_argument("--yes", action="store_true")
+    ledger_credentials(init)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parser.parse_args(raw)
+    except SystemExit as exit_:
+        if raw[:1] != ["route"] or exit_.code == 0:
+            raise
+        # Routing never fails a job: with arguments this command cannot read, the caller keeps its
+        # own runs-on expression (an empty runs_on output).
+        emit_route(Decision("", False, "glaeda-route could not read its arguments"), env)
+        return 0
+
+    def repo_client() -> GitHub:
+        if not cache.get("repo"):
+            cache["repo"] = resolve_token(env, args.repo, now(), app_id=args.app_id, app_key_file=args.app_key_file,
+                                          token_file=args.token_file, env_name="GLAEDA_ROUTE_TOKEN", opener=opener)
+        return GitHub(cache["repo"], opener)
+
+    def ledger_client(deadline: float | None = None) -> Ledger:
+        if not cache.get("ledger"):
+            cache["ledger"] = resolve_token(env, args.ledger_repo, now(), app_id=args.ledger_app_id,
+                                            app_key_file=args.ledger_app_key_file, token_file=args.ledger_token_file,
+                                            env_name="GLAEDA_LEDGER_TOKEN", opener=opener)
+        return Ledger(GitHub(cache["ledger"], opener, deadline=deadline), args.ledger_repo)
+
+    cache: dict[str, str] = {}
+    if args.command == "route":
+        # Routing never fails a job: whatever goes wrong, answer the caller's default and exit 0.
+        req = request_from(args, env)
+
+        # The alarm raises at most once (armed), and a raise that lands while the route is already
+        # answering or disarming is caught by the outer handler, so it can never escape as exit 1.
+        armed = {"on": False}
+
+        def out_of_time(_signum: int, _frame: Any) -> None:
+            if armed["on"]:
+                armed["on"] = False
+                raise Failure(f"no answer within {ROUTE_WALL_SECONDS} s")
+
+        def disarm() -> None:
+            armed["on"] = False
+            if alarm:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+
+        alarm = hasattr(signal, "setitimer") and env.get("GLAEDA_ROUTE_NO_ALARM") != "1"
+        previous = signal.signal(signal.SIGALRM, out_of_time) if alarm else None
+        decision: Decision | None = None
+        try:
+            try:
+                if alarm:
+                    armed["on"] = True
+                    signal.setitimer(signal.ITIMER_REAL, ROUTE_WALL_SECONDS)
+                state_text = args.state.read_text(encoding="utf-8") if args.state \
+                    else env.get("GLAEDA_POOL_STATE", "")
+                ledger: Ledger | None = None
+                if not untrusted(req, tuple(args.allowed_repo or (DEFAULT_REPO,))):
+                    try:
+                        ledger = ledger_client(deadline=time.monotonic() + ROUTE_DEADLINE_SECONDS)
+                    except Exception:  # noqa: BLE001
+                        ledger = None
+                decision = route(req, state_text, ledger, now=now, sleep=sleep,
+                                 allowed_repos=tuple(args.allowed_repo or (DEFAULT_REPO,)))
+            except Exception as error:  # noqa: BLE001
+                decision = default(req, f"the route failed ({type(error).__name__}: {str(error)[:80]})"
+                                   if isinstance(error, Failure) else f"the route failed ({type(error).__name__})")
+            finally:
+                disarm()
+        except Failure as error:
+            disarm()
+            if decision is None:
+                decision = default(req, f"the route failed (Failure: {str(error)[:80]})")
+        try:
+            emit_route(decision, env)
+        except OSError as error:
+            print(f"glaeda-route: could not write outputs ({type(error).__name__}); the caller keeps its default",
+                  file=sys.stderr)
+        return 0
+
+    try:
+        if args.command == "check":
+            usable, reason = validate_state(load_json(args.state), now=now(), repo=args.repo, max_age=args.max_age)
+            print(("usable: " if usable else "unusable: ") + reason)
+            return 0 if usable else 1
+        if args.command == "init-ledger":
+            if not args.yes:
+                print(f"would create branch {LEDGER_BRANCH} with an empty {LEDGER_FILE} on {args.ledger_repo}")
+                return 0
+            print(f"ledger on {args.ledger_repo}: {ledger_client().init()}")
+            return 0
+        if args.command == "agent":
+            code = 0
+            if not args.no_publish:
+                try:
+                    doc = current_state(args, env, now, repo_client)
+                    text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+                    repo_client().set_variable(args.repo, args.variable, text)
+                    print(f"published {args.variable}: "
+                          + (", ".join(f"{k} {v['idle']} idle" for k, v in doc["pools"].items()) or "no owned pools")
+                          + "".join(f"; {k} {v['running']} running {v['queued']} queued"
+                                    for k, v in (doc.get("overflow") or {}).get("pools", {}).items()))
+                except (Failure, urllib.error.URLError, OSError) as error:
+                    # The watch still runs: a stale state only means new runs go to Blacksmith.
+                    print(f"glaeda-route: publish failed: {error}", file=sys.stderr)
+                    code = 2
+            seen = load_seen(args.seen_file)
+            try:
+                summary = agent_tick(repo_client(), ledger_client(), repo=args.repo, now=now(), seen=seen,
+                                     log=lambda line: print(line, flush=True), sleep=sleep,
+                                     rescue_seconds=args.rescue_seconds,
+                                     persist=lambda: save_seen(args.seen_file, seen))
+            finally:
+                save_seen(args.seen_file, seen)
+            print(f"watched {summary['watched']} reservation(s), updated {summary['updated']}")
+            return code
+
+        doc = current_state(args, env, now, repo_client)
+        text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+        if args.command == "state":
+            print(json.dumps(doc, indent=2, sort_keys=True))
+            return 0
+        if not args.yes:
+            print(f"would write {args.variable} on {args.repo} ({len(text)} bytes):")
+            print(json.dumps(doc, indent=2, sort_keys=True))
+            return 0
+        outcome = repo_client().set_variable(args.repo, args.variable, text)
+        idle = ", ".join(f"{label} {entry['idle']} idle" for label, entry in doc["pools"].items()) or "no owned pools"
+        print(f"{outcome} {args.variable} on {args.repo}: {idle}; observed {doc['observed_at']}")
+        return 0
+    except (Failure, urllib.error.URLError, OSError) as error:
+        print(f"glaeda-route: {type(error).__name__ + ': ' if not isinstance(error, Failure) else ''}{error}",
+              file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

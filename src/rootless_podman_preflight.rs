@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::debian_package_plan::{DebianPackagePlan, PackagePlanDisposition};
+use crate::lane_executable::{
+    is_supported_environment_executable_path, resolve_reviewed_environment_executable,
+};
 use crate::rootless_podman_config_resolution::{
     RootlessPodmanConfigAssessment, RootlessPodmanConfigAssessmentState, RootlessPodmanConfigField,
 };
@@ -20,15 +23,41 @@ use support::{
 
 pub const ROOTLESS_PODMAN_PREFLIGHT_SCHEMA_VERSION: u8 = 1;
 
-const REVIEWED_EXECUTABLES: [(&str, &str); 8] = [
-    ("podman", "/usr/bin/podman"),
-    ("runuser", "/usr/sbin/runuser"),
-    ("env", "/usr/bin/env"),
-    ("systemctl", "/usr/bin/systemctl"),
-    ("newuidmap", "/usr/bin/newuidmap"),
-    ("newgidmap", "/usr/bin/newgidmap"),
-    ("slirp4netns", "/usr/bin/slirp4netns"),
-    ("fuse-overlayfs", "/usr/bin/fuse-overlayfs"),
+const ENV_COMPATIBILITY_PATH: &str = "/usr/bin/env";
+
+#[derive(Clone, Copy)]
+enum ReviewedExecutablePath {
+    Fixed(&'static str),
+    Environment,
+}
+
+const REVIEWED_EXECUTABLES: [(&str, ReviewedExecutablePath); 8] = [
+    ("podman", ReviewedExecutablePath::Fixed("/usr/bin/podman")),
+    (
+        "runuser",
+        ReviewedExecutablePath::Fixed("/usr/sbin/runuser"),
+    ),
+    ("env", ReviewedExecutablePath::Environment),
+    (
+        "systemctl",
+        ReviewedExecutablePath::Fixed("/usr/bin/systemctl"),
+    ),
+    (
+        "newuidmap",
+        ReviewedExecutablePath::Fixed("/usr/bin/newuidmap"),
+    ),
+    (
+        "newgidmap",
+        ReviewedExecutablePath::Fixed("/usr/bin/newgidmap"),
+    ),
+    (
+        "slirp4netns",
+        ReviewedExecutablePath::Fixed("/usr/bin/slirp4netns"),
+    ),
+    (
+        "fuse-overlayfs",
+        ReviewedExecutablePath::Fixed("/usr/bin/fuse-overlayfs"),
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,34 +150,62 @@ pub fn observe_rootless_podman_static_preflight(
     let runtime_identity = identity.map(|identity| RuntimeIdentity {
         uid: identity.uid(),
     });
-    observe_with(
+    observe_with_environment(
         package_plan,
         account_observations,
         runtime_identity,
         configuration,
         paths,
-        &LinuxRuntimeFilesystem,
-        &verify_reviewed_executable,
+        (
+            &LinuxRuntimeFilesystem,
+            &verify_reviewed_executable,
+            &|| {
+                resolve_reviewed_environment_executable()
+                    .map(|executable| executable.path().to_path_buf())
+                    .map_err(|_| ())
+            },
+        ),
     )
 }
 
-fn observe_with(
+fn observe_with_environment<F, P, E>(
     package_plan: &DebianPackagePlan,
     account_observations: &RunnerAccountObservations,
     identity: Option<RuntimeIdentity>,
     configuration_assessment: &RootlessPodmanConfigAssessment,
     paths: &RootlessPodmanPreflightPaths,
-    filesystem: &impl RuntimeFilesystem,
-    executable_probe: &impl Fn(&Path) -> ExecutableProbe,
-) -> RootlessPodmanStaticPreflightReport {
+    dependencies: (&F, &P, &E),
+) -> RootlessPodmanStaticPreflightReport
+where
+    F: RuntimeFilesystem,
+    P: Fn(&Path) -> ExecutableProbe,
+    E: Fn() -> Result<PathBuf, ()>,
+{
+    let (filesystem, executable_probe, environment_path) = dependencies;
     let packages = classify_packages(package_plan);
     let runner_account = classify_runner_account(account_observations, identity);
     let runtime_directory = classify_runtime_directory(identity, paths, filesystem);
     let configuration = classify_configuration(configuration_assessment);
     let executables = REVIEWED_EXECUTABLES
         .into_iter()
-        .map(|(name, path)| {
-            let path = PathBuf::from(path);
+        .map(|(name, reviewed_path)| {
+            let path = match reviewed_path {
+                ReviewedExecutablePath::Fixed(path) => PathBuf::from(path),
+                ReviewedExecutablePath::Environment => match environment_path() {
+                    Ok(path) if is_supported_environment_executable_path(&path) => path,
+                    Ok(_) | Err(()) => {
+                        return RootlessPodmanExecutableObservation {
+                            name: name.to_owned(),
+                            path: PathBuf::from(ENV_COMPATIBILITY_PATH),
+                            state: RootlessPodmanPreflightState::Conflicting,
+                            evidence: vec![
+                                "no supported reviewed environment executable is available"
+                                    .to_owned(),
+                            ],
+                        };
+                    }
+                },
+            };
             let probe = executable_probe(&path);
             RootlessPodmanExecutableObservation {
                 name: name.to_owned(),
@@ -180,6 +237,28 @@ fn observe_with(
         configuration,
         executables,
     }
+}
+
+#[cfg(test)]
+fn observe_with(
+    package_plan: &DebianPackagePlan,
+    account_observations: &RunnerAccountObservations,
+    identity: Option<RuntimeIdentity>,
+    configuration_assessment: &RootlessPodmanConfigAssessment,
+    paths: &RootlessPodmanPreflightPaths,
+    filesystem: &impl RuntimeFilesystem,
+    executable_probe: &impl Fn(&Path) -> ExecutableProbe,
+) -> RootlessPodmanStaticPreflightReport {
+    observe_with_environment(
+        package_plan,
+        account_observations,
+        identity,
+        configuration_assessment,
+        paths,
+        (filesystem, executable_probe, &|| {
+            Ok(PathBuf::from(ENV_COMPATIBILITY_PATH))
+        }),
+    )
 }
 
 fn classify_packages(package_plan: &DebianPackagePlan) -> RootlessPodmanPreflightObservation {

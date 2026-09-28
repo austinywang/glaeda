@@ -1,21 +1,21 @@
 mod artifact {
-    pub use smolrunner::artifact::*;
+    pub use glaeda::artifact::*;
 }
 
 mod lima_observation {
-    pub use smolrunner::lima_observation::*;
+    pub use glaeda::lima_observation::*;
 }
 
 mod mac_availability {
-    pub use smolrunner::mac_availability::*;
+    pub use glaeda::mac_availability::*;
 }
 
 mod personal_worker_queue {
-    pub use smolrunner::personal_worker_queue::*;
+    pub use glaeda::personal_worker_queue::*;
 }
 
 mod verification_profile {
-    pub use smolrunner::verification_profile::*;
+    pub use glaeda::verification_profile::*;
 }
 
 #[allow(dead_code)]

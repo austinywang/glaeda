@@ -1,0 +1,321 @@
+{
+  "schema_version": 1,
+  "document_type": "glaeda-owned-fleet-workload-catalog",
+  "authority": "benchmark_observation_only",
+  "catalog_id": "owned-fleet-canonical-v1",
+  "state_classes": [
+    "cold",
+    "dependency_warm",
+    "compiler_warm",
+    "project_resident",
+    "exact_reusable_compiled_product_present"
+  ],
+  "state_evidence_contract": {
+    "cold": {
+      "dependency_cache_present": false,
+      "compiler_state_present": false,
+      "project_resident": false,
+      "exact_reusable_product_present": false
+    },
+    "dependency_warm": {
+      "dependency_cache_present": true,
+      "compiler_state_present": false,
+      "project_resident": false,
+      "exact_reusable_product_present": false
+    },
+    "compiler_warm": {
+      "dependency_cache_present": true,
+      "compiler_state_present": true,
+      "project_resident": false,
+      "exact_reusable_product_present": false
+    },
+    "project_resident": {
+      "dependency_cache_present": true,
+      "compiler_state_present": true,
+      "project_resident": true,
+      "exact_reusable_product_present": false
+    },
+    "exact_reusable_compiled_product_present": {
+      "dependency_cache_present": true,
+      "compiler_state_present": true,
+      "project_resident": true,
+      "exact_reusable_product_present": true
+    }
+  },
+  "contention_profiles": {
+    "large": {
+      "jobs": 1
+    },
+    "medium": {
+      "jobs": 2
+    },
+    "small": {
+      "jobs": 4
+    }
+  },
+  "storage_comparison": {
+    "rule": "change only declared source/state storage placement; retain machine comparison identity, backend, source revision, toolchain, workload, state class, resource policy, and validator",
+    "operations": [
+      "source traversal with the exact checkout located on the declared source storage tier",
+      "Git worktree/materialization with task temporaries located on the declared state storage tier",
+      "Xcode/Swift or Cargo compiler state rooted in state_dir",
+      "large immutable artifacts already consumed or produced by the reviewed workload",
+      "concurrent I/O through fixed-offer contention windows",
+      "sustained thermal behavior through repeated broader validated workloads"
+    ],
+    "synthetic_microbenchmark_authority": false
+  },
+  "workloads": [
+    {
+      "id": "cmux-native-apple-incremental-v1",
+      "label": "cmux native Apple incremental compile/check",
+      "repository": "teamleaderleo/cmux",
+      "commit": "2319ef27a05e8fdc0a3c231e6ccc33b016c83cc4",
+      "tree": "08bcff464995140302ecc186e61a3a0b4b810aa5",
+      "platform": "macos",
+      "toolchain": {
+        "policy": "repository-selected stable Xcode with macOS SDK major 26; exact xcodebuild, SDK, and swiftc outputs become part of every receipt and comparisons require identical toolchain_digest",
+        "preflight": [
+          "CMUX_CI_REQUIRED_MACOS_SDK_MAJOR=26 ./scripts/select-ci-xcode.sh",
+          "test -d GhosttyKit.xcframework"
+        ],
+        "probes": [
+          "xcodebuild -version",
+          "xcrun --sdk macosx --show-sdk-version",
+          "xcrun swiftc --version",
+          "git -C ghostty rev-parse HEAD",
+          "awk -v sha=\"$(git -C ghostty rev-parse HEAD)\" '$1 == sha { print $1 \" \" $2; found=1; exit } END { if (!found) exit 1 }' scripts/ghosttykit-checksums.txt",
+          "test -d GhosttyKit.xcframework && find GhosttyKit.xcframework -type f -exec shasum -a 256 {} + | LC_ALL=C sort | shasum -a 256"
+        ],
+        "required_output_regex": "(?m)^26(?:\\.[0-9]+)*$"
+      },
+      "operation": {
+        "semantic_profile": "cmux-unit focused native macOS incremental compile/test after one mtime-only Swift source touch",
+        "command": "touch Sources/RestorableAgentSession.swift && ./scripts/test-unit.sh test -derivedDataPath {state_dir}/DerivedData -clonedSourcePackagesDirPath {state_dir}/SourcePackages -only-testing:cmuxTests/TerminalStartupWorkingDirectoryPrefixRefreshTests",
+        "first_useful_regex": "(Test Suite .* passed|\\*\\* TEST SUCCEEDED \\*\\*)",
+        "validation": {
+          "kind": "output_and_exit",
+          "success_regex": "\\*\\* TEST SUCCEEDED \\*\\*"
+        }
+      },
+      "resource_envelope": {
+        "cpu": "natural host allocation; record logical CPU count",
+        "memory": "natural host allocation; record peak aggregate RSS",
+        "disk": "state_dir owns DerivedData and SourcePackages"
+      },
+      "candidate_roles": [
+        "latency-sensitive Apple build node"
+      ]
+    },
+    {
+      "id": "cmux-native-apple-broad-v1",
+      "label": "cmux broader native Apple unit-test product",
+      "repository": "teamleaderleo/cmux",
+      "commit": "2319ef27a05e8fdc0a3c231e6ccc33b016c83cc4",
+      "tree": "08bcff464995140302ecc186e61a3a0b4b810aa5",
+      "platform": "macos",
+      "toolchain": {
+        "policy": "same exact Xcode closure as cmux-native-apple-incremental-v1",
+        "preflight": [
+          "CMUX_CI_REQUIRED_MACOS_SDK_MAJOR=26 ./scripts/select-ci-xcode.sh",
+          "test -d GhosttyKit.xcframework"
+        ],
+        "probes": [
+          "xcodebuild -version",
+          "xcrun --sdk macosx --show-sdk-version",
+          "xcrun swiftc --version",
+          "git -C ghostty rev-parse HEAD",
+          "awk -v sha=\"$(git -C ghostty rev-parse HEAD)\" '$1 == sha { print $1 \" \" $2; found=1; exit } END { if (!found) exit 1 }' scripts/ghosttykit-checksums.txt",
+          "test -d GhosttyKit.xcframework && find GhosttyKit.xcframework -type f -exec shasum -a 256 {} + | LC_ALL=C sort | shasum -a 256"
+        ],
+        "required_output_regex": "(?m)^26(?:\\.[0-9]+)*$"
+      },
+      "operation": {
+        "semantic_profile": "cmux-unit complete native macOS unit suite",
+        "command": "./scripts/test-unit.sh test -derivedDataPath {state_dir}/DerivedData -clonedSourcePackagesDirPath {state_dir}/SourcePackages",
+        "first_useful_regex": "(Test Suite .* passed|\\*\\* TEST SUCCEEDED \\*\\*)",
+        "validation": {
+          "kind": "output_and_exit",
+          "success_regex": "\\*\\* TEST SUCCEEDED \\*\\*"
+        }
+      },
+      "resource_envelope": {
+        "cpu": "natural host allocation",
+        "memory": "natural host allocation",
+        "disk": "state_dir owns DerivedData and SourcePackages"
+      },
+      "candidate_roles": [
+        "latency-sensitive Apple build node",
+        "background/replay node"
+      ]
+    },
+    {
+      "id": "glaeda-rust-focused-v1",
+      "label": "Glaeda Rust focused verification",
+      "repository": "teamleaderleo/glaeda",
+      "commit": "0be1d302785df5876c81f5cd729540763aacf2c6",
+      "tree": "810238ade4259d36abd2d0747209446267425165",
+      "platform": "linux-or-macos",
+      "toolchain": {
+        "policy": "rust-toolchain.toml exact channel 1.97.1",
+        "preflight": [],
+        "probes": [
+          "rustc --version",
+          "cargo --version"
+        ],
+        "required_output_regex": "rustc 1\\.97\\.1"
+      },
+      "environment": {
+        "CARGO_HOME": "{state_dir}/cargo-home",
+        "CARGO_TARGET_DIR": "{state_dir}/target"
+      },
+      "operation": {
+        "semantic_profile": "scripts/verify focused",
+        "command": "./scripts/verify focused --receipt {semantic_receipt}",
+        "first_useful_regex": "\\[1/3\\].*: exit=0",
+        "validation": {
+          "kind": "glaeda_verification_receipt",
+          "expected_profile": "focused"
+        }
+      },
+      "resource_envelope": {
+        "cpu": "natural host allocation unless contention wrapper constrains it",
+        "memory": "natural host allocation",
+        "disk": "state_dir owns Cargo home and target"
+      },
+      "candidate_roles": [
+        "native-Linux base-load node",
+        "background/replay node"
+      ]
+    },
+    {
+      "id": "glaeda-rust-broad-v1",
+      "label": "Glaeda broader Rust verification/build",
+      "repository": "teamleaderleo/glaeda",
+      "commit": "0be1d302785df5876c81f5cd729540763aacf2c6",
+      "tree": "810238ade4259d36abd2d0747209446267425165",
+      "platform": "linux-or-macos",
+      "toolchain": {
+        "policy": "rust-toolchain.toml exact channel 1.97.1 plus exact cargo-nextest probe",
+        "preflight": [],
+        "probes": [
+          "rustc --version",
+          "cargo --version",
+          "cargo nextest --version"
+        ],
+        "required_output_regex": "rustc 1\\.97\\.1"
+      },
+      "environment": {
+        "CARGO_HOME": "{state_dir}/cargo-home",
+        "CARGO_TARGET_DIR": "{state_dir}/target"
+      },
+      "operation": {
+        "semantic_profile": "scripts/verify full-tests",
+        "command": "./scripts/verify full-tests --receipt {semantic_receipt}",
+        "first_useful_regex": "\\[1/1\\].*: exit=0",
+        "validation": {
+          "kind": "glaeda_verification_receipt",
+          "expected_profile": "full-tests"
+        }
+      },
+      "resource_envelope": {
+        "cpu": "natural host allocation unless contention wrapper constrains it",
+        "memory": "natural host allocation",
+        "disk": "state_dir owns Cargo home and target"
+      },
+      "candidate_roles": [
+        "native-Linux base-load node",
+        "background/replay node"
+      ]
+    },
+    {
+      "id": "quarry-verification-v1",
+      "label": "Quarry focused/parallel verification",
+      "repository": "teamleaderleo/quarry",
+      "commit": "468ccc442dd6be737d1cb6deeafc36d29e02a581",
+      "tree": "9316a33c1fc1c599158ee113840539a981056a9a",
+      "platform": "linux",
+      "toolchain": {
+        "policy": "canonical Python 3.14 verifier; exact probe outputs must match within comparison blocks",
+        "preflight": [],
+        "probes": [
+          "python --version",
+          "python -m pytest --version",
+          "python -m ruff --version",
+          "python -c 'from quarry.verification_toolchain import capture_verifier_toolchain; print(capture_verifier_toolchain().toolchain_id)'"
+        ],
+        "required_output_regex": "verification-toolchain-v1:sha256:42ef015b6cf09754c683b0bfc1add9d5c178f307681a708d057794aea9dc161b",
+        "known_verifier_toolchain_id": "verification-toolchain-v1:sha256:42ef015b6cf09754c683b0bfc1add9d5c178f307681a708d057794aea9dc161b"
+      },
+      "environment": {
+        "PYTHONPYCACHEPREFIX": "{state_dir}/pycache",
+        "PIP_CACHE_DIR": "{state_dir}/pip-cache",
+        "TMPDIR": "{state_dir}"
+      },
+      "variants": {
+        "focused": {
+          "semantic_profile": "repository-owned focused pytest",
+          "command": "python scripts/run_local_tests.py focus tests/test_agent_brief.py",
+          "first_useful_regex": "execution=completed",
+          "validation": {
+            "kind": "output_and_exit",
+            "success_regex": "execution=completed"
+          }
+        },
+        "parallel": {
+          "semantic_profile": "repository-owned parallel-full exact-head verifier, four workers",
+          "command": "python scripts/run_local_tests.py parallel-full --workers 4 --receipt-stdout > {semantic_receipt}",
+          "first_useful_regex": "parallel_shard=.*state=passed",
+          "validation": {
+            "kind": "quarry_parallel_receipt"
+          }
+        }
+      },
+      "resource_envelope": {
+        "cpu": "four inner workers for parallel variant; focused is one pytest invocation",
+        "memory": "natural host allocation",
+        "disk": "state_dir owns Python bytecode/package cache and task-private temporary worktrees"
+      },
+      "candidate_roles": [
+        "native-Linux base-load node",
+        "background/replay node"
+      ]
+    },
+    {
+      "id": "quarry-reviewed-container-v1",
+      "label": "Reviewed Linux package/container workload",
+      "repository": "teamleaderleo/quarry",
+      "commit": "468ccc442dd6be737d1cb6deeafc36d29e02a581",
+      "tree": "9316a33c1fc1c599158ee113840539a981056a9a",
+      "platform": "linux",
+      "toolchain": {
+        "policy": "repository reviewed Podman profile; exact Podman version and local image ID captured",
+        "preflight": [],
+        "probes": [
+          "podman --version",
+          "podman image inspect --format '{{.Id}}' localhost/quarry-ci:4"
+        ],
+        "required_output_regex": "(podman|sha256:)"
+      },
+      "operation": {
+        "semantic_profile": "scripts/verify-in-container.sh focused; rootless Podman, offline by default",
+        "command": "QUARRY_TARGET_ROOT=. QUARRY_OFFLINE=1 scripts/verify-in-container.sh focused",
+        "first_useful_regex": "(passed|minimum-bars-per-second)",
+        "validation": {
+          "kind": "output_and_exit",
+          "success_regex": "suite=focused"
+        }
+      },
+      "resource_envelope": {
+        "cpu": "profile default 0.85 container CPU unless explicitly overridden and receipt-bound",
+        "memory": "profile default 768m",
+        "pids": 512,
+        "disk": "read-only source plus tmpfs workspace"
+      },
+      "candidate_roles": [
+        "native-Linux base-load node",
+        "background/replay node"
+      ]
+    }
+  ]
+}

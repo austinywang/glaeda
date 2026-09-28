@@ -1,28 +1,28 @@
 #![cfg(target_os = "linux")]
 
-use smolrunner::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
-use smolrunner::execution_receipt::{
+use glaeda::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
+use glaeda::execution_receipt::{
     ExecutionReceiptOperation, ReceiptTimestamp, encode_execution_receipt,
 };
-use smolrunner::host_preparation_execution::{
+use glaeda::host_preparation_execution::{
     HOST_PREPARATION_EXECUTION_SCHEMA_VERSION, HostPreparationExecutionDisposition,
     HostPreparationExecutionReport,
 };
-use smolrunner::host_preparation_plan::{
+use glaeda::host_preparation_plan::{
     HostReadinessSourceIdentity, SourceExecutableIdentity, SourceRootlessPodmanIdentity,
     SourceRunnerAccountIdentity,
 };
-use smolrunner::host_preparation_receipt_binding::{
+use glaeda::host_preparation_receipt_binding::{
     HostPreparationReceiptBinding, HostPreparationReceiptBindingErrorKind,
     digest_host_preparation_source,
 };
-use smolrunner::host_readiness::HostObservationState;
-use smolrunner::journal::{
+use glaeda::host_readiness::HostObservationState;
+use glaeda::journal::{
     ActionOutcome, ExecutionJournal, ExecutionLane, JOURNAL_SCHEMA_VERSION, JournalRecord,
     PlannedMutation, Preconditions, RollbackClass,
 };
-use smolrunner::rootless_podman_preflight::RootlessPodmanPreflightState;
-use smolrunner::state::JournalId;
+use glaeda::rootless_podman_preflight::RootlessPodmanPreflightState;
+use glaeda::state::JournalId;
 
 const PRIVATE_PATH: &str = "/private/reviewed/usr/bin/git";
 const CHANGED_PRIVATE_PATH: &str = "/different/private/usr/bin/git";

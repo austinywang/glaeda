@@ -4,7 +4,7 @@
 
 ## Status
 
-This document records an exploratory product direction. It expands SmolRunner's existing runner-steward work without discarding it.
+This document records an exploratory product direction. It expands Glaeda's existing runner-steward work without discarding it.
 
 The dependable host, ownership, privilege, rollback, runner-lifecycle, and disposable-execution work remains the foundation. Leased workspaces and previews become optional capabilities built on that foundation after the existing safety model can support mutations.
 
@@ -12,9 +12,9 @@ The first platform-independent implementation slice now exists in `src/lease.rs`
 
 ## Product direction
 
-SmolRunner can grow from a steward for self-hosted GitHub Actions runners into a small execution host for the machines an operator already owns.
+Glaeda can grow from a steward for self-hosted GitHub Actions runners into a small execution host for the machines an operator already owns.
 
-GitHub Actions remains the first scheduler, workflow language, status interface, and log store. SmolRunner owns the host-side concerns:
+GitHub Actions remains the first scheduler, workflow language, status interface, and log store. Glaeda owns the host-side concerns:
 
 - preparing and reconciling ordinary Linux workers;
 - managing official GitHub Actions runner listeners;
@@ -41,7 +41,7 @@ A useful default policy is:
 
 Possible preview triggers include:
 
-- an explicit `smolrunner preview create` command;
+- an explicit `glaeda preview create` command;
 - a manually dispatched GitHub Actions workflow;
 - a repository label or trusted pull-request comment;
 - promotion of an integration branch;
@@ -89,40 +89,40 @@ A later idle-suspension policy may stop a preview process while preserving its w
 
 ## Local-first execution path
 
-The first execution backend should use the rootless Podman model already selected by SmolRunner.
+The first execution backend should use the rootless Podman model already selected by Glaeda.
 
 A practical first path is:
 
-1. GitHub Actions runs on an official listener managed by SmolRunner.
+1. GitHub Actions runs on an official listener managed by Glaeda.
 2. Repository-owned scripts or a Containerfile perform verification and build work.
 3. The workflow requests a preview from a verified OCI image digest or static artifact.
-4. SmolRunner starts the preview with declared CPU, memory, PID, network, and lifetime limits.
+4. Glaeda starts the preview with declared CPU, memory, PID, network, and lifetime limits.
 5. A reverse-proxy adapter assigns a route.
-6. SmolRunner records the lease and removes the preview after expiry.
+6. Glaeda records the lease and removes the preview after expiry.
 
-The control socket remains available only to the trusted SmolRunner process. Repository code never receives a Podman or Docker socket.
+The control socket remains available only to the trusted Glaeda process. Repository code never receives a Podman or Docker socket.
 
 ## Deployment targets
 
-SmolRunner should begin with one local target and keep target selection behind a narrow interface.
+Glaeda should begin with one local target and keep target selection behind a narrow interface.
 
 Possible future targets include:
 
 - local rootless Podman on the current worker;
-- another enrolled SmolRunner worker;
+- another enrolled Glaeda worker;
 - a static hosting provider;
 - Vercel or Cloudflare through explicit provider adapters;
 - a managed sandbox provider when local capacity is unavailable.
 
-Provider routing should come after local artifact, lease, and cleanup semantics prove themselves. SmolRunner should avoid becoming a compatibility layer for every hosting product.
+Provider routing should come after local artifact, lease, and cleanup semantics prove themselves. Glaeda should avoid becoming a compatibility layer for every hosting product.
 
 ## Collaboration with Stensibly
 
-Stensibly can remain the shared work ledger while SmolRunner owns execution state.
+Stensibly can remain the shared work ledger while Glaeda owns execution state.
 
 A Stensibly task or claim may reference:
 
-- a SmolRunner run;
+- a Glaeda run;
 - a leased workspace;
 - a preview URL;
 - an immutable artifact;
@@ -130,13 +130,13 @@ A Stensibly task or claim may reference:
 
 A handoff may transfer access to an existing workspace. Each actor should normally receive an independent Git worktree and writable environment. Shared live workspaces should require an explicit collaboration mode because simultaneous writers introduce unclear ownership and conflicting mutations.
 
-The integration should remain optional. SmolRunner must work through its CLI and GitHub Actions without requiring Stensibly.
+The integration should remain optional. Glaeda must work through its CLI and GitHub Actions without requiring Stensibly.
 
 ## Daemon boundary
 
 The current CLI-first design remains appropriate for host inspection, planning, preparation, runner lifecycle, and one-shot execution.
 
-A background process becomes justified when SmolRunner must own:
+A background process becomes justified when Glaeda must own:
 
 - lease renewal and expiry;
 - long-running preview supervision;
@@ -156,7 +156,7 @@ The daemon should reuse the same typed planning, ownership, journal, and executi
 - Hostile multi-tenant workloads.
 - A custom container runtime, image format, reverse proxy, or TLS implementation.
 - Automatic production promotion.
-- Model-driven scheduling inside SmolRunner.
+- Model-driven scheduling inside Glaeda.
 
 ## Questions to answer through prototypes
 

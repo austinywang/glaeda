@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use smolrunner::artifact::Sha256Digest;
-use smolrunner::disposable_launchd_service::{
+use glaeda::artifact::Sha256Digest;
+use glaeda::disposable_launchd_service::{
     DisposableLaunchdServiceDesiredState, plan_disposable_launchd_service,
 };
 

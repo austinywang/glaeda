@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""glaeda-fleet-cas-prune: keep a cmux mini's fleet compilation-cache stores within budget.
+
+    glaeda-fleet-cas-prune                 plan: sizes, budgets, what would go
+    glaeda-fleet-cas-prune --apply         prune (the hourly LaunchAgent from glaeda-mini-setup)
+
+Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODES.md):
+
+  cas         Xcode's own local CAS. The node does not manage it and its layout is Xcode's, so
+              it only ever goes whole, once it is over --local-cas-gib. On a reader it only
+              speeds up repeat builds (everything in it comes back from the node); the writer
+              empties it at the start of every writer build, so the writer's is left alone.
+  node-store  the node daemon's cache of the fleet store: one file per object (cas/) or index
+              entry (kv/), named by hash in two-hex-digit shards. Any file may go: a missing one
+              is fetched again, and its signature re-verified, on the next lookup. Oldest mtime
+              goes first until the store is under 90% of --node-gib. stats.json stays. The
+              writer's node store must stay consistent with the fleet store, so it is never
+              pruned here.
+
+A missing index entry in the middle of a build means a compile, so nothing is deleted while a
+build can be running: the run is skipped (exit 0, "deferred") while any xcodebuild, Xcode build
+service or GitHub Actions Runner.Worker runs. Sizes and the plan are worked out without any lock;
+only the deletes run under the fleet host lock (host.lock, the same flock with-host-lock and the
+runner hook take), taken without waiting, after checking for a build once more. Holding it
+refuses new jobs and takes idle listeners offline (#1206), so it is held only for a rename and
+the unlinks; the renamed local CAS is removed after the lock is released.
+
+The fleet store (xcode/fleet-store, on the store host only) is pruned by `fleet-cas gc`, which
+knows which entries are still read (glaeda#1216): kept are entries used within --gc-keep-days,
+everything they reach, and anything written in the last day. It runs at most once a day, from
+this same hourly job, and always as a dry run first: the real run goes ahead only when the dry
+run reports 0 "kept entries naming no stored object" (the check of gc's object-ID heuristic),
+otherwise the numbers are logged and nothing is deleted. gc takes no lock: a race with the running
+store only turns into a cache miss, never a wrong answer (gc.rs), so it is not gated on builds. Prints one JSON line per run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("GLAEDA_FLEET_CAS_ROOT", "/Users/Shared/cmux-build-fleet/xcode"))
+HOST_LOCK = Path(os.environ.get("FLEET_HOST_LOCK", "/Users/Shared/cmux-build-fleet/host.lock"))
+GIB = 1024**3
+# A build that can read the node: any xcodebuild, or a CI job (any runner dir, versioned bin too).
+# Xcode's build service can outlive xcodebuild with the CAS plugin still open.
+BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
+                  r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
+PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
+GC_EVERY = 86400  # seconds between fleet-store gc runs
+GC_REPORT = re.compile(r"kept entries naming no stored object: (\d+)")
+
+
+def busy(commands: list[str]) -> str:
+    for c in commands:
+        if BUSY.search(c):
+            return c.strip()[:160]
+    return ""
+
+
+def running_commands() -> list[str] | None:
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.splitlines() if out.returncode == 0 else None
+
+
+def is_writer(root: Path) -> bool:
+    """The writer's env file names its signing key (glaeda-fleet-cas writer)."""
+    try:
+        for line in (root / "fleet-cas.env").read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "FLEET_CAS_SIGN_KEY" and value.strip().strip("'\""):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def tree_bytes(path: Path) -> int:
+    total = 0
+    for dirpath, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, f)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def node_files(store: Path) -> list[tuple[float, int, str]]:
+    """(mtime, bytes, path) of every object and index entry; stats.json and anything else stays."""
+    out = []
+    for sub in ("cas", "kv"):
+        for dirpath, _, files in os.walk(store / sub):
+            for f in files:
+                p = os.path.join(dirpath, f)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                out.append((st.st_mtime, st.st_blocks * 512, p))
+    return out
+
+
+def plan_node(files: list[tuple[float, int, str]], budget: int) -> list[tuple[float, int, str]]:
+    """Oldest first until the rest fits in 90% of the budget; nothing while it is under budget."""
+    total = sum(b for _, b, _ in files)
+    if total <= budget:
+        return []
+    goal = int(budget * 0.9)
+    doomed = []
+    for entry in sorted(files):
+        if total <= goal:
+            break
+        doomed.append(entry)
+        total -= entry[1]
+    return doomed
+
+
+def sweep(root: Path) -> int:
+    """Delete local CAS copies a previous run renamed aside but did not finish removing."""
+    freed = 0
+    for leftover in root.glob(PRUNING + "*"):
+        freed += tree_bytes(leftover)
+        shutil.rmtree(leftover, ignore_errors=True)
+    return freed
+
+
+def take_lock(path: Path):
+    """The host lock without waiting, or None when a build holds it. No lock file: no lock."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # flock needs no write access
+    except FileNotFoundError:
+        return -1
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None
+        raise
+    return fd
+
+
+def store_gc(root: Path, keep_days: int, now: float | None = None) -> dict:
+    """Daily `fleet-cas gc` on the store host: dry run, then the real run only when it is safe."""
+    store, binary, stamp = root / "fleet-store", root / "bin" / "fleet-cas", root / "run" / "gc.last"
+    if not (store / "kv").is_dir() or not (store / "cas").is_dir():
+        return {}
+    now = time.time() if now is None else now
+    try:
+        if now - stamp.stat().st_mtime < GC_EVERY:
+            return {"gc": "not due"}
+    except FileNotFoundError:
+        pass
+
+    def gc(*extra: str) -> tuple[int, str]:
+        try:
+            out = subprocess.run([str(binary), "gc", str(store), "--keep-days", str(keep_days), *extra],
+                                 capture_output=True, text=True, timeout=3600)
+        except (OSError, subprocess.SubprocessError) as e:
+            return 1, str(e)
+        # The report is the last stdout line; stderr is kept apart so it cannot push it out.
+        return out.returncode, (out.stdout.strip()[-400:] + (f" | stderr: {out.stderr.strip()[-200:]}"
+                                                            if out.returncode else ""))
+
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()  # one attempt a day, whatever the outcome
+    code, dry = gc("--dry-run")
+    m = GC_REPORT.search(dry)
+    if code != 0 or not m:
+        return {"gc": "skipped: the dry run failed or fleet-cas predates gc", "gc_dry_run": dry}
+    if int(m.group(1)) != 0:
+        return {"gc": "skipped: kept entries name no stored object, so the ID heuristic is suspect",
+                "gc_dry_run": dry}
+    code, real = gc()
+    return {"gc": "ran" if code == 0 else "failed", "gc_dry_run": dry, "gc_run": real}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="delete (default: plan only)")
+    ap.add_argument("--node-gib", type=float, default=20, help="node-store budget (default %(default)s)")
+    ap.add_argument("--local-cas-gib", type=float, default=30,
+                    help="the local Xcode CAS goes whole above this (default %(default)s)")
+    ap.add_argument("--gc-keep-days", type=int, default=14,
+                    help="on the store host: fleet-cas gc keeps entries used within this many days")
+    a = ap.parse_args(argv)
+    rec: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "apply": a.apply}
+    if a.apply:
+        rec.update(store_gc(ROOT, a.gc_keep_days))
+    if not (ROOT / "fleet-cas.env").exists():
+        rec["result"] = "no fleet-cas on this host"
+        print(json.dumps(rec))
+        return 0
+    writer = is_writer(ROOT)
+    rec["role"] = "writer" if writer else "reader"
+    commands = running_commands()
+    if commands is None:
+        rec["result"] = "deferred: ps failed, cannot rule out a running build"
+        print(json.dumps(rec))
+        return 0
+    if a.apply and (why := busy(commands)):
+        rec["result"] = f"deferred: a build is running ({why})"
+        print(json.dumps(rec))
+        return 0
+    if a.apply:
+        rec["swept_bytes"] = sweep(ROOT)
+    # Measure and plan with no lock held: these walks are the slow part.
+    local = ROOT / "cas"
+    local_bytes = tree_bytes(local) if local.is_dir() else 0
+    rec["local_cas_bytes"] = local_bytes
+    drop_local = not writer and local_bytes > a.local_cas_gib * GIB
+    store = ROOT / "node-store"
+    files = node_files(store) if store.is_dir() else []
+    rec["node_store_bytes"] = sum(b for _, b, _ in files)
+    doomed = [] if writer else plan_node(files, int(a.node_gib * GIB))
+    rec["local_cas"] = ("kept: the writer empties it before every writer build" if writer
+                        else ("would remove" if drop_local else "within budget"))
+    rec["node_store"] = ("kept: the writer's node store must match the fleet store" if writer
+                         else f"would remove {len(doomed)} oldest files, "
+                              f"{sum(b for _, b, _ in doomed) / GIB:.1f} GiB")
+    if not a.apply or not (drop_local or doomed):
+        rec["result"] = "ok"
+        print(json.dumps(rec))
+        return 0
+    lock = take_lock(HOST_LOCK)
+    if lock is None:
+        rec["result"] = "deferred: a build holds the host lock"
+        print(json.dumps(rec))
+        return 0
+    renamed = None
+    try:
+        again = running_commands()
+        if again is None or (why := busy(again)):
+            rec["result"] = f"deferred: a build started ({why if again else 'ps failed'})"
+            print(json.dumps(rec))
+            return 0
+        if drop_local and local.is_dir():
+            renamed = ROOT / f"{PRUNING}{os.getpid()}"
+            os.rename(local, renamed)
+            rec["local_cas"] = "removed"
+        freed = 0
+        for _, b, p in doomed:
+            try:
+                os.unlink(p)
+                freed += b
+            except FileNotFoundError:
+                pass
+        if doomed:
+            rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
+    finally:
+        if lock != -1:
+            os.close(lock)
+    if renamed is not None:  # the slow part, with the lock released: nothing reads this path
+        shutil.rmtree(renamed, ignore_errors=True)
+    rec["result"] = "ok"
+    print(json.dumps(rec))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

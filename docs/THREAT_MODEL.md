@@ -1,6 +1,6 @@
 # Threat model
 
-SmolRunner automatically runs GitHub Actions jobs from operator-enrolled repositories on resources provisioned on an operator-owned Mac. Repository code is untrusted even when it comes from the operator's repository or a known open-source project.
+Glaeda automatically runs GitHub Actions jobs from operator-enrolled repositories on resources provisioned on an operator-owned Mac. Repository code is untrusted even when it comes from the operator's repository or a known open-source project.
 
 The detailed product boundary and milestone sequence are in [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md).
 
@@ -10,7 +10,7 @@ The detailed product boundary and milestone sequence are in [Disposable autoscal
 - GitHub App credentials, just-in-time runner configuration, workflow secrets, and unrelated credentials.
 - Other workers, their jobs, state, and network traffic.
 - Other devices and services on the host's private networks.
-- The integrity of SmolRunner's controller, durable state, capacity decisions, and public results.
+- The integrity of Glaeda's controller, durable state, capacity decisions, and public results.
 - The operator's ability to understand recovery debt and stop automatic mutation.
 
 ## Adversary
@@ -21,9 +21,9 @@ The adversary is allowed to gain complete control of its disposable guest. Secur
 
 ## Trusted computing base
 
-The initial trusted computing base is macOS, Apple Virtualization Framework, Lima's controller, a pinned Ubuntu guest image, the pinned official GitHub Actions runner, the selected network-enforcement component, GitHub Actions, and SmolRunner's host controller. Their exact versions and configuration are managed inputs, and security updates require deliberate rollout.
+The initial trusted computing base is macOS, Apple Virtualization Framework, Lima's controller, a pinned Ubuntu guest image, the pinned official GitHub Actions runner, the selected network-enforcement component, GitHub Actions, and Glaeda's host controller. Their exact versions and configuration are managed inputs, and security updates require deliberate rollout.
 
-SmolRunner does not independently re-prove every Linux, glibc, container-runtime, or network-stack semantic that a mature trusted component already owns. It verifies the configuration and lifecycle facts needed to use that component within this boundary.
+Glaeda does not independently re-prove every Linux, glibc, container-runtime, or network-stack semantic that a mature trusted component already owns. It verifies the configuration and lifecycle facts needed to use that component within this boundary.
 
 ## Required security invariants
 
@@ -38,7 +38,7 @@ Unless an operator explicitly selects a separately documented weaker backend:
 - The guest runner user has no sudo or equivalent administrative authority. Nested containers, when enabled, are rootless inside the guest and expose no host runtime socket.
 - Every provision, registration, start, terminal observation, deregistration, destruction, and capacity-release transition is durably checkpointed or safely rediscovered after a crash.
 - Unknown ownership, conflicting identity, stale authority, partial cleanup, and ambiguous external mutation block reuse. Recovery prefers destroying the disposable worker over adopting uncertain state.
-- A job's result is not success until GitHub terminal evidence and SmolRunner cleanup state are classified truthfully. Cleanup failure remains visible and retryable.
+- A job's result is not success until GitHub terminal evidence and Glaeda cleanup state are classified truthfully. Cleanup failure remains visible and retryable.
 - Bounded diagnostics exclude raw repository contents, environment dumps, secrets, credentials, and unrelated host data.
 
 ## Network policy
@@ -49,11 +49,11 @@ The enforcement point is outside repository authority. It denies host gateway ad
 
 ## Secrets and GitHub trust
 
-Host credentials and unrelated repository credentials never enter the guest. A workflow may intentionally receive its own GitHub job token or configured repository secret; protecting the job from secrets deliberately granted by that workflow is outside SmolRunner's boundary. Repository enrollment and GitHub policy should therefore avoid granting powerful secrets to unreviewed pull-request contexts.
+Host credentials and unrelated repository credentials never enter the guest. A workflow may intentionally receive its own GitHub job token or configured repository secret; protecting the job from secrets deliberately granted by that workflow is outside Glaeda's boundary. Repository enrollment and GitHub policy should therefore avoid granting powerful secrets to unreviewed pull-request contexts.
 
 ## Failure behavior
 
-When SmolRunner cannot establish a required boundary or lifecycle fact, it does not start repository code. Once a job may have run, uncertainty triggers teardown and stale-runner cleanup rather than worker reuse. Automatic retries are bounded, preserve the same job and authority, use backoff and circuit breakers, and never exceed the host resource budget.
+When Glaeda cannot establish a required boundary or lifecycle fact, it does not start repository code. Once a job may have run, uncertainty triggers teardown and stale-runner cleanup rather than worker reuse. Automatic retries are bounded, preserve the same job and authority, use backoff and circuit breakers, and never exceed the host resource budget.
 
 ## Deferred high-assurance hardening
 

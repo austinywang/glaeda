@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::host_readiness::HostReadinessReport;
 use crate::host_rootless_podman::HostRootlessPodmanReadiness;
+use crate::lane_executable::is_supported_environment_executable_path;
 use crate::rootless_podman_config_observation::ROOTLESS_PODMAN_CONFIG_OBSERVATION_SCHEMA_VERSION;
 use crate::rootless_podman_config_resolution::{
     ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION, RootlessPodmanConfigAssessmentState,
@@ -240,8 +241,12 @@ fn validate_executables(
             );
             continue;
         };
-        if !seen.insert(observation.name.as_str()) || observation.path != Path::new(*expected_path)
-        {
+        let path_matches = if observation.name == "env" {
+            is_supported_environment_executable_path(&observation.path)
+        } else {
+            observation.path == Path::new(*expected_path)
+        };
+        if !seen.insert(observation.name.as_str()) || !path_matches {
             inconsistent(
                 blockers,
                 HostPreparationResource::RootlessPodman,

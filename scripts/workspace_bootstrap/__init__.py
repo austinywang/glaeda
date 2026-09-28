@@ -1,1 +1,1 @@
-"""SmolRunner repository workspace bootstrap implementation."""
+"""Glaeda repository workspace bootstrap implementation."""

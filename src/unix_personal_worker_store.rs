@@ -31,6 +31,8 @@ pub(crate) mod disposable_runner_transaction;
 pub(crate) mod disposable_template_generation;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
 pub mod lima_authority;
+/// Same-lock native-Linux task preparation, recovery, and teardown.
+pub(crate) mod owned_linux_jit_transaction;
 #[cfg(test)]
 mod publication_fault;
 #[cfg(test)]

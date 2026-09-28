@@ -12,17 +12,21 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
-use crate::local_install_plan::LocalInstallSourceIdentity;
+use crate::local_install_plan::{LocalInstallIdentityGeneration, LocalInstallSourceIdentity};
 use crate::process::TimedCommandExecutor;
 use crate::project_checkout_observation::{
     ProjectCheckoutObservation, ProjectCheckoutObservationErrorKind, ProjectCheckoutObserver,
 };
+use crate::project_workspace_identity::{
+    ProjectWorkspaceFilesystemIdentityKind, ProjectWorkspaceIdentityGeneration,
+    project_workspace_filesystem_identity,
+};
 
-pub const LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION: u8 = 1;
+pub const LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION: u8 = 3;
 pub const MAX_LOCAL_INSTALL_CARGO_LOCK_BYTES: usize = 4 * 1024 * 1024;
 
-const EXPECTED_PROJECT: &str = "github.com/teamleaderleo/smolrunner";
-const MATERIALIZATION_ID_DOMAIN: &[u8] = b"smolrunner-project-materialization-v1\0";
+const SMOLRUNNER_PROJECT: &str = "github.com/teamleaderleo/smolrunner";
+const GLAEDA_PROJECT: &str = "github.com/teamleaderleo/glaeda";
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -38,6 +42,7 @@ const FILE_FLAGS: OFlags = OFlags::RDONLY
 #[serde(rename_all = "snake_case")]
 pub enum LocalInstallSourceProjectDisposition {
     ExactSmolrunner,
+    ExactGlaeda,
     Other,
     Ambiguous,
     Unknown,
@@ -46,6 +51,7 @@ pub enum LocalInstallSourceProjectDisposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalInstallSourceBlockingCode {
+    IdentityGenerationMismatch,
     WrongProject,
     CommitMismatch,
     TreeMismatch,
@@ -63,6 +69,8 @@ pub enum LocalInstallSourceBlockingCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalInstallSourcePreflightReceipt {
     schema_version: u8,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
+    local_install_identity_generation: LocalInstallIdentityGeneration,
     expected_source_digest: Sha256Digest,
     observed_project: LocalInstallSourceProjectDisposition,
     commit_match: bool,
@@ -78,6 +86,16 @@ impl LocalInstallSourcePreflightReceipt {
     #[must_use]
     pub const fn schema_version(&self) -> u8 {
         self.schema_version
+    }
+
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
+    }
+
+    #[must_use]
+    pub const fn local_install_identity_generation(&self) -> LocalInstallIdentityGeneration {
+        self.local_install_identity_generation
     }
 
     #[must_use]
@@ -139,16 +157,37 @@ pub fn observe_local_install_source_preflight(
     observer: &ProjectCheckoutObserver,
     executor: &impl TimedCommandExecutor,
 ) -> LocalInstallSourcePreflightReceipt {
-    let first_lock = match observe_lock_snapshot(checkout) {
+    let identity_generation = observer.identity_generation();
+    let local_install_identity_generation = expected.identity_generation();
+    if identity_generation != workspace_generation(local_install_identity_generation) {
+        return root_cause_receipt(
+            expected,
+            identity_generation,
+            LocalInstallSourceBlockingCode::IdentityGenerationMismatch,
+        );
+    }
+    let first_lock = match observe_lock_snapshot(checkout, identity_generation) {
         Ok(snapshot) => snapshot,
         Err(LockSnapshotError::Unsafe) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::UnsafeSource);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::UnsafeSource,
+            );
         }
         Err(LockSnapshotError::Unknown) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::UnknownSource);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::UnknownSource,
+            );
         }
         Err(LockSnapshotError::Changed) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::SourceChanged);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::SourceChanged,
+            );
         }
     };
 
@@ -169,41 +208,70 @@ pub fn observe_local_install_source_preflight(
                     LocalInstallSourceBlockingCode::UnknownSource
                 }
             };
-            return root_cause_receipt(expected, code);
+            return root_cause_receipt(expected, identity_generation, code);
         }
     };
 
-    let second_lock = match observe_lock_snapshot(checkout) {
+    let second_lock = match observe_lock_snapshot(checkout, identity_generation) {
         Ok(snapshot) => snapshot,
         Err(LockSnapshotError::Unsafe | LockSnapshotError::Changed) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::SourceChanged);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::SourceChanged,
+            );
         }
         Err(LockSnapshotError::Unknown) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::UnknownSource);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::UnknownSource,
+            );
         }
     };
 
     if !first_lock.same_as(&second_lock)
         || first_lock.materialization_id != *checkout_observation.materialization_id()
     {
-        return root_cause_receipt(expected, LocalInstallSourceBlockingCode::SourceChanged);
+        return root_cause_receipt(
+            expected,
+            identity_generation,
+            LocalInstallSourceBlockingCode::SourceChanged,
+        );
     }
 
-    stable_receipt(expected, &checkout_observation, &second_lock)
+    stable_receipt(
+        expected,
+        identity_generation,
+        &checkout_observation,
+        &second_lock,
+    )
 }
 
 fn stable_receipt(
     expected: &LocalInstallSourceIdentity,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     observation: &ProjectCheckoutObservation,
     lock: &LockSnapshot,
 ) -> LocalInstallSourcePreflightReceipt {
+    let local_install_identity_generation = expected.identity_generation();
+    let (expected_project, exact_project_disposition) = match local_install_identity_generation {
+        LocalInstallIdentityGeneration::SmolrunnerV1 => (
+            SMOLRUNNER_PROJECT,
+            LocalInstallSourceProjectDisposition::ExactSmolrunner,
+        ),
+        LocalInstallIdentityGeneration::GlaedaV2 => (
+            GLAEDA_PROJECT,
+            LocalInstallSourceProjectDisposition::ExactGlaeda,
+        ),
+    };
     let observed_project = if observation.source_ambiguous() {
         LocalInstallSourceProjectDisposition::Ambiguous
     } else if observation
         .primary_project()
-        .is_some_and(|project| project.as_str() == EXPECTED_PROJECT)
+        .is_some_and(|project| project.as_str() == expected_project)
     {
-        LocalInstallSourceProjectDisposition::ExactSmolrunner
+        exact_project_disposition
     } else {
         LocalInstallSourceProjectDisposition::Other
     };
@@ -214,7 +282,7 @@ fn stable_receipt(
         !observation.tracked_changes_present() && observation.untracked_entry_count() == 0;
 
     let mut blocking_codes = BTreeSet::new();
-    if observed_project != LocalInstallSourceProjectDisposition::ExactSmolrunner {
+    if observed_project != exact_project_disposition {
         blocking_codes.insert(LocalInstallSourceBlockingCode::WrongProject);
     }
     if !commit_match {
@@ -233,6 +301,8 @@ fn stable_receipt(
 
     LocalInstallSourcePreflightReceipt {
         schema_version: LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION,
+        identity_generation,
+        local_install_identity_generation,
         expected_source_digest: expected.digest().clone(),
         observed_project,
         commit_match,
@@ -247,10 +317,13 @@ fn stable_receipt(
 
 fn root_cause_receipt(
     expected: &LocalInstallSourceIdentity,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     code: LocalInstallSourceBlockingCode,
 ) -> LocalInstallSourcePreflightReceipt {
     LocalInstallSourcePreflightReceipt {
         schema_version: LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION,
+        identity_generation,
+        local_install_identity_generation: expected.identity_generation(),
         expected_source_digest: expected.digest().clone(),
         observed_project: LocalInstallSourceProjectDisposition::Unknown,
         commit_match: false,
@@ -260,6 +333,17 @@ fn root_cause_receipt(
         observation_stable: false,
         ready: false,
         blocking_codes: vec![code],
+    }
+}
+
+const fn workspace_generation(
+    generation: LocalInstallIdentityGeneration,
+) -> ProjectWorkspaceIdentityGeneration {
+    match generation {
+        LocalInstallIdentityGeneration::SmolrunnerV1 => {
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+        }
+        LocalInstallIdentityGeneration::GlaedaV2 => ProjectWorkspaceIdentityGeneration::GlaedaV2,
     }
 }
 
@@ -334,7 +418,10 @@ enum LockSnapshotError {
     Changed,
 }
 
-fn observe_lock_snapshot(checkout: &Path) -> Result<LockSnapshot, LockSnapshotError> {
+fn observe_lock_snapshot(
+    checkout: &Path,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
+) -> Result<LockSnapshot, LockSnapshotError> {
     if !valid_checkout_path(checkout) {
         return Err(LockSnapshotError::Unsafe);
     }
@@ -364,7 +451,7 @@ fn observe_lock_snapshot(checkout: &Path) -> Result<LockSnapshot, LockSnapshotEr
     }
 
     Ok(LockSnapshot {
-        materialization_id: materialization_id(&root_after),
+        materialization_id: materialization_id(&root_after, identity_generation),
         root: PrivateMetadata::from_metadata(&root_after),
         lock: PrivateMetadata::from_metadata(&lock_after),
         digest: sha256_digest(&bytes),
@@ -446,13 +533,18 @@ fn map_lock_open(error: Errno) -> LockSnapshotError {
     }
 }
 
-fn materialization_id(metadata: &std::fs::Metadata) -> Sha256Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(MATERIALIZATION_ID_DOMAIN);
-    hasher.update(metadata.dev().to_be_bytes());
-    hasher.update(metadata.ino().to_be_bytes());
-    hasher.update(metadata.uid().to_be_bytes());
-    digest_from_hasher(hasher)
+fn materialization_id(
+    metadata: &std::fs::Metadata,
+    generation: ProjectWorkspaceIdentityGeneration,
+) -> Sha256Digest {
+    project_workspace_filesystem_identity(
+        generation,
+        ProjectWorkspaceFilesystemIdentityKind::Materialization,
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+    )
+    .expect("validated identity fields always produce canonical SHA-256")
 }
 
 fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
@@ -641,7 +733,7 @@ mod tests {
     fn exact_script(root: &Path) -> Vec<Response> {
         script(
             root,
-            "remote.origin.url\nhttps://github.com/TeamLeaderLeo/SmolRunner.git\0",
+            "remote.origin.url\nhttps://github.com/TeamLeaderLeo/Glaeda.git\0",
             &format!("# branch.oid {COMMIT}\0# branch.head (detached)\0"),
             COMMIT,
             TREE,
@@ -670,14 +762,85 @@ mod tests {
         assert!(receipt.lockfile_digest_match());
         assert!(receipt.checkout_clean());
         assert_eq!(
+            receipt.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::GlaedaV2
+        );
+        assert_eq!(
             receipt.observed_project(),
-            LocalInstallSourceProjectDisposition::ExactSmolrunner
+            LocalInstallSourceProjectDisposition::ExactGlaeda
         );
         assert!(receipt.blocking_codes().is_empty());
         assert_eq!(executor.commands.borrow().len(), 16);
         let public = serde_json::to_string(&receipt).expect("receipt JSON");
+        assert!(public.contains("\"schema_version\":3"));
+        assert!(public.contains("\"identity_generation\":\"glaeda_v2\""));
+        assert!(public.contains("\"local_install_identity_generation\":\"glaeda_v2\""));
         assert!(!public.contains(checkout.path().to_string_lossy().as_ref()));
         assert!(!public.contains("/private/path"));
+    }
+
+    #[test]
+    fn preflight_binds_lock_and_checkout_observation_to_one_explicit_generation() {
+        let checkout = TempCheckout::new("generation");
+        let legacy_observer = ProjectCheckoutObserver::with_identity_generation(
+            "/usr/bin/git",
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+        )
+        .expect("legacy observer");
+        let legacy_expected = LocalInstallSourceIdentity::with_identity_generation(
+            LocalInstallIdentityGeneration::SmolrunnerV1,
+            CommitId::parse(COMMIT).expect("commit"),
+            GitTreeId::parse(TREE).expect("tree"),
+            sha256_digest(LOCK_BYTES),
+            LocalInstallToolchainIdentity::parse("rust-1.97.1-aarch64-apple-darwin")
+                .expect("toolchain"),
+        )
+        .expect("legacy source");
+        let mut legacy_script = exact_script(checkout.path());
+        for response in &mut legacy_script {
+            response.stdout = response.stdout.replace(
+                "https://github.com/TeamLeaderLeo/Glaeda.git",
+                "https://github.com/TeamLeaderLeo/SmolRunner.git",
+            );
+        }
+        let receipt = observe_local_install_source_preflight(
+            &legacy_expected,
+            checkout.path(),
+            &legacy_observer,
+            &ScriptedExecutor::new(legacy_script),
+        );
+
+        assert!(receipt.ready());
+        assert_eq!(
+            receipt.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+        );
+        let public = serde_json::to_string(&receipt).expect("legacy receipt JSON");
+        assert!(public.contains("\"identity_generation\":\"smolrunner_v1\""));
+    }
+
+    #[test]
+    fn mismatched_install_and_workspace_generations_refuse_before_observation() {
+        let checkout = TempCheckout::new("generation-mismatch");
+        let legacy_observer = ProjectCheckoutObserver::with_identity_generation(
+            "/usr/bin/git",
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+        )
+        .expect("legacy observer");
+        let executor = ScriptedExecutor::new(Vec::new());
+
+        let receipt = observe_local_install_source_preflight(
+            &expected(LOCK_BYTES),
+            checkout.path(),
+            &legacy_observer,
+            &executor,
+        );
+
+        assert_eq!(
+            receipt.blocking_codes(),
+            [LocalInstallSourceBlockingCode::IdentityGenerationMismatch]
+        );
+        assert!(executor.commands.borrow().is_empty());
     }
 
     #[test]

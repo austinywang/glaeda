@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub use smolrunner::{
+pub use glaeda::{
     actions_runner_readiness, artifact, execution_admission, lima_host_identity, lima_lifecycle,
     lima_observation, mac_availability, macos_resource_observation, operator_config,
     personal_worker_mac_observation, personal_worker_operator_read, personal_worker_queue,
@@ -23,6 +23,45 @@ mod lima_host_identity_support;
 #[path = "../src/personal_worker_runner_readiness.rs"]
 mod personal_worker_runner_readiness;
 
+use glaeda::actions_runner_readiness::{
+    ActionsRunnerConfiguredIdentity, ActionsRunnerName, ActionsRunnerReadinessAdapter,
+    ActionsRunnerReadinessRequest,
+};
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
+    DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
+    ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
+    FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
+    ReservationGeneration, ReservationId, RunnerProfileId,
+};
+use glaeda::lima_lifecycle::LimaResourceProfile;
+use glaeda::lima_observation::{
+    LimaArchitecture, LimaFilesystemObjectIdentity, LimaInstanceName, LimaObservationAdapter,
+    LimaObservationClock, LimaObservationRequest, LimaRuntimeState, LimaVmType,
+};
+use glaeda::mac_availability::AvailabilityRequest;
+use glaeda::macos_resource_observation::{
+    lima_process_command, memory_pressure_command, power_command, swap_command,
+};
+use glaeda::operator_config::{
+    GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
+    OperatorRemediationPreference, PersonalWorkerStateRoot,
+};
+use glaeda::personal_worker_operator_read::{
+    PersonalWorkerOperatorJobRead, PersonalWorkerOperatorReadService,
+    PersonalWorkerOperatorStatusRead,
+};
+use glaeda::personal_worker_queue::{
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
+};
+use glaeda::personal_worker_read_model::PersonalWorkerJobReadRequest;
+use glaeda::personal_worker_store::{PersonalWorkerDurableCacheLease, PersonalWorkerStoreDocument};
+use glaeda::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
 use lima_host_identity_support::LimaHostIdentityFixture;
 use personal_worker_mac_observation::{
     PersonalWorkerMacObservation, PersonalWorkerMacObservationAdapter,
@@ -32,47 +71,6 @@ use personal_worker_runner_readiness::{
     PersonalWorkerRunnerReadinessAdapter, PersonalWorkerRunnerReadinessDisposition,
     PersonalWorkerRunnerReadinessReason,
 };
-use smolrunner::actions_runner_readiness::{
-    ActionsRunnerConfiguredIdentity, ActionsRunnerName, ActionsRunnerReadinessAdapter,
-    ActionsRunnerReadinessRequest,
-};
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
-    DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
-    ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
-    FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
-    ReservationGeneration, ReservationId, RunnerProfileId,
-};
-use smolrunner::lima_lifecycle::LimaResourceProfile;
-use smolrunner::lima_observation::{
-    LimaArchitecture, LimaFilesystemObjectIdentity, LimaInstanceName, LimaObservationAdapter,
-    LimaObservationClock, LimaObservationRequest, LimaRuntimeState, LimaVmType,
-};
-use smolrunner::mac_availability::AvailabilityRequest;
-use smolrunner::macos_resource_observation::{
-    lima_process_command, memory_pressure_command, power_command, swap_command,
-};
-use smolrunner::operator_config::{
-    GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
-    OperatorRemediationPreference, PersonalWorkerStateRoot,
-};
-use smolrunner::personal_worker_operator_read::{
-    PersonalWorkerOperatorJobRead, PersonalWorkerOperatorReadService,
-    PersonalWorkerOperatorStatusRead,
-};
-use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
-    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
-    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
-    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
-};
-use smolrunner::personal_worker_read_model::PersonalWorkerJobReadRequest;
-use smolrunner::personal_worker_store::{
-    PersonalWorkerDurableCacheLease, PersonalWorkerStoreDocument,
-};
-use smolrunner::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE_MILLIS: u64 = 5_000_000;

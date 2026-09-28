@@ -279,6 +279,60 @@ fn matching_report_is_ready_and_retains_exact_source() {
 }
 
 #[test]
+fn reviewed_rust_coreutils_env_path_is_ready() {
+    let mut report = report(
+        packages(&[]),
+        all(PreparationObservationState::Matching),
+        Some((1001, 1001)),
+    );
+    let HostRootlessPodmanReadiness::Observed { preflight, .. } = &mut report.rootless_podman
+    else {
+        panic!("observed rootless preflight expected");
+    };
+    let environment = preflight
+        .executables
+        .iter_mut()
+        .find(|executable| executable.name == "env")
+        .expect("environment executable");
+    environment.path = PathBuf::from("/usr/lib/cargo/bin/coreutils/env");
+
+    let proposal = plan_host_preparation(report);
+    assert!(matches!(proposal.result, HostPreparationResult::Ready));
+}
+
+#[test]
+fn unreviewed_environment_path_blocks_without_leaking_the_path() {
+    let mut report = report(
+        packages(&[]),
+        all(PreparationObservationState::Matching),
+        Some((1001, 1001)),
+    );
+    let HostRootlessPodmanReadiness::Observed { preflight, .. } = &mut report.rootless_podman
+    else {
+        panic!("observed rootless preflight expected");
+    };
+    let environment = preflight
+        .executables
+        .iter_mut()
+        .find(|executable| executable.name == "env")
+        .expect("environment executable");
+    environment.path = PathBuf::from("/tmp/private-env-marker");
+
+    let proposal = plan_host_preparation(report);
+    let HostPreparationResult::Blocked { blockers } = &proposal.result else {
+        panic!("unreviewed environment path must block");
+    };
+    assert!(blockers.iter().any(|blocker| {
+        blocker.resource == HostPreparationResource::RootlessPodman
+            && blocker.code == HostPreparationBlockerCode::InconsistentObservation
+    }));
+    let json = serde_json::to_string(&proposal).expect("serialize proposal");
+    let human = render_human(&proposal);
+    assert!(!json.contains("private-env-marker"));
+    assert!(!human.contains("private-env-marker"));
+}
+
+#[test]
 fn package_only_phase_is_root_irreversible_and_durable() {
     let proposal = plan_host_preparation(report(
         packages(&[("git", Presence::Absent)]),

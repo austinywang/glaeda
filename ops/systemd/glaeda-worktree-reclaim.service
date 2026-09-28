@@ -1,0 +1,9 @@
+[Unit]
+Description=Reclaim linked Git worktrees whose removal loses nothing (glaeda-worktree-reclaim)
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/bin/bash %h/.local/bin/glaeda-worktree-reclaim-all --apply --output json
+StandardOutput=append:%h/.local/state/glaeda-worktree-reclaim.jsonl

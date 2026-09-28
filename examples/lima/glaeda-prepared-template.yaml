@@ -1,0 +1,304 @@
+minimumLimaVersion: "2.2.0"
+
+# This is the controller-owned source for disposable clones. It is never a job runner itself.
+# One dated image and one pinned runner archive keep template construction fail-closed.
+images:
+  - location: https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc
+    variant: server
+
+vmType: vz
+arch: aarch64
+plain: true
+
+# Disposable clones may only increase these values through the durable reservation.
+cpus: 2
+memory: 2GiB
+disk: 20GiB
+
+# Lima owns this SSH/control account. Repository code runs only as the separate locked account.
+user:
+  name: smolrunner-admin
+  comment: SmolRunner controller
+  home: /home/smolrunner-admin
+  shell: /bin/bash
+  uid: 1000
+  passwordlessSudo: true
+
+mounts: []
+networks: []
+portForwards: []
+
+ssh:
+  localPort: 0
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+  overVsock: true
+
+# Do not resolve through the Mac, its VPN, or mDNS. Ordinary build DNS goes only to these
+# reviewed public resolvers; the later runtime network gate will separately deny private/LAN egress.
+hostResolver:
+  enabled: false
+dns:
+  - 1.1.1.1
+  - 1.0.0.1
+
+containerd:
+  system: false
+  user: false
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: false
+      binfmt: false
+
+video:
+  display: none
+
+propagateProxyEnv: false
+
+# Lima plain mode deliberately retains system provisioning. This fixed script consumes no
+# repository input, downloads only the pinned official runner, verifies size and SHA-256 before
+# extraction, runs the archive's official dependency installer, and creates the non-sudo workload
+# account used by the later JIT boundary.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+      export LC_ALL=C
+      umask 022
+
+      readonly runner_user="smolrunner-runner"
+      readonly runner_guard_group="smolrunner-runner-guard"
+      readonly runner_home="/var/lib/smolrunner-runner"
+      readonly install_parent="/opt/smolrunner"
+      readonly install_dir="${install_parent}/actions-runner"
+      readonly install_stage="${install_parent}/actions-runner.staging"
+      readonly runner_work="${install_dir}/_work"
+      readonly runner_diag="${install_dir}/_diag"
+      readonly launcher_dir="${install_parent}/bin"
+      readonly jit_launcher="${launcher_dir}/smolrunner-jit-launcher"
+      readonly jit_launcher_stage="/var/tmp/smolrunner-jit-launcher.new"
+      readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
+      readonly integrity_verifier="${launcher_dir}/smolrunner-runner-integrity"
+      readonly integrity_verifier_stage="${integrity_verifier}.new"
+      readonly integrity_verifier_sha256="d8ee50c0981fb6eec4fdc957491e492f3a5befc7153b8916466627c9812a379f"
+      readonly marker_dir="/etc/smolrunner"
+      readonly runner_entries="${marker_dir}/actions-runner.entries"
+      readonly runner_entries_stage="${runner_entries}.new"
+      readonly runner_checksums="${marker_dir}/actions-runner.sha256"
+      readonly runner_checksums_stage="${runner_checksums}.new"
+      readonly archive="/var/tmp/actions-runner-linux-arm64-2.336.0.tar.gz"
+      readonly runner_url="https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-arm64-2.336.0.tar.gz"
+      readonly runner_bytes="138824064"
+      readonly runner_sha256="58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
+      readonly marker="${marker_dir}/prepared-template.json"
+      readonly apt_policy="/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
+      readonly suid_dumpable_policy="/etc/sysctl.d/99-smolrunner-runner-secrets.conf"
+
+      if [[ "$(/usr/bin/id -u)" != "0" ]]; then
+        echo "prepared-template provisioning requires root" >&2
+        exit 1
+      fi
+
+      verify_automatic_updates_disabled() {
+        /usr/bin/grep --fixed-strings --line-regexp 'APT::Periodic::Enable "0";' "${apt_policy}" >/dev/null
+        /usr/bin/grep --fixed-strings --line-regexp 'APT::Periodic::Update-Package-Lists "0";' "${apt_policy}" >/dev/null
+        /usr/bin/grep --fixed-strings --line-regexp 'APT::Periodic::Unattended-Upgrade "0";' "${apt_policy}" >/dev/null
+        for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+          [[ "$(/usr/bin/systemctl is-enabled "${unit}" 2>/dev/null)" == "masked" ]]
+        done
+      }
+
+      /usr/bin/systemctl mask --now \
+        apt-daily.timer \
+        apt-daily-upgrade.timer \
+        apt-daily.service \
+        apt-daily-upgrade.service
+      /usr/bin/install -o root -g root -m 0644 /dev/null "${apt_policy}"
+      /usr/bin/printf '%s\n' \
+        'APT::Periodic::Enable "0";' \
+        'APT::Periodic::Update-Package-Lists "0";' \
+        'APT::Periodic::Unattended-Upgrade "0";' \
+        >"${apt_policy}"
+      verify_automatic_updates_disabled
+
+      if /usr/bin/getent passwd "${runner_user}" >/dev/null; then
+        IFS=: read -r _ _ _ _ _ existing_home existing_shell < <(/usr/bin/getent passwd "${runner_user}")
+        [[ "${existing_home}" == "${runner_home}" && "${existing_shell}" == "/bin/bash" ]]
+      else
+        /usr/sbin/useradd \
+          --system \
+          --create-home \
+          --home-dir "${runner_home}" \
+          --shell /bin/bash \
+          --user-group \
+          "${runner_user}"
+      fi
+      /usr/bin/passwd --lock "${runner_user}" >/dev/null
+      if ! /usr/bin/getent group "${runner_guard_group}" >/dev/null; then
+        /usr/sbin/groupadd --system "${runner_guard_group}"
+      fi
+      [[ -z "$(/usr/bin/getent group "${runner_guard_group}" | /usr/bin/cut --delimiter=: --fields=4)" ]]
+      /usr/bin/install -o root -g root -m 0644 /dev/null "${suid_dumpable_policy}"
+      /usr/bin/printf '%s\n' 'fs.suid_dumpable = 0' >"${suid_dumpable_policy}"
+      /usr/sbin/sysctl --load "${suid_dumpable_policy}" >/dev/null
+      [[ "$(/usr/bin/id -Gn "${runner_user}")" == "${runner_user}" ]]
+
+      verify_runner_secret_protection() {
+        [[ "$(/usr/sbin/sysctl -n fs.suid_dumpable)" == "0" ]]
+        local listener_mount_options
+        listener_mount_options="$(/usr/bin/findmnt --noheadings --output OPTIONS --target "${install_dir}/bin/Runner.Listener")"
+        [[ -n "${listener_mount_options}" ]]
+        ! /usr/bin/grep --quiet --word-regexp nosuid <<<"${listener_mount_options}"
+        [[ "$(/usr/bin/stat --format=%U:%G:%a "${install_dir}/bin/Runner.Listener")" == "root:${runner_guard_group}:2755" ]]
+      }
+
+      verify_runner_install() {
+        [[ "$(${integrity_verifier})" == "smolrunner-runner-integrity-ok" ]]
+      }
+
+      /usr/bin/install -d -o root -g root -m 0755 \
+        "${install_parent}" "${launcher_dir}" "${marker_dir}"
+      /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 \
+        "${runner_home}"
+
+      /usr/bin/printf '%s' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyIgpyZWFkb25seSBlbnRyaWVzPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuZW50cmllcyIKcmVhZG9ubHkgY2hlY2tzdW1zPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iJHtpbnN0YWxsX2Rpcn0vX3dvcmsiCnJlYWRvbmx5IHJ1bm5lcl9ndWFyZF9ncm91cD0ic21vbHJ1bm5lci1ydW5uZXItZ3VhcmQiCnJlYWRvbmx5IHJ1bm5lcl9kaWFnPSIke2luc3RhbGxfZGlyfS9fZGlhZyIKcmVhZG9ubHkgaml0X2xhdW5jaGVyPSIvb3B0L3Ntb2xydW5uZXIvYmluL3Ntb2xydW5uZXItaml0LWxhdW5jaGVyIgpyZWFkb25seSBqaXRfbGF1bmNoZXJfc2hhMjU2PSI2ZjA5NmZiNTE4YjZkNDBkNDVjYTFhOTkyM2U0MjNkYTQzNmI2MjY5ZmNlZWM1YTU5ODk1NjZhYmJjOTNhNzZhIgoKW1sgIiQoL3Vzci9iaW4vaWQgLXUpIiA9PSAiMCIgXV0KW1sgIiQoL3Vzci9zYmluL3N5c2N0bCAtbiBmcy5zdWlkX2R1bXBhYmxlKSIgPT0gIjAiIF1dCmxpc3RlbmVyX21vdW50X29wdGlvbnM9IiQoL3Vzci9iaW4vZmluZG1udCAtLW5vaGVhZGluZ3MgLS1vdXRwdXQgT1BUSU9OUyAtLXRhcmdldCAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIgpyZWFkb25seSBsaXN0ZW5lcl9tb3VudF9vcHRpb25zCltbIC1uICIke2xpc3RlbmVyX21vdW50X29wdGlvbnN9IiBdXQohIC91c3IvYmluL2dyZXAgLS1xdWlldCAtLXdvcmQtcmVnZXhwIG5vc3VpZCA8PDwiJHtsaXN0ZW5lcl9tb3VudF9vcHRpb25zfSIKW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYSAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIiA9PSAicm9vdDoke3J1bm5lcl9ndWFyZF9ncm91cH06Mjc1NSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtpbnN0YWxsX2Rpcn0iKSIgPT0gInJvb3Q6c21vbHJ1bm5lci1ydW5uZXI6MTc3NTpkaXJlY3RvcnkiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7ZW50cmllc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2NoZWNrc3Vtc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2ppdF9sYXVuY2hlcn0iKSIgPT0gInJvb3Q6cm9vdDo3NTU6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke3J1bm5lcl93b3JrfSIpIiA9PSAic21vbHJ1bm5lci1ydW5uZXI6c21vbHJ1bm5lci1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtydW5uZXJfZGlhZ30iKSIgPT0gInNtb2xydW5uZXItcnVubmVyOnNtb2xydW5uZXItcnVubmVyOjc1MDpkaXJlY3RvcnkiIF1dCgppZiAvdXNyL2Jpbi9maW5kIC1QICIke2luc3RhbGxfZGlyfSIgLXhkZXYgLW1pbmRlcHRoIDEgXAogIFwoIC1wYXRoICIke3J1bm5lcl93b3JrfSIgLW8gLXBhdGggIiR7cnVubmVyX2RpYWd9IiBcKSAtcHJ1bmUgLW8gXAogICEgLXVzZXIgcm9vdCAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKaWYgL3Vzci9iaW4vZmluZCAtUCAiJHtpbnN0YWxsX2Rpcn0iIC14ZGV2IC1taW5kZXB0aCAxIFwKICBcKCAtcGF0aCAiJHtydW5uZXJfd29ya30iIC1vIC1wYXRoICIke3J1bm5lcl9kaWFnfSIgXCkgLXBydW5lIC1vIFwKICAhIC10eXBlIGwgLXBlcm0gLzAyMiAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vZmluZCAtUCAuIC14ZGV2IC1taW5kZXB0aCAxIC1wcmludGYgJyV5ICVtICVQICVsXG4nIHwgL3Vzci9iaW4vc29ydAopIHwgL3Vzci9iaW4vY21wIC0tc2lsZW50IC0gIiR7ZW50cmllc30iCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vc2hhMjU2c3VtIC0tY2hlY2sgLS1zdHJpY3QgLS1xdWlldCAiJHtjaGVja3N1bXN9IgopCi91c3IvYmluL3ByaW50ZiAnJXNcbicgIiR7aml0X2xhdW5jaGVyX3NoYTI1Nn0gICR7aml0X2xhdW5jaGVyfSIgfCAvdXNyL2Jpbi9zaGEyNTZzdW0gLS1jaGVjayAtLXN0YXR1cwoKL3Vzci9iaW4vcHJpbnRmICclc1xuJyAnc21vbHJ1bm5lci1ydW5uZXItaW50ZWdyaXR5LW9rJwo=' \
+        | /usr/bin/base64 --decode >"${integrity_verifier_stage}"
+      /usr/bin/printf '%s  %s\n' "${integrity_verifier_sha256}" "${integrity_verifier_stage}" \
+        | /usr/bin/sha256sum --check --status
+      /usr/bin/install -o root -g root -m 0755 "${integrity_verifier_stage}" "${integrity_verifier}"
+      /usr/bin/rm -f -- "${integrity_verifier_stage}"
+
+      if [[ -f "${marker}" && -x "${install_dir}/bin/Runner.Listener" ]]; then
+        /usr/bin/cmp --silent "${marker}" <(/usr/bin/printf '%s\n' \
+          '{' \
+          '  "schema_version": 2,' \
+          '  "actions_runner_version": "2.336.0",' \
+          '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
+          '  "workload_user": "smolrunner-runner",' \
+          '  "runner_listener_protection": "setgid_nondumpable",' \
+          '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
+          '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
+          '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
+          '  "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"' \
+          '}')
+        verify_runner_install
+        verify_runner_secret_protection
+        verify_automatic_updates_disabled
+        exit 0
+      fi
+
+      if [[ -e "${install_dir}" || -L "${install_dir}" ]]; then
+        echo "runner installation exists without the exact readiness marker" >&2
+        exit 1
+      fi
+
+      /usr/bin/rm -rf -- "${install_stage}"
+      /usr/bin/rm -f -- "${archive}"
+      /usr/bin/curl \
+        --proto '=https' \
+        --tlsv1.2 \
+        --fail \
+        --location \
+        --retry 8 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --retry-max-time 300 \
+        --max-time 300 \
+        --connect-timeout 30 \
+        --speed-limit 1024 \
+        --speed-time 60 \
+        --continue-at - \
+        --silent \
+        --show-error \
+        --output "${archive}" \
+        "${runner_url}"
+      [[ "$(/usr/bin/stat --format=%s "${archive}")" == "${runner_bytes}" ]]
+      /usr/bin/printf '%s  %s\n' "${runner_sha256}" "${archive}" \
+        | /usr/bin/sha256sum --check --status
+
+      /usr/bin/install -d -o root -g root -m 0755 "${install_stage}"
+      /usr/bin/tar \
+        --extract \
+        --gzip \
+        --no-same-owner \
+        --file "${archive}" \
+        --directory "${install_stage}"
+      [[ -x "${install_stage}/bin/Runner.Listener" ]]
+      [[ -x "${install_stage}/bin/installdependencies.sh" ]]
+      /usr/bin/env -i \
+        DEBIAN_FRONTEND=noninteractive \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        "${install_stage}/bin/installdependencies.sh"
+      /usr/bin/chown -R root:root "${install_stage}"
+      /usr/bin/chown root:"${runner_user}" "${install_stage}"
+      /usr/bin/chmod 1775 "${install_stage}"
+      # A distinct setgid identity makes Linux mark the listener non-dumpable at exec.
+      # With fs.suid_dumpable=0, same-UID workflow processes cannot read its JIT environment.
+      /usr/bin/chown root:"${runner_guard_group}" "${install_stage}/bin/Runner.Listener"
+      /usr/bin/chmod 2755 "${install_stage}/bin/Runner.Listener"
+      /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 \
+        "${install_stage}/_work" "${install_stage}/_diag"
+      (
+        cd "${install_stage}"
+        /usr/bin/find -P . -xdev -mindepth 1 -printf '%y %m %P %l\n' | /usr/bin/sort
+      ) >"${runner_entries_stage}"
+      (
+        cd "${install_stage}"
+        /usr/bin/find -P . -xdev -type f -print0 \
+          | /usr/bin/sort --zero-terminated \
+          | /usr/bin/xargs --null /usr/bin/sha256sum
+      ) >"${runner_checksums_stage}"
+      /usr/bin/mv -- "${install_stage}" "${install_dir}"
+      /usr/bin/install -o root -g root -m 0444 "${runner_entries_stage}" "${runner_entries}"
+      /usr/bin/install -o root -g root -m 0444 "${runner_checksums_stage}" "${runner_checksums}"
+      /usr/bin/rm -f -- "${runner_entries_stage}" "${runner_checksums_stage}"
+      /usr/bin/rm -f -- "${archive}"
+
+      /usr/bin/printf '%s' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCnJlYWRvbmx5IHJ1bm5lcl9saXN0ZW5lcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyL2Jpbi9SdW5uZXIuTGlzdGVuZXIiCnJlYWRvbmx5IG1heF9qaXRfYnl0ZXM9NjU1MzYKCnVtYXNrIDA3NwpqaXRfY29uZmlnPSIiCklGUz0gcmVhZCAtciBqaXRfY29uZmlnIHx8IGV4aXQgNjQKW1sgLW4gIiR7aml0X2NvbmZpZ30iICYmICR7I2ppdF9jb25maWd9IC1sZSAke21heF9qaXRfYnl0ZXN9IF1dCltbICIke2ppdF9jb25maWd9IiA9fiBeW0EtWmEtejAtOSsvPV8tXSskIF1dCmlmIElGUz0gcmVhZCAtciBfOyB0aGVuCiAgZXhpdCA2NApmaQoKZXhwb3J0IEFDVElPTlNfUlVOTkVSX0lOUFVUX0pJVENPTkZJRz0iJHtqaXRfY29uZmlnfSIKZXhlYyAiJHtydW5uZXJfbGlzdGVuZXJ9IiBydW4gLS1zdGFydHVwdHlwZSBzZXJ2aWNlCg==' \
+        | /usr/bin/base64 --decode >"${jit_launcher_stage}"
+      /usr/bin/printf '%s  %s\n' "${jit_launcher_sha256}" "${jit_launcher_stage}" \
+        | /usr/bin/sha256sum --check --status
+      /usr/bin/install -o root -g root -m 0755 "${jit_launcher_stage}" "${jit_launcher}"
+      /usr/bin/rm -f -- "${jit_launcher_stage}"
+
+      verify_runner_install
+      verify_runner_secret_protection
+      verify_automatic_updates_disabled
+
+      readonly marker_stage="${marker}.new"
+      /usr/bin/printf '%s\n' \
+        '{' \
+        '  "schema_version": 2,' \
+        '  "actions_runner_version": "2.336.0",' \
+        '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
+        '  "workload_user": "smolrunner-runner",' \
+        '  "runner_listener_protection": "setgid_nondumpable",' \
+        '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
+        '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
+        '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
+        '  "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"' \
+        '}' >"${marker_stage}"
+      /usr/bin/chown root:root "${marker_stage}"
+      /usr/bin/chmod 0444 "${marker_stage}"
+      /usr/bin/mv -- "${marker_stage}" "${marker}"
+
+probes:
+  - mode: readiness
+    description: pinned SmolRunner Actions runner is prepared
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      /usr/bin/test -r /etc/smolrunner/prepared-template.json
+      /usr/bin/test -x /opt/smolrunner/actions-runner/bin/Runner.Listener
+      /usr/bin/test -x /opt/smolrunner/bin/smolrunner-jit-launcher
+      /usr/bin/test "$(/usr/bin/id -Gn smolrunner-runner)" = "smolrunner-runner"

@@ -4,7 +4,9 @@ This document defines the Linux-only trusted producer that supplies runner works
 
 ## Authority boundary
 
-The only public acquisition function uses SmolRunner's canonical state root at `/var/lib/smolrunner` and accepts one `ProjectIdentity` lookup key. Repository code cannot select a state root, installation ID, record filename, workspace path, cache path, workspace ID, cache ID, namespace digest, or evidence digest.
+The only public acquisition function uses Glaeda's current canonical state root at `/var/lib/glaeda` and accepts one `ProjectIdentity` lookup key. It derives both that fixed root and the `GlaedaV2` workspace/cache identity generation from the same closed current-root selection. The legacy `/var/lib/smolrunner` root remains a distinct explicit generation and cannot be relabelled with current Glaeda identity. The acquisition API exposes no selector for a state root, installation ID, record filename, workspace path, cache path, workspace ID, cache ID, namespace digest, or evidence digest.
+
+There is no root-presence probe, fallback, merge, copy, migration, or adoption path. In particular, a missing current root never causes the producer to open legacy state, and this producer grants no authority to retire legacy state.
 
 The producer performs no readiness decision. It does not execute a process, read credentials, create or delete a cache, clean or reset a workspace, publish evidence, access a browser or network, or grant mutation authority.
 

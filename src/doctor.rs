@@ -19,7 +19,7 @@ pub fn inspect_host() -> DoctorReport {
 #[must_use]
 pub fn render_human(report: &DoctorReport) -> String {
     let mut output = String::new();
-    output.push_str("SmolRunner doctor\n\n");
+    output.push_str("Glaeda doctor\n\n");
 
     for check in &report.checks {
         let marker = match check.status {
@@ -51,7 +51,7 @@ fn check_operating_system() -> Check {
             "operating-system",
             CheckStatus::Fail,
             format!("unsupported host operating system: {}", env::consts::OS),
-            Some("The first SmolRunner host target is Linux.".to_owned()),
+            Some("The first Glaeda host target is Linux.".to_owned()),
         )
     }
 }

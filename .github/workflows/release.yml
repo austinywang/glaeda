@@ -1,0 +1,129 @@
+name: Release
+
+# Every push to main becomes one durable release and the new canary (#525, docs/GLAEDA_OTA.md).
+# glaeda-update on canary hosts installs it within the hour; promote.yml moves it to stable.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # only main of this repository publishes (the manaflow-ai/glaeda mirror copies, never builds);
+    # a dispatch on another ref must never reach a host
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+      - name: Fleet candidate bundle
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output release-assets
+      - name: Hygiene tools archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --bin glaeda-worktree-reclaim --target "$TARGET"
+          python3 scripts/glaeda_release.py hygiene --source "$GITHUB_SHA" --target "$TARGET" \
+            --reclaim "target/$TARGET/release/glaeda-worktree-reclaim" --output release-assets
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-${{ matrix.target }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+    # canary.json has this one writer; a newer push waiting here supersedes an older pending one
+    concurrency:
+      group: ota-canary
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+          fetch-depth: 0  # canary only moves forward: the ancestry check needs history
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Release manifest
+        id: manifest
+        run: |
+          tag=$(python3 scripts/glaeda_release.py tag --source "$GITHUB_SHA")
+          python3 scripts/glaeda_release.py manifest --source "$GITHUB_SHA" --tag "$tag" --assets release-assets
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          cat release-assets/release.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: release-assets/*
+      - name: Publish the release
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # a re-run of the same commit: same tag, replace the assets
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "$TAG" --notes "glaeda $GITHUB_SHA. Installed by glaeda-update on the canary ring first (docs/GLAEDA_OTA.md)."
+          fi
+      - name: Move canary to it
+        run: |
+          mkdir -p channels
+          if ! gh release view ota-channels >/dev/null 2>&1; then
+            python3 scripts/glaeda_release.py control --paused false > channels/control.json
+            gh release create ota-channels channels/control.json --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "OTA channels" --notes "canary.json, stable.json, control.json: what each glaeda-update ring installs (docs/GLAEDA_OTA.md)."
+          fi
+          if gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
+            previous=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
+            set +e
+            git merge-base --is-ancestor "$previous" "$GITHUB_SHA"
+            descends=$?
+            set -e
+            if [ "$descends" = 1 ]; then
+              echo "canary stays at $previous: $GITHUB_SHA does not descend from it" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            elif [ "$descends" != 0 ]; then
+              echo "canary commit $previous is not in main's history (rewritten?); fix canary.json by hand" >&2
+              exit 1
+            fi
+          elif ! grep -q "no assets match" channels/err; then
+            cat channels/err; exit 1
+          fi
+          python3 scripts/glaeda_release.py canary --release release-assets/release.json > channels/next.json
+          mv channels/next.json channels/canary.json
+          gh release upload ota-channels channels/canary.json --clobber
+          cat channels/canary.json >> "$GITHUB_STEP_SUMMARY"

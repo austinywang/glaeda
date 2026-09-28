@@ -1,0 +1,13 @@
+#!/bin/bash
+# launchd entry point for a fleet-cas service: exec fleet-cas with the role's
+# arguments from $ROOT/run/ROLE.args (one per line, written by glaeda-fleet-cas),
+# recording the PID so the installer can restart it without root.
+set -u
+role=${1:?usage: fleet-cas-run ROLE}
+ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
+args=()
+while IFS= read -r a; do args+=("$a"); done <"$ROOT/run/$role.args" || exit 1
+# Record the pid and the binary it runs, so the installer can restart a stale one.
+echo $$ >"$ROOT/run/$role.pid"
+shasum -a 256 "$ROOT/bin/fleet-cas" | cut -c1-64 >"$ROOT/run/$role.bin"
+exec "$ROOT/bin/fleet-cas" "${args[@]}"

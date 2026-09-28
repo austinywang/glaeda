@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "actions_runner": {
+    "version": "2.336.0",
+    "architecture": "x64",
+    "location": "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz",
+    "archive_sha256": "sha256:04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
+  },
+  "task": {
+    "profile": "github-actions-trusted-v1",
+    "network": "github_actions_trusted_egress",
+    "network_authority": {
+      "document_type": "glaeda-owned-linux-egress-authority",
+      "enforcement": "external_reviewed_host_firewall_or_gateway",
+      "private_or_link_local_egress": false,
+      "root_owned_mode": "0400-or-0444",
+      "exact_path_and_sha256_required": true
+    },
+    "cpu_quota_percent": 400,
+    "memory_max_bytes": 8589934592,
+    "memory_swap_max_bytes": 0,
+    "tasks_max": 1024,
+    "max_deadline_seconds": 21600
+  },
+  "trust": {
+    "repository_jobs": "owner_trusted_internal_only",
+    "fork_pull_requests": false,
+    "host_container_socket": false,
+    "sudo_or_admin": false,
+    "control_credentials": false,
+    "publisher_credentials": false,
+    "ssh_agent": false
+  },
+  "canary": {
+    "repository": "teamleaderleo/glaeda",
+    "runner_label": "big-red-owned-linux",
+    "workflow": ".github/workflows/big-red-jit-canary.yml"
+  }
+}

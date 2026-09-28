@@ -7,7 +7,7 @@ repo_url="${SMOLRUNNER_REPO_URL:-https://github.com/teamleaderleo/smolrunner.git
 repo_ref="${SMOLRUNNER_REPO_REF:-main}"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
-config="${SMOLRUNNER_LIMA_CONFIG:-${repo_root}/examples/lima/smolrunner-interactive.yaml}"
+config="${SMOLRUNNER_LIMA_CONFIG:-${repo_root}/examples/lima/glaeda-interactive.yaml}"
 
 usage() {
   cat <<'USAGE'
@@ -219,7 +219,7 @@ socket_is_listening() {
   '
 }
 
-# SmolRunner invokes rootless Podman directly. Do not keep an unused
+# Glaeda invokes rootless Podman directly. Do not keep an unused
 # privileged API socket or tag-based auto-update path enabled.
 sudo systemctl disable --now \
   podman.socket \

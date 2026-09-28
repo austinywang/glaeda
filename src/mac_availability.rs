@@ -74,7 +74,7 @@ pub const ACTIVE_PROFILE: MacVmProfile = MacVmProfile {
 
 pub const AWAY_PROFILE: MacVmProfile = MacVmProfile {
     cpus: 8,
-    memory_mib: 8 * 1024,
+    memory_mib: 10 * 1024,
     max_concurrent_jobs: 1,
 };
 
@@ -643,6 +643,19 @@ mod tests {
                 AvailabilityActionKind::VerifyTransition,
             ]
         );
+    }
+
+    #[test]
+    fn away_profile_matches_the_accepted_work_envelope() {
+        let plan = plan_availability_transition(
+            observation(EffectiveAvailabilityMode::Off),
+            AvailabilityRequest::Away,
+        );
+        let profile = plan.target_profile.expect("away mode has a target profile");
+
+        assert_eq!(profile.cpus, 8);
+        assert_eq!(profile.memory_mib, 10 * 1024);
+        assert_eq!(profile.max_concurrent_jobs, 1);
     }
 
     #[test]

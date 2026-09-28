@@ -1,7 +1,7 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-pub use smolrunner::{
+pub use glaeda::{
     actions_runner_readiness, artifact, execution_admission, lima_observation, mac_availability,
     operator_config, operator_error, operator_status, personal_worker_operator_read,
     personal_worker_queue, personal_worker_read_model, personal_worker_store,
@@ -16,53 +16,53 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use operator_status_service::{
-    OperatorStatusEvidenceReader, OperatorStatusService, OperatorStatusServiceErrorKind,
-    OperatorStatusServiceEvidence, OperatorStatusTerminalEvidence, OperatorStatusWorkerEvidence,
-};
-use smolrunner::actions_runner_readiness::{
+use glaeda::actions_runner_readiness::{
     ACTIONS_RUNNER_READINESS_SCHEMA_VERSION, ActionsRunnerConfiguredIdentity, ActionsRunnerName,
     ActionsRunnerReadinessReport, ActionsRunnerReadinessState,
 };
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
     ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
-use smolrunner::lima_observation::{
+use glaeda::lima_observation::{
     LIMA_OBSERVATION_SCHEMA_VERSION, LimaArchitecture, LimaConfiguredInstance,
     LimaFilesystemObjectIdentity, LimaGuestObservation, LimaGuestResources, LimaInstanceName,
     LimaInstanceObservationReport, LimaObservationFreshness, LimaObservationTiming,
     LimaObservedGuest, LimaPersistentIdentity, LimaRuntimeState, LimaVmType,
 };
-use smolrunner::mac_availability::AvailabilityRequest;
-use smolrunner::operator_config::{
+use glaeda::mac_availability::AvailabilityRequest;
+use glaeda::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
-use smolrunner::operator_error::{OperatorErrorCode, OperatorPublicError};
-use smolrunner::operator_status::{
+use glaeda::operator_error::{OperatorErrorCode, OperatorPublicError};
+use glaeda::operator_status::{
     OperatorConfigurationCompatibility, OperatorStatusDisposition, OperatorTerminalResult,
 };
-use smolrunner::personal_worker_operator_read::{
+use glaeda::personal_worker_operator_read::{
     PersonalWorkerOperatorJobRead, PersonalWorkerOperatorReadService,
     PersonalWorkerOperatorStatusRead,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
     PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
     PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_read_model::PersonalWorkerJobReadRequest;
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_read_model::PersonalWorkerJobReadRequest;
+use glaeda::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
     PersonalWorkerTerminalTombstone,
 };
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use operator_status_service::{
+    OperatorStatusEvidenceReader, OperatorStatusService, OperatorStatusServiceErrorKind,
+    OperatorStatusServiceEvidence, OperatorStatusTerminalEvidence, OperatorStatusWorkerEvidence,
+};
 
 const BASE_MILLIS: u64 = 5_000_000;
 const GIB: u64 = 1_024 * 1_024 * 1_024;

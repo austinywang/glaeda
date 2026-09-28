@@ -12,47 +12,46 @@ use std::time::Duration;
 
 mod lima_host_identity_support;
 
-use lima_host_identity_support::{LimaHostIdentityFixture, rewrite_disk_identity};
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput, ExecutionAdmissionRecord,
     ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
     ReservationGeneration, ReservationId, RunnerProfileId,
 };
-use smolrunner::lima_lifecycle::{
+use glaeda::lima_lifecycle::{
     LimaCacheDiskId, LimaCacheDiskIdentity, LimaInstanceId, LimaInstanceIdentity,
     LimaLifecycleObservation, LimaLifecycleObservationDefinition, LimaLifecyclePolicy,
     LimaLifecycleState, LimaObservedResources, LimaProfileGeneration, LimaResourceProfile,
 };
-use smolrunner::lima_lifecycle_executor::{
+use glaeda::lima_lifecycle_executor::{
     LimaLifecycleExecutionAction, LimaLifecycleExecutionPhase, LimaLifecycleExecutionRefusalCode,
     LimaLifecycleExecutor,
 };
-use smolrunner::lima_observation::{
+use glaeda::lima_observation::{
     LimaArchitecture, LimaInstanceName, LimaObservationAdapter, LimaObservationRequest, LimaVmType,
 };
-use smolrunner::mac_availability::{
+use glaeda::mac_availability::{
     AvailabilityRequest, EffectiveAvailabilityMode, HostPowerSource, JobActivity,
     MacAvailabilityObservation, MemoryPressure, ObservationFreshness, VmPowerState,
 };
-use smolrunner::operator_config::{
+use glaeda::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
-use smolrunner::personal_worker_lima_adapter::{
+use glaeda::personal_worker_lima_adapter::{
     PERSONAL_WORKER_LIMA_ADAPTER_SCHEMA_VERSION, PersonalWorkerLimaAdapter,
     PersonalWorkerLimaInput, PersonalWorkerLimaRefusalCode,
 };
-use smolrunner::personal_worker_lima_authority::{
+use glaeda::personal_worker_lima_authority::{
     PersonalWorkerLimaAttemptPhase, PersonalWorkerLimaAuthorityDocument,
     PersonalWorkerLimaRecoveryDisposition, personal_worker_lima_enrollment_confirmation,
 };
-use smolrunner::personal_worker_mac_observation::{
+use glaeda::personal_worker_mac_observation::{
     PersonalWorkerMacObservation, PersonalWorkerMacObservationAdapter,
     PersonalWorkerMacObservationClock,
 };
-use smolrunner::personal_worker_queue::{
+use glaeda::personal_worker_queue::{
     PERSONAL_WORKER_QUEUE_SCHEMA_VERSION, PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
     PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES, PersonalWorkerActiveReservation,
     PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
@@ -60,19 +59,20 @@ use smolrunner::personal_worker_queue::{
     PersonalWorkerProfile, PersonalWorkerProfileObservation, PersonalWorkerQueueDecision,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStoreDocument, PersonalWorkerStoreRevision,
 };
-use smolrunner::personal_worker_tick::{
+use glaeda::personal_worker_tick::{
     PersonalWorkerTickAction, PersonalWorkerTickInput, PersonalWorkerTickPlan,
     PersonalWorkerTickPolicy,
 };
-use smolrunner::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
-use smolrunner::unix_personal_worker_store::lima_authority::{
+use glaeda::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::unix_personal_worker_store::lima_authority::{
     UnixPersonalWorkerLimaAuthorityErrorKind, UnixPersonalWorkerLimaAuthorityGuard,
 };
-use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+use glaeda::verification_profile::{CacheId, VerificationProfileId};
+use lima_host_identity_support::{LimaHostIdentityFixture, rewrite_disk_identity};
 
 const CACHE_PATH: &str = "/home/runner/.cache/cargo";
 const LIMACTL: &str = "/opt/homebrew/bin/limactl";
@@ -678,14 +678,14 @@ fn lifecycle_tick(
         operator_hold: false,
     };
     let runner = running.then(|| {
-        smolrunner::personal_worker_host_broker::HostBrokerRunnerObservation::new(
+        glaeda::personal_worker_host_broker::HostBrokerRunnerObservation::new(
             broker_identity().instance_id().clone(),
             lifecycle.profile_generation(),
             epoch(decision_at - 100),
             if matches!(case, LifecycleCase::StopOnly) {
-                smolrunner::personal_worker_host_broker::HostBrokerRunnerState::Offline
+                glaeda::personal_worker_host_broker::HostBrokerRunnerState::Offline
             } else {
-                smolrunner::personal_worker_host_broker::HostBrokerRunnerState::IdleReady
+                glaeda::personal_worker_host_broker::HostBrokerRunnerState::IdleReady
             },
         )
     });
@@ -884,8 +884,8 @@ fn execute_start(
     commands: &ScriptedExecutor,
     clock: &impl PersonalWorkerMacObservationClock,
 ) -> Result<
-    smolrunner::personal_worker_lima_adapter::PersonalWorkerLimaExecution,
-    smolrunner::personal_worker_lima_adapter::PersonalWorkerLimaFailure,
+    glaeda::personal_worker_lima_adapter::PersonalWorkerLimaExecution,
+    glaeda::personal_worker_lima_adapter::PersonalWorkerLimaFailure,
 > {
     PersonalWorkerLimaAdapter.execute(
         PersonalWorkerLimaInput {
@@ -906,7 +906,7 @@ fn execute_start(
 }
 
 fn assert_public_failure_is_private(
-    failure: &smolrunner::personal_worker_lima_adapter::PersonalWorkerLimaFailure,
+    failure: &glaeda::personal_worker_lima_adapter::PersonalWorkerLimaFailure,
     setup: &Setup,
 ) {
     let public = serde_json::to_string(failure).expect("public failure JSON");
@@ -1155,7 +1155,7 @@ fn held_host_identity_drift_refuses_before_prepared_or_command() {
     assert_eq!(
         error.observation_kind,
         Some(
-            smolrunner::personal_worker_mac_observation::PersonalWorkerMacObservationErrorKind::LimaHostIdentityEvidence
+            glaeda::personal_worker_mac_observation::PersonalWorkerMacObservationErrorKind::LimaHostIdentityEvidence
         )
     );
     assert!(commands.seen.borrow().is_empty());
@@ -1195,7 +1195,7 @@ fn composite_reconfirms_host_identity_before_the_next_command() {
     assert_eq!(
         error.observation_kind,
         Some(
-            smolrunner::personal_worker_mac_observation::PersonalWorkerMacObservationErrorKind::LimaHostIdentityEvidence
+            glaeda::personal_worker_mac_observation::PersonalWorkerMacObservationErrorKind::LimaHostIdentityEvidence
         )
     );
     let mutations = commands

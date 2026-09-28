@@ -1,10 +1,10 @@
-use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
-use smolrunner::execution_admission::{
+use glaeda::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use glaeda::execution_admission::{
     ExecutionAdmissionIdentity, ExecutionRequestId, RunnerProfileId,
 };
-use smolrunner::renderprove_vision_profile::*;
-use smolrunner::renderprove_vision_result::*;
-use smolrunner::verification_profile::{
+use glaeda::renderprove_vision_profile::*;
+use glaeda::renderprove_vision_result::*;
+use glaeda::verification_profile::{
     ConcurrencyPolicy, MemoryPolicy, RepositoryCommandId, RepositoryCommandIdentity,
     ResourceDefaults, TestedSourceIdentity, TimeoutPolicy, VerificationProfileId,
 };

@@ -89,8 +89,8 @@ for image in "${images[@]}"; do
   docker run --rm \
     --tmpfs /run:rw,nosuid,nodev,mode=0755 \
     --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
-    --mount "type=bind,src=$linux_acceptance_binary,dst=/usr/local/bin/smolrunner-linux-acceptance,readonly" \
-    --mount "type=bind,src=$host_prepare_acceptance_binary,dst=/usr/local/bin/smolrunner-host-prepare-acceptance,readonly" \
+    --mount "type=bind,src=$linux_acceptance_binary,dst=/usr/local/bin/glaeda-linux-acceptance,readonly" \
+    --mount "type=bind,src=$host_prepare_acceptance_binary,dst=/usr/local/bin/glaeda-host-prepare-acceptance,readonly" \
     --env SMOLRUNNER_LINUX_ACCEPTANCE=1 \
     --env "SMOLRUNNER_EXPECTED_OS=$expected_os" \
     "$image" \
@@ -107,7 +107,7 @@ for image in "${images[@]}"; do
         uidmap \
         util-linux
       rm -rf /var/lib/apt/lists/*
-      /usr/local/bin/smolrunner-linux-acceptance --test-threads=1 --nocapture
-      /usr/local/bin/smolrunner-host-prepare-acceptance --test-threads=1 --nocapture
+      /usr/local/bin/glaeda-linux-acceptance --test-threads=1 --nocapture
+      /usr/local/bin/glaeda-host-prepare-acceptance --test-threads=1 --nocapture
     '
 done

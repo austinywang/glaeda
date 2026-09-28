@@ -1,6 +1,17 @@
-# Implementation capability map
+# Implementation capability map (retired)
 
-> **Product-direction note:** the critical path is now [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md). Existing R01 modules remain reviewed optional hardening/future Linux-container work; their listed "missing integration proof" cells are not an instruction to add more R01 slices before the disposable Lima/JIT path is complete.
+> **Retired 2026-09-22.** This map was hand-written against exact base
+> `3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae` (2026-07-28) and was never updated. `main` is 1015
+> commits ahead of that base, the crate was renamed from `smolrunner` to `glaeda`, and `src/lib.rs`
+> now exports 200 modules rather than the 91 recorded below — 96 of them appear nowhere in this
+> document, and the "mechanical completeness check" at the end asserts `count=93` against 104 module
+> rows. Nothing in the repository links here. Read it as the W01-base design record it is; do not
+> read a classification, a product track, or a module count from it.
+>
+> The current inventory is generated: [`../MODULE_INVENTORY.md`](../MODULE_INVENTORY.md), produced
+> and gated by `tests/module_inventory.rs`.
+
+> **Product-direction note:** the critical path is now [Disposable autoscaling CI](../DISPOSABLE_AUTOSCALING_CI.md). Existing R01 modules remain reviewed optional hardening/future Linux-container work; their listed "missing integration proof" cells are not an instruction to add more R01 slices before the disposable Lima/JIT path is complete.
 
 This document maps every public library module exported by `src/lib.rs` on exact W01 activation base
 `3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae`. It distinguishes what the installed binary already
@@ -10,8 +21,8 @@ integration guide, not authority to refactor, delete, rename, expose, or call a 
 Evidence reviewed:
 
 - exact-base `src/lib.rs` and `src/main.rs`;
-- the current [README](../README.md), [roadmap](ROADMAP.md), and
-  [MacBook runner quickstart](MACBOOK-RUNNER-QUICKSTART.md);
+- the current [README](../../README.md), [roadmap](../ROADMAP.md), and
+  [MacBook runner quickstart](../MACBOOK-RUNNER-QUICKSTART.md);
 - merged W00 results in PRs #226, #230, and #231;
 - programme waves #233–#239 and P02 preflight comment `5104870676`.
 
@@ -34,14 +45,14 @@ a foundation for its own product track even when the personal Mac alpha does not
 
 ## Inventory totals
 
-- Public modules: **90**
+- Public modules: **91**
 - Classification: **48 CLI reachable**, **17 integration-ready**,
-  **17 pure foundation**, **8 experimental**,
+  **18 pure foundation**, **8 experimental**,
   **0 superseded**
-- Product track: **24 personal Mac**, **39 Linux runner steward**,
+- Product track: **25 personal Mac**, **39 Linux runner steward**,
   **11 shared**, **8 Renderprove**,
   **8 research**
-- Compile gate: **52 all targets**, **37 Linux-only**,
+- Compile gate: **53 all targets**, **37 Linux-only**,
   **1 Unix-only**
 
 ## Exact-base command reachability
@@ -88,6 +99,10 @@ strict commands are evidence-bearing advanced surfaces and should survive conven
 | `personal_worker_host_broker` | all | integration-ready | personal_mac | `smolrunner::personal_worker_host_broker` | none | pure | typed caller-owned identities/evidence | pure queue/Lima/readiness next-action decision | B01, I01 | focused tests; Verify; W00/W03 evidence where applicable | compose typed observations in one tick | #187; #238 B01 | candidate for later internalisation behind operator service |
 | `personal_worker_queue` | all | CLI reachable | personal_mac | `smolrunner::personal_worker_queue` | `worker status`; `queue list/submit`; `job show/cancel` | pure | exact observation time, identities, resources, cache state | typed queue, priority, resource, cache, and profile policy | O03, O04, B01, B07 | queue tests; installed CLI suites; Verify | ergonomic services and terminal completion adapter | #187; #237/#238 | core public policy contract |
 | `personal_worker_read_model` | all | CLI reachable | personal_mac | `smolrunner::personal_worker_read_model` | `worker status`; `queue list`; `job show` | read | exact target identity; bounded observation source | bounded status, queue-page, and job projections | O03, O06, I02 | read-model + installed CLI tests; Verify | current-store discovery and unified status | #222; #237 O03/O06 | retain bounded public projections |
+| `personal_worker_repository_result` | all | pure foundation | personal_mac | `glaeda::personal_worker_repository_result` | none | pure | exact request/attempt, source, profile/command/toolchain, resources/concurrency, reservation/cache/deadline, bounded receipt channel, repository aggregate, outer terminal, and cleanup evidence | one repository-owned internally parallel verifier correlated to one replay-safe personal-worker completion input | B06, B07 | focused binding/drift/failure/cleanup/resource/replay/privacy tests | B06 outer-attempt producer and B07 durable terminal publication | #848; #932 | work units remain receipt detail; they gain no queue, lease, resource, or cleanup authority |
+| `quarry_parallel_verification_capture` | all | pure foundation | personal_mac | `glaeda::quarry_parallel_verification_capture` | none | read | one already-open `Read` channel whose deadline, ownership, and terminality remain caller-owned | bounded exact receipt bytes, missing classification, or threshold-only overflow after EOF | B06 | focused empty/raw/boundary/overflow/drain/interruption/failure/privacy tests; Verify | compose with an independently reviewed channel opener and #205/#319 execution settlement before terminal use | #938 | retains at most the fixed Quarry receipt budget; opens no channel, executes no work, and grants no cleanup, persistence, or publication authority |
+| `quarry_parallel_verification_adapter` | all | pure foundation | personal_mac | `glaeda::quarry_parallel_verification_adapter` | none | pure | one bound repository attempt, independently observed outer terminal/cleanup/resource facts, exact bounded channel capture, and strict Quarry v2 receipt bytes | one whole Quarry aggregate correlated to one outer Glaeda completion input | B06, B07 | focused success/failure/cancellation/missing/malformed/overflow/drift/timeline/cleanup/privacy tests; Verify | B06 channel opener and observation producer, then B07 durable terminal publication | #932 | validates the fixed producer/schema/byte contract before capture classification; started inner shards remain digest-only detail and gain no queue, lease, resource, cleanup, execution, persistence, or publication authority |
+| `resident_backend_comparison` | all | pure foundation | hot_execution | `glaeda::resident_backend_comparison` | none | pure | one preregistered exact workload, A/B backend and lifecycle generations, four leading A/A noise blocks, explicit crossover schedule, and matching bounded performance receipts | one observation-only plan or sample bound to its complete canonical plan digest | none | focused plan-digest/schedule/treatment/mode/semantic/privacy tests; Verify | pure complete-block evaluator and separately authorized physical Lima/Apple-container adapters | #561 | samples grant no backend, lifecycle, benchmark, promotion, persistence, or policy authority; stopped/resident canaries remain distinct from validated resident-task evidence |
 | `personal_worker_runtime_contract` | all | pure foundation | personal_mac | `smolrunner::personal_worker_runtime_contract` | none | pure | complete exact runtime-closure evidence plus durable generations | sealed equality-only rootless verification-runtime readiness identity | R01, R02, B06 | focused pure contract tests; disposable Noble evidence | Linux static observer and journaled installation/smoke producer | #319 | public summary is path-free; private identity is not serializable |
 | `personal_worker_runtime_manifest` | all | pure foundation | personal_mac | `smolrunner::personal_worker_runtime_manifest` | none | pure | journaled installation identity, generations, platform, architecture, and sealed runtime identity digest | strict canonical recorded-but-not-observed runtime declaration | R01 | focused codec/version/privacy tests | safe Linux store plus no-follow observer and journaled producer | #319 | record is not readiness and has no public private-evidence accessors |
 | `linux_personal_worker_runtime_manifest` | linux | integration-ready | personal_mac | `smolrunner::linux_personal_worker_runtime_manifest` | none | read | fixed root-owned state root, existing shared catalog lock, exact project installation and strict manifest | locked descriptor-relative recorded manifest discovery and crate-private two-phase observation boundary | R01 | focused Linux missing/lock/version/filesystem/privacy/composition tests | complete exact host-evidence observer plus journaled manifest producer | #319 | two-phase composition brackets retained-host reconfirmation with durable-state revalidation; discovery never creates state or seals readiness |
@@ -226,7 +241,7 @@ These are findings for later owners, not changes authorised by P02:
   adapter, and exact worker snapshot mutation.
 - The unused exact-commit handoff and Git-bundle export experiment was retired from the compiled
   product path. Its recovery coordinates and rationale are recorded in
-  [`history/RETIRED_FEATURE_ISLANDS.md`](history/RETIRED_FEATURE_ISLANDS.md).
+  [`history/RETIRED_FEATURE_ISLANDS.md`](RETIRED_FEATURE_ISLANDS.md).
 - `github_workflow_job_mapper` and `github_workflow_job_reconciliation` belong to W06. Coupling them
   to the run-once alpha would prematurely import GitHub observation and credential concerns.
 - Renderprove modules are mature within their own track. They should remain separate from the

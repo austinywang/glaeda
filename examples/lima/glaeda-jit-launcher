@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly runner_listener="/opt/smolrunner/actions-runner/bin/Runner.Listener"
+readonly max_jit_bytes=65536
+
+umask 077
+jit_config=""
+IFS= read -r jit_config || exit 64
+[[ -n "${jit_config}" && ${#jit_config} -le ${max_jit_bytes} ]]
+[[ "${jit_config}" =~ ^[A-Za-z0-9+/=_-]+$ ]]
+if IFS= read -r _; then
+  exit 64
+fi
+
+export ACTIONS_RUNNER_INPUT_JITCONFIG="${jit_config}"
+exec "${runner_listener}" run --startuptype service

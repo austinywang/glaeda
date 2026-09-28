@@ -1,0 +1,64 @@
+{
+  "schema_version": 3,
+  "guest_image": {
+    "location": "https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img",
+    "architecture": "aarch64",
+    "variant": "server",
+    "digest": "sha256:7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc"
+  },
+  "actions_runner": {
+    "version": "2.336.0",
+    "location": "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-arm64-2.336.0.tar.gz",
+    "architecture": "arm64",
+    "archive_bytes": 138824064,
+    "digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
+  },
+  "source_resources": {
+    "cpu_count": 2,
+    "memory_bytes": 2147483648,
+    "disk_bytes": 21474836480
+  },
+  "provisioning": {
+    "recipe_revision": 7,
+    "lima_template_digest": "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2",
+    "admin_user": "smolrunner-admin",
+    "admin_uid": 1000,
+    "admin_comment": "SmolRunner controller",
+    "admin_passwordless_sudo": true,
+    "workload_user": "smolrunner-runner",
+    "runner_install_directory": "/opt/smolrunner/actions-runner",
+    "runner_work_directory": "/opt/smolrunner/actions-runner/_work",
+    "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",
+    "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a",
+    "ready_marker_path": "/etc/smolrunner/prepared-template.json",
+    "runner_dependency_install": "official_archive_script",
+    "os_package_source": "ubuntu_noble_signed_repositories_at_build",
+    "automatic_os_updates_after_readiness": false,
+    "runner_auto_update": false,
+    "workload_sudo": false,
+    "repository_controlled_input": false
+  },
+  "isolation": {
+    "lima_version": "2.2.0",
+    "vm_type": "vz",
+    "plain_mode": true,
+    "lima_global_overrides": false,
+    "host_mounts": false,
+    "additional_networks": false,
+    "port_forwards": false,
+    "host_resolver": false,
+    "dns_servers": [
+      "1.1.1.1",
+      "1.0.0.1"
+    ],
+    "ssh_over_vsock": true,
+    "ssh_load_dot_public_keys": false,
+    "ssh_agent_forwarding": false,
+    "ssh_forward_x11": false,
+    "ssh_forward_x11_trusted": false,
+    "proxy_environment": false,
+    "built_in_containerd": false,
+    "rosetta": false,
+    "display": false
+  }
+}

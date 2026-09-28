@@ -13,7 +13,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::disposable_attempt_catalog::{
-    DisposableAttemptCatalog, DisposableAttemptCatalogDocument, DisposableAttemptReservation,
+    DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
+    DisposableAttemptReservation,
 };
 use crate::disposable_clone_runtime::{
     CloneRuntimeClock, DisposableCleanupRunnerSource, DisposableCleanupTransactionOutcome,
@@ -37,6 +38,7 @@ use crate::github_scale_set_delivery_controller::{
     consume_with_bridge_capacity_at_revision, reconcile_and_ack_delivery,
 };
 use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
+use crate::owned_linux_jit_runtime::OwnedLinuxJitRuntime;
 use crate::process::TimedCommandExecutor;
 use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
 use crate::unix_personal_worker_store::disposable_runner_transaction::DisposableRunnerTransactionOutcome;
@@ -173,6 +175,40 @@ impl DisposableWorkerCoordinator {
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+        self.supervise_backend(
+            bridge,
+            PhysicalBackend::Lima(clone_runtime),
+            runner_runtime,
+            executor,
+            clock,
+        )
+    }
+
+    pub(crate) fn supervise_owned_linux_with_bridge<B: DisposableWorkerServiceBridge>(
+        &self,
+        bridge: &mut B,
+        runtime: &OwnedLinuxJitRuntime,
+        runner_runtime: &DisposableRunnerRuntime,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+        self.supervise_backend(
+            bridge,
+            PhysicalBackend::OwnedLinux(runtime),
+            runner_runtime,
+            executor,
+            clock,
+        )
+    }
+
+    fn supervise_backend<B: DisposableWorkerServiceBridge>(
+        &self,
+        bridge: &mut B,
+        backend: PhysicalBackend<'_>,
+        runner_runtime: &DisposableRunnerRuntime,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
         if has_delivery_recovery(&self.state_root)? {
             let observed_at = clock
                 .epoch_millis()
@@ -192,7 +228,9 @@ impl DisposableWorkerCoordinator {
             return Err(coordinator_error("disposable_capacity_invariant_violated"));
         }
 
-        if catalog.active().is_empty() {
+        if catalog.active().is_empty()
+            && let PhysicalBackend::Lima(clone_runtime) = backend
+        {
             let template = clone_runtime
                 .reconcile_template_once(executor, clock)
                 .map_err(map_clone_error)?;
@@ -261,62 +299,126 @@ impl DisposableWorkerCoordinator {
             return Ok(DisposableWorkerCoordinatorDisposition::Idle);
         };
         let attempt_id = reservation.attempt().attempt_id().clone();
+        let now = clock
+            .epoch_millis()
+            .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
+        if requires_post_start_deadline_cleanup(reservation, now) {
+            let mut durable = DisposableAttemptCatalog::new(open_catalog(&self.state_root)?);
+            let (next, _) = durable
+                .transition(
+                    catalog.revision(),
+                    &attempt_id,
+                    reservation.attempt().revision(),
+                    DisposableAttemptCatalogAction::BeginCleanup,
+                )
+                .map_err(|_| coordinator_error("disposable_deadline_cleanup_checkpoint_failed"))?;
+            let phase = next
+                .find_active(&attempt_id)
+                .ok_or_else(|| coordinator_error("disposable_attempt_missing_after_deadline"))?
+                .attempt()
+                .phase();
+            return Ok(
+                DisposableWorkerCoordinatorDisposition::CleanupCheckpointed {
+                    attempt_id: attempt_id.as_str().to_owned(),
+                    phase,
+                },
+            );
+        }
         match operation_for(reservation)? {
             CoordinatorOperation::AuthorizeClone => {
                 let mut store = open_catalog(&self.state_root)?;
-                map_clone_outcome(
-                    store
+                let outcome = match backend {
+                    PhysicalBackend::Lima(clone_runtime) => store
                         .authorize_disposable_clone_transaction(
                             clone_runtime,
                             &attempt_id,
                             executor,
                             clock,
-                        )
-                        .map_err(map_clone_error)?,
-                )
+                        ),
+                    PhysicalBackend::OwnedLinux(runtime) => store
+                        .authorize_owned_linux_task_transaction(
+                            runtime,
+                            &attempt_id,
+                            executor,
+                            clock,
+                        ),
+                }
+                .map_err(map_clone_error)?;
+                map_clone_outcome(outcome)
             }
             CoordinatorOperation::ExecuteClone => {
                 self.with_live_admission(bridge, clock, |admission| {
                     let mut store = open_catalog(&self.state_root)?;
-                    store
-                        .execute_disposable_clone_transaction(
-                            clone_runtime,
-                            &attempt_id,
-                            admission,
-                            executor,
-                            clock,
-                        )
-                        .map_err(map_clone_error)
+                    match backend {
+                        PhysicalBackend::Lima(clone_runtime) => store
+                            .execute_disposable_clone_transaction(
+                                clone_runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                        PhysicalBackend::OwnedLinux(runtime) => store
+                            .execute_owned_linux_task_transaction(
+                                runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                    }
+                    .map_err(map_clone_error)
                 })
             }
             CoordinatorOperation::CheckpointRegistration => {
                 self.with_live_admission(bridge, clock, |admission| {
                     let mut store = open_catalog(&self.state_root)?;
-                    store
-                        .checkpoint_disposable_registration_transaction(
-                            clone_runtime,
-                            &attempt_id,
-                            admission,
-                            executor,
-                            clock,
-                        )
-                        .map_err(map_clone_error)
+                    match backend {
+                        PhysicalBackend::Lima(clone_runtime) => store
+                            .checkpoint_disposable_registration_transaction(
+                                clone_runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                        PhysicalBackend::OwnedLinux(runtime) => store
+                            .checkpoint_owned_linux_registration_transaction(
+                                runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                    }
+                    .map_err(map_clone_error)
                 })
             }
             CoordinatorOperation::RunRunner => {
                 let mut source = LiveRunnerSource { bridge };
                 let mut store = open_catalog(&self.state_root)?;
-                match store
-                    .execute_disposable_runner_transaction(
-                        runner_runtime,
-                        clone_runtime,
-                        &attempt_id,
-                        &mut source,
-                        executor,
-                        clock,
-                    )
-                    .map_err(map_runner_error)?
-                {
+                let outcome = match backend {
+                    PhysicalBackend::Lima(clone_runtime) => store
+                        .execute_disposable_runner_transaction(
+                            runner_runtime,
+                            clone_runtime,
+                            &attempt_id,
+                            &mut source,
+                            executor,
+                            clock,
+                        ),
+                    PhysicalBackend::OwnedLinux(runtime) => store
+                        .execute_disposable_runner_transaction(
+                            runner_runtime,
+                            runtime,
+                            &attempt_id,
+                            &mut source,
+                            executor,
+                            clock,
+                        ),
+                }
+                .map_err(map_runner_error)?;
+                match outcome {
                     DisposableRunnerTransactionOutcome::RegistrationRecovered { attempt_id } => Ok(
                         DisposableWorkerCoordinatorDisposition::RunnerRegistrationRecovered {
                             attempt_id,
@@ -332,17 +434,25 @@ impl DisposableWorkerCoordinator {
             CoordinatorOperation::Cleanup => {
                 let mut source = LiveRunnerSource { bridge };
                 let mut store = open_catalog(&self.state_root)?;
-                map_cleanup_outcome(
-                    store
+                let outcome = match backend {
+                    PhysicalBackend::Lima(clone_runtime) => store
                         .execute_disposable_cleanup_transaction(
                             clone_runtime,
                             &attempt_id,
                             &mut source,
                             executor,
                             clock,
-                        )
-                        .map_err(map_clone_error)?,
-                )
+                        ),
+                    PhysicalBackend::OwnedLinux(runtime) => store
+                        .execute_owned_linux_cleanup_transaction(
+                            runtime,
+                            &attempt_id,
+                            &mut source,
+                            executor,
+                        ),
+                }
+                .map_err(map_clone_error)?;
+                map_cleanup_outcome(outcome)
             }
             CoordinatorOperation::Wait => Ok(DisposableWorkerCoordinatorDisposition::Idle),
         }
@@ -386,6 +496,12 @@ impl DisposableWorkerCoordinator {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PhysicalBackend<'a> {
+    Lima(&'a DisposableCloneRuntime),
+    OwnedLinux(&'a OwnedLinuxJitRuntime),
+}
+
 fn advertised_capacity(
     catalog: &DisposableAttemptCatalogDocument,
     host_storage: &dyn DisposableHostStorageSource,
@@ -416,6 +532,22 @@ enum CoordinatorOperation {
     Wait,
 }
 
+fn requires_post_start_deadline_cleanup(
+    reservation: &DisposableAttemptReservation,
+    now: EpochMillis,
+) -> bool {
+    let attempt = reservation.attempt();
+    attempt.runner_start_started()
+        && now > attempt.not_after()
+        && matches!(
+            attempt.phase(),
+            DisposableAttemptPhase::Registering
+                | DisposableAttemptPhase::Waiting
+                | DisposableAttemptPhase::Assigned
+                | DisposableAttemptPhase::Running
+        )
+}
+
 fn operation_for(
     reservation: &DisposableAttemptReservation,
 ) -> Result<CoordinatorOperation, DisposableWorkerCoordinatorError> {
@@ -424,6 +556,11 @@ fn operation_for(
         DisposableAttemptPhase::Reserved => Ok(CoordinatorOperation::AuthorizeClone),
         DisposableAttemptPhase::CloneAuthorized => Ok(CoordinatorOperation::ExecuteClone),
         DisposableAttemptPhase::CloneStarted => Ok(CoordinatorOperation::CheckpointRegistration),
+        DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+            if !attempt.runner_start_started() && attempt.runner_id().is_some() =>
+        {
+            Ok(CoordinatorOperation::Cleanup)
+        }
         DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
             if !attempt.runner_start_started() =>
         {
@@ -731,7 +868,9 @@ mod tests {
     use crate::github_scale_set_bridge::{
         ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
     };
-    use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetRunnerRequestId};
+    use crate::github_scale_set_protocol::{
+        ScaleSetJobId, ScaleSetRunnerId, ScaleSetRunnerRequestId,
+    };
     use crate::lima_observation::LimaObservationClock;
 
     const GIB: u64 = 1 << 30;
@@ -823,6 +962,72 @@ mod tests {
             .reserve(reservation())
             .unwrap()
     }
+    fn runner_registered_catalog() -> DisposableAttemptCatalogDocument {
+        let mut catalog = catalog();
+        let attempt_id = catalog.active()[0].attempt().attempt_id().clone();
+        for action in [
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::AuthorizeClone,
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordCloneStarted,
+        ] {
+            let revision = catalog.active()[0].attempt().revision();
+            catalog = catalog
+                .replace_attempt(&attempt_id, revision, action)
+                .unwrap();
+        }
+        let revision = catalog.active()[0].attempt().revision();
+        catalog = catalog
+            .bind_vm_identity_after_clone(
+                &attempt_id,
+                revision,
+                crate::disposable_worker_reconciler::DisposableVmIdentity::parse(&format!(
+                    "sha256:{}",
+                    "55".repeat(32)
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        for action in [
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginRegistration,
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+        ] {
+            let revision = catalog.active()[0].attempt().revision();
+            catalog = catalog
+                .replace_attempt(&attempt_id, revision, action)
+                .unwrap();
+        }
+        let runner = ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(77).unwrap(),
+            catalog.active()[0].attempt().runner_name().clone(),
+        );
+        let revision = catalog.active()[0].attempt().revision();
+        catalog
+            .replace_attempt(
+                &attempt_id,
+                revision,
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRegistration(
+                    runner,
+                ),
+            )
+            .unwrap()
+    }
+
+    fn runner_registered_reservation() -> DisposableAttemptReservation {
+        runner_registered_catalog().active()[0].clone()
+    }
+
+    fn runner_started_reservation() -> DisposableAttemptReservation {
+        let catalog = runner_registered_catalog();
+        let reservation = &catalog.active()[0];
+        catalog
+            .replace_attempt(
+                reservation.attempt().attempt_id(),
+                reservation.attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+            )
+            .unwrap()
+            .active()[0]
+            .clone()
+    }
 
     fn unavailable_storage_error() -> crate::disposable_host_storage::DisposableHostStorageError {
         crate::disposable_host_storage::DisposableHostStorage::new(
@@ -843,6 +1048,35 @@ mod tests {
             busy_runners: 0,
             idle_runners: 0,
         }
+    }
+
+    #[test]
+    fn lost_jit_after_runner_registration_routes_directly_to_cleanup() {
+        let reservation = runner_registered_reservation();
+        assert!(reservation.attempt().runner_id().is_some());
+        assert!(!reservation.attempt().runner_start_started());
+        assert_eq!(
+            operation_for(&reservation).unwrap(),
+            CoordinatorOperation::Cleanup
+        );
+    }
+
+    #[test]
+    fn runner_exit_before_terminal_waits_until_deadline_then_forces_cleanup() {
+        let reservation = runner_started_reservation();
+        assert_eq!(
+            operation_for(&reservation).unwrap(),
+            CoordinatorOperation::Wait
+        );
+        let not_after = reservation.attempt().not_after();
+        assert!(!requires_post_start_deadline_cleanup(
+            &reservation,
+            not_after
+        ));
+        assert!(requires_post_start_deadline_cleanup(
+            &reservation,
+            EpochMillis::new(not_after.get() + 1).unwrap()
+        ));
     }
 
     #[test]

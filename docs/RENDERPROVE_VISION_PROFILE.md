@@ -1,6 +1,6 @@
 # Renderprove vision packet profile
 
-SmolRunner's first Renderprove vision profile is a pure credentialless contract for the merged `renderprove.vision-check.v1` dry-run command. It does not execute a model and does not add a packet file format.
+Glaeda's first Renderprove vision profile is a pure credentialless contract for the merged `renderprove.vision-check.v1` dry-run command. It does not execute a model and does not add a packet file format.
 
 ## Reviewed Renderprove contract
 
@@ -55,7 +55,7 @@ The first executor must resolve the `renderprove` program to one explicit absolu
 - local commits forbidden;
 - publication forbidden.
 
-A caller cannot construct a wider policy through this module. Resource and timeout values reuse SmolRunner's existing validated profile types. The complete profile remains provider-free even when a later executor is added.
+A caller cannot construct a wider policy through this module. Resource and timeout values reuse Glaeda's existing validated profile types. The complete profile remains provider-free even when a later executor is added.
 
 ## Preview evidence
 
@@ -71,7 +71,7 @@ A caller cannot construct a wider policy through this module. Resource and timeo
 
 Deserialization denies unknown top-level fields and rejects duplicate or missing top-level fields before the reviewed identities are compared. This validates the exact public envelope shape without claiming to reimplement Renderprove's complete nested JSON Schema.
 
-The caller supplies the content digest of the exact retained preview bytes through SmolRunner's existing artifact boundary. The source screenshot, canonical image bytes, brief contents, raw receipt, private paths, logs, environment, and credentials are not part of the public profile or preview evidence.
+The caller supplies the content digest of the exact retained preview bytes through Glaeda's existing artifact boundary. The source screenshot, canonical image bytes, brief contents, raw receipt, private paths, logs, environment, and credentials are not part of the public profile or preview evidence.
 
 ## Admission and terminal result
 
@@ -90,10 +90,10 @@ The public result includes fixed evidence coverage. It identifies the public pre
 
 Renderprove keeps canonical image bytes in an in-process private store and returns copies only through an integrity-checking accessor. Its dry-run CLI emits a public preview; it does not serialize a reusable private packet.
 
-SmolRunner must not invent a packet file, environment payload, cross-process byte bundle, or provider subprocess reconstruction. Provider execution remains blocked until Renderprove selects one live endpoint/output mode and defines a reviewed credential and network boundary. SmolRunner must not claim packet/provider phase isolation unless it can enforce that boundary.
+Glaeda must not invent a packet file, environment payload, cross-process byte bundle, or provider subprocess reconstruction. Provider execution remains blocked until Renderprove selects one live endpoint/output mode and defines a reviewed credential and network boundary. Glaeda must not claim packet/provider phase isolation unless it can enforce that boundary.
 
 ## Current scope
 
-The modules contain pure identities, slot validation, fixed argv projection, preview identity validation, admission binding, and terminal result projection. They add no executor, process environment, persistence, provider transport, credential handling, CLI surface, or SmolRunner manifest field.
+The modules contain pure identities, slot validation, fixed argv projection, preview identity validation, admission binding, and terminal result projection. They add no executor, process environment, persistence, provider transport, credential handling, CLI surface, or Glaeda manifest field.
 
 A later issue may add an executor only after it specifies absolute executable resolution, empty environment construction, read-only workspace enforcement, bounded capture, cleanup, and durable receipt storage. Provider execution remains a separate gated contract.

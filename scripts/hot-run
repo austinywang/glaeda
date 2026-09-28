@@ -1,0 +1,142 @@
+#!/bin/sh
+# Fast front door for scripts/hot-run-python. Only the already-direct, unobserved same-root case
+# executes here; every option-bearing state, identity, observation, or control path falls through.
+
+try_direct() {
+  resident=
+  task=
+  cache_count=0
+  resident_seen=false
+  task_seen=false
+
+  while [ "$#" -gt 0 ]; do
+    option=$1
+    case "$option" in
+      --resident | --task | --cache)
+        [ "$#" -ge 2 ] || return 125
+        value=$2
+        shift 2
+        ;;
+      --resident=* | --task=* | --cache=*)
+        value=${option#*=}
+        option=${option%%=*}
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *) return 125 ;;
+    esac
+    [ -n "$value" ] || return 125
+    case "$option" in
+      --resident)
+        [ "$resident_seen" = false ] || return 125
+        resident_seen=true
+        resident=$value
+        ;;
+      --task)
+        [ "$task_seen" = false ] || return 125
+        task_seen=true
+        task=$value
+        ;;
+      --cache)
+        cache_count=$((cache_count + 1))
+        [ "$cache_count" -eq 1 ] || return 125
+        case "$value" in
+          ?*:native) cache_path=${value%:native} ;;
+          *) return 125 ;;
+        esac
+        case "$cache_path" in
+          . | .. | /* | */../* | ../* | */.. | *//* | */./* | ./* | */.) return 125 ;;
+        esac
+        ;;
+    esac
+  done
+
+  [ "$resident_seen" = true ] && [ "$task_seen" = true ] && [ "$#" -gt 0 ] || return 125
+  if [ "${GIT_DIR+x}" = x ] || [ "${GIT_WORK_TREE+x}" = x ] || \
+    [ "${GIT_COMMON_DIR+x}" = x ] || [ "${GIT_CEILING_DIRECTORIES+x}" = x ] || \
+    [ "${GIT_DISCOVERY_ACROSS_FILESYSTEM+x}" = x ]; then
+    return 125
+  fi
+
+  resident_physical=$(CDPATH='' cd -- "$resident" 2>/dev/null && pwd -P) || return 125
+  task_physical=$(CDPATH='' cd -- "$task" 2>/dev/null && pwd -P) || return 125
+  [ "$resident_physical" = "$task_physical" ] || return 125
+  git_program=$(command -v git) || return 125
+  case "$git_program" in /*) ;; *) return 125 ;; esac
+  git_root=$(
+    "$git_program" -C "$task_physical" rev-parse --path-format=absolute --show-toplevel \
+      2>/dev/null
+  ) || return 125
+  git_physical=$(CDPATH='' cd -- "$git_root" 2>/dev/null && pwd -P) || return 125
+  [ "$task_physical" = "$git_physical" ] || return 125
+
+  requested=$1
+  shift
+  case "$requested" in
+    /*) program=$requested ;;
+    */*) return 125 ;;
+    *)
+      program=$(
+        CDPATH='' cd -- "$task_physical" 2>/dev/null && command -v -- "$requested"
+      ) || return 125
+      case "$program" in /*) ;; *) return 125 ;; esac
+      ;;
+  esac
+  [ -f "$program" ] && [ -x "$program" ] || return 125
+  cd -- "$task_physical" || return 125
+  "$program" "$@"
+  exit $?
+}
+
+try_direct "$@"
+
+case "$0" in
+  */*) script_path=$0 ;;
+  *)
+    script_path=$(command -v -- "$0") || {
+      printf '%s\n' 'hot-run error: cannot resolve its implementation path' >&2
+      exit 2
+    }
+    ;;
+esac
+readlink_program=$(command -v readlink) || {
+  printf '%s\n' 'hot-run error: required capability readlink is unavailable' >&2
+  exit 2
+}
+case "$readlink_program" in
+  /*) ;;
+  *)
+    printf '%s\n' 'hot-run error: required capability readlink is not absolute' >&2
+    exit 2
+    ;;
+esac
+resolved_script_path=$("$readlink_program" -f -- "$script_path" 2>/dev/null) || {
+  printf '%s\n' 'hot-run error: cannot resolve its implementation path' >&2
+  exit 2
+}
+case "$resolved_script_path" in
+  /*) ;;
+  *)
+    printf '%s\n' 'hot-run error: resolved implementation path is not absolute' >&2
+    exit 2
+    ;;
+esac
+script_directory=$(CDPATH='' cd -- "${resolved_script_path%/*}" 2>/dev/null && pwd -P) || {
+  printf '%s\n' 'hot-run error: cannot resolve its implementation directory' >&2
+  exit 2
+}
+python=$(command -v python3) || {
+  printf '%s\n' 'hot-run error: required capability python3 is unavailable' >&2
+  exit 2
+}
+case "$python" in
+  /*) ;;
+  *)
+    printf '%s\n' 'hot-run error: required capability python3 is not an absolute executable' >&2
+    exit 2
+    ;;
+esac
+exec "$python" "$script_directory/hot-run-python" "$@"

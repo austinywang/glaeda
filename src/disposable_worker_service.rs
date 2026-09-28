@@ -16,6 +16,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalog;
 use crate::disposable_clone_runtime::CloneRuntimeClock;
+#[cfg(test)]
+use crate::disposable_service_failure_receipt::{
+    DisposableServiceFailureCode, DisposableServiceFailureKind, DisposableServiceFailureReceipt,
+    DisposableServiceFailureReceiptError,
+};
 use crate::disposable_worker_coordinator::{
     DisposableWorkerCoordinator, DisposableWorkerCoordinatorDisposition,
 };
@@ -29,6 +34,8 @@ use crate::disposable_worker_supervisor::{
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{ScaleSetBridgeClient, ScaleSetBridgeConfig};
 use crate::lima_observation::LimaObservationClock;
+#[cfg(target_os = "linux")]
+use crate::owned_linux_jit_enrollment::{OwnedLinuxJitEnrollment, OwnedLinuxJitEnrollmentParts};
 use crate::personal_worker_store::PersonalWorkerStoreErrorKind;
 use crate::process::ProcessExecutor;
 use crate::unix_personal_worker_store::{DisposableWorkerServiceLock, UnixPersonalWorkerStore};
@@ -72,6 +79,61 @@ impl fmt::Display for DisposableWorkerServiceError {
 }
 
 impl std::error::Error for DisposableWorkerServiceError {}
+
+/// Map one already-bounded service failure into the accepted v1 diagnostic receipt.
+///
+/// This pure adapter grants no persistence, retry, cleanup, runtime-health, or capacity authority.
+/// The caller remains responsible for supplying the exact accepted installation identities and
+/// explicit timing/generation evidence that a later #515 persistence slice will own.
+///
+/// # Errors
+///
+/// Returns the receipt contract's fixed public error when a service machine code falls outside the
+/// closed v1 grammar or when the supplied failure time predates process start.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub(crate) fn build_disposable_worker_service_failure_receipt(
+    error: DisposableWorkerServiceError,
+    program_digest: crate::artifact::Sha256Digest,
+    enrollment_digest: crate::artifact::Sha256Digest,
+    service_plan_identity: crate::artifact::Sha256Digest,
+    process_started_at_epoch_ms: u64,
+    failed_at_epoch_ms: u64,
+    restart_generation: u64,
+    durable_recovery_present: bool,
+) -> Result<DisposableServiceFailureReceipt, DisposableServiceFailureReceiptError> {
+    let failure_kind = match error.kind() {
+        DisposableWorkerServiceErrorKind::DurableState => {
+            DisposableServiceFailureKind::DurableState
+        }
+        DisposableWorkerServiceErrorKind::Supervisor => DisposableServiceFailureKind::Supervisor,
+    };
+    let failure_code = DisposableServiceFailureCode::from_static(error.code())?;
+    DisposableServiceFailureReceipt::new(
+        program_digest,
+        enrollment_digest,
+        service_plan_identity,
+        failure_kind,
+        failure_code,
+        process_started_at_epoch_ms,
+        failed_at_epoch_ms,
+        restart_generation,
+        durable_recovery_present,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct OwnedLinuxJitServiceDriver {
+    _service_lock: DisposableWorkerServiceLock,
+    bridge_config: ScaleSetBridgeConfig,
+    private_key_path: std::path::PathBuf,
+    private_key_digest: crate::artifact::Sha256Digest,
+    coordinator: DisposableWorkerCoordinator,
+    runtime: crate::owned_linux_jit_runtime::OwnedLinuxJitRuntime,
+    runner_runtime: crate::disposable_runner_runtime::DisposableRunnerRuntime,
+    executor: ProcessExecutor,
+    clock: SystemDisposableWorkerClock,
+}
 
 pub(crate) struct DisposableWorkerServiceDriver {
     _service_lock: DisposableWorkerServiceLock,
@@ -119,6 +181,35 @@ pub(crate) fn prepare_disposable_worker_service(
     Ok(build_driver(parts, service_lock))
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_owned_linux_jit_service(
+    enrollment: OwnedLinuxJitEnrollment,
+) -> Result<OwnedLinuxJitServiceDriver, DisposableWorkerServiceError> {
+    let parts = enrollment.into_parts();
+    let neutral =
+        UnixPersonalWorkerStore::open_or_create_disposable_worker_service_store(&parts.state_root)
+            .map_err(|_| durable_error("owned_linux_jit_store_unavailable"))?;
+    let service_lock = neutral
+        .acquire_disposable_worker_service_lock()
+        .map_err(|error| {
+            if error.kind() == PersonalWorkerStoreErrorKind::Busy {
+                durable_error("owned_linux_jit_service_busy")
+            } else {
+                durable_error("owned_linux_jit_service_lock_unavailable")
+            }
+        })?;
+    let delivery_evidence = neutral
+        .has_scale_set_delivery_recovery_evidence()
+        .map_err(|_| durable_error("owned_linux_jit_delivery_recovery_unavailable"))?;
+    drop(neutral);
+    if !delivery_evidence {
+        recover_local_documents(&parts.state_root)?;
+    }
+    UnixPersonalWorkerStore::open_or_create_scale_set_delivery_controller(&parts.state_root)
+        .map_err(|_| durable_error("owned_linux_jit_delivery_recovery_unavailable"))?;
+    Ok(build_owned_linux_driver(parts, service_lock))
+}
+
 fn recover_local_documents(path: &std::path::Path) -> Result<(), DisposableWorkerServiceError> {
     // One staged document can temporarily fence recovery of the other. Each successful opener
     // removes or publishes only its own classified stage, so two bounded passes are sufficient.
@@ -139,6 +230,28 @@ fn recover_local_documents(path: &std::path::Path) -> Result<(), DisposableWorke
     Err(durable_error("disposable_worker_recovery_required"))
 }
 
+#[cfg(target_os = "linux")]
+fn build_owned_linux_driver(
+    parts: OwnedLinuxJitEnrollmentParts,
+    service_lock: DisposableWorkerServiceLock,
+) -> OwnedLinuxJitServiceDriver {
+    OwnedLinuxJitServiceDriver {
+        _service_lock: service_lock,
+        bridge_config: parts.bridge_config,
+        private_key_path: parts.private_key_path,
+        private_key_digest: parts.private_key_digest,
+        coordinator: DisposableWorkerCoordinator::new(
+            parts.state_root,
+            parts.consumer_policy,
+            Box::new(parts.host_storage),
+        ),
+        runtime: parts.runtime,
+        runner_runtime: parts.runner_runtime,
+        executor: ProcessExecutor,
+        clock: SystemDisposableWorkerClock,
+    }
+}
+
 fn build_driver(
     parts: DisposableWorkerEnrollmentParts,
     service_lock: DisposableWorkerServiceLock,
@@ -155,6 +268,35 @@ fn build_driver(
         runner_runtime: parts.runner_runtime,
         executor: ProcessExecutor,
         clock: SystemDisposableWorkerClock,
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl DisposableWorkerSupervisorDriver for OwnedLinuxJitServiceDriver {
+    type Session = ScaleSetBridgeClient;
+
+    fn connect(&mut self) -> Result<Self::Session, DisposableWorkerSupervisorError> {
+        ScaleSetBridgeClient::connect_from_private_key_file(
+            self.bridge_config.clone(),
+            &self.private_key_path,
+            &self.private_key_digest,
+        )
+        .map_err(|error| DisposableWorkerSupervisorError::new(error.code()))
+    }
+
+    fn supervise_once(
+        &mut self,
+        session: &mut Self::Session,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerSupervisorError> {
+        self.coordinator
+            .supervise_owned_linux_with_bridge(
+                session,
+                &self.runtime,
+                &self.runner_runtime,
+                &self.executor,
+                &self.clock,
+            )
+            .map_err(|error| DisposableWorkerSupervisorError::new(error.code()))
     }
 }
 
@@ -192,6 +334,16 @@ impl DisposableWorkerSupervisorDriver for DisposableWorkerServiceDriver {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn serve_owned_linux_jit_with_control(
+    enrollment: OwnedLinuxJitEnrollment,
+    control: &mut impl DisposableWorkerSupervisorControl,
+) -> Result<DisposableWorkerSupervisorDisposition, DisposableWorkerServiceError> {
+    let mut driver = prepare_owned_linux_jit_service(enrollment)?;
+    supervise_disposable_worker(&mut driver, control)
+        .map_err(|error| supervisor_error(error.code()))
+}
+
 fn serve_disposable_worker_with_control(
     enrollment: DisposableWorkerEnrollment,
     control: &mut impl DisposableWorkerSupervisorControl,
@@ -199,6 +351,16 @@ fn serve_disposable_worker_with_control(
     let mut driver = prepare_disposable_worker_service(enrollment)?;
     supervise_disposable_worker(&mut driver, control)
         .map_err(|error| supervisor_error(error.code()))
+}
+
+/// Run one enrolled native-Linux JIT worker until process termination is requested.
+#[cfg(target_os = "linux")]
+pub fn serve_owned_linux_jit_worker(
+    enrollment: OwnedLinuxJitEnrollment,
+) -> Result<(), DisposableWorkerServiceError> {
+    let mut control = InterruptibleSupervisorControl::for_process_signals()
+        .map_err(|error| supervisor_error(error.code()))?;
+    serve_owned_linux_jit_with_control(enrollment, &mut control).map(|_| ())
 }
 
 /// Run one enrolled disposable-worker controller until macOS termination is requested.
@@ -225,11 +387,11 @@ pub fn serve_disposable_worker(
 struct InterruptibleSupervisorControl {
     stop: Arc<AtomicBool>,
     wake_read: UnixStream,
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     signal_actions: Vec<signal_hook::SigId>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl InterruptibleSupervisorControl {
     fn for_process_signals() -> Result<Self, DisposableWorkerSupervisorError> {
         use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -270,13 +432,13 @@ impl InterruptibleSupervisorControl {
         Self {
             stop,
             wake_read,
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             signal_actions: Vec::new(),
         }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl Drop for InterruptibleSupervisorControl {
     fn drop(&mut self) {
         for action in self.signal_actions.drain(..) {
@@ -382,6 +544,7 @@ mod tests {
     use super::*;
     use crate::artifact::Sha256Digest;
     use crate::disposable_prepared_template::current_disposable_prepared_template;
+    use crate::disposable_service_failure_receipt::DisposableServiceFailureReceiptErrorKind;
     use crate::disposable_template_generation::{
         DisposableTemplateGenerationDocument, DisposableTemplateGenerationId,
         DisposableTemplateSourceIdentity, encode_disposable_template_generation,
@@ -457,6 +620,100 @@ mod tests {
             DIGEST = DIGEST,
         );
         decode_disposable_worker_enrollment(document.as_bytes()).unwrap()
+    }
+
+    fn digest() -> Sha256Digest {
+        Sha256Digest::parse(DIGEST).unwrap()
+    }
+
+    fn service_failure_receipt(
+        error: DisposableWorkerServiceError,
+        process_started_at_epoch_ms: u64,
+        failed_at_epoch_ms: u64,
+    ) -> Result<DisposableServiceFailureReceipt, DisposableServiceFailureReceiptError> {
+        build_disposable_worker_service_failure_receipt(
+            error,
+            digest(),
+            digest(),
+            digest(),
+            process_started_at_epoch_ms,
+            failed_at_epoch_ms,
+            7,
+            true,
+        )
+    }
+
+    #[test]
+    fn bounded_durable_failure_maps_into_v1_receipt() {
+        let receipt = service_failure_receipt(
+            durable_error("disposable_worker_recovery_required"),
+            1_725_000_000_000,
+            1_725_000_001_234,
+        )
+        .unwrap();
+
+        assert_eq!(
+            receipt.failure_kind(),
+            DisposableServiceFailureKind::DurableState
+        );
+        assert_eq!(
+            receipt.failure_code().as_str(),
+            "disposable_worker_recovery_required"
+        );
+        assert_eq!(receipt.restart_generation(), 7);
+        assert!(receipt.durable_recovery_present());
+
+        let json = String::from_utf8(receipt.canonical_json()).unwrap();
+        assert!(json.contains("\"failure_kind\":\"durable_state\""));
+        assert!(json.contains("\"failure_code\":\"disposable_worker_recovery_required\""));
+        for forbidden in [
+            "path",
+            "argv",
+            "environment",
+            "stdout",
+            "stderr",
+            "credential",
+            "token",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "forbidden receipt field fragment: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_supervisor_failure_maps_into_v1_receipt() {
+        let receipt = service_failure_receipt(
+            supervisor_error("disposable_worker_signal_control_unavailable"),
+            10,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            receipt.failure_kind(),
+            DisposableServiceFailureKind::Supervisor
+        );
+        assert_eq!(
+            receipt.failure_code().as_str(),
+            "disposable_worker_signal_control_unavailable"
+        );
+    }
+
+    #[test]
+    fn receipt_mapping_delegates_timeline_validation() {
+        let error = service_failure_receipt(
+            supervisor_error("disposable_worker_signal_control_unavailable"),
+            11,
+            10,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            DisposableServiceFailureReceiptErrorKind::InvalidTimeline
+        );
     }
 
     #[test]

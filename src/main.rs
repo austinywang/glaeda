@@ -5,17 +5,89 @@ mod personal_worker_submit_command;
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::ffi::OsString;
-#[cfg(target_os = "macos")]
+use std::io::Read as _;
+#[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::{
     fs::File,
-    io::{Read as _, Seek as _, SeekFrom},
+    io::{Seek as _, SeekFrom},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(unix)]
+use glaeda::artifact::Sha256Digest;
+use glaeda::cache_inventory::{
+    CacheReportRequest, CacheStateId, MAX_CACHE_INVENTORY_DOCUMENT_BYTES,
+    build_cache_inventory_report, decode_cache_inventory, render_cache_inventory_human,
+};
+use glaeda::disposable_launchd_service::DisposableLaunchdServiceDesiredState;
+#[cfg(target_os = "macos")]
+use glaeda::disposable_launchd_service::{
+    DISPOSABLE_LAUNCHD_SERVICE_LABEL, DisposableLaunchdServicePlan,
+    apply_disposable_launchd_service, plan_disposable_launchd_service,
+};
+#[cfg(target_os = "macos")]
+use glaeda::disposable_launchd_service_status::{
+    DisposableLaunchdServiceObservedState, DisposableLaunchdServiceRemediation,
+    DisposableLaunchdServiceStatusErrorKind, inspect_disposable_launchd_service_status,
+};
+#[cfg(target_os = "macos")]
+use glaeda::disposable_worker_enrollment::decode_disposable_worker_enrollment;
+#[cfg(target_os = "macos")]
+use glaeda::disposable_worker_service::serve_disposable_worker;
+#[cfg(target_os = "linux")]
+use glaeda::disposable_worker_service::serve_owned_linux_jit_worker;
+use glaeda::doctor::{inspect_host, render_human as render_doctor};
+#[cfg(target_os = "linux")]
+use glaeda::durable_journal::StateStoreJournalCheckpoint;
+#[cfg(target_os = "linux")]
+use glaeda::durable_lane_execution::SystemLaneCommandRunner;
+#[cfg(target_os = "linux")]
+use glaeda::host_preparation_command::{
+    HostPreparationCommandDecision, HostPreparationCommandDisposition, decide_host_preparation,
+    render_human as render_host_prepare_decision,
+};
+#[cfg(target_os = "linux")]
+use glaeda::host_preparation_execution::{
+    HostPreparationExecutionDisposition, HostPreparationExecutionError,
+    execute_confirmed_host_preparation, render_human as render_host_prepare_execution,
+};
+#[cfg(target_os = "linux")]
+use glaeda::host_preparation_plan::{ExecutableHostPreparationAction, plan_host_preparation};
+#[cfg(target_os = "linux")]
+use glaeda::host_readiness::{RunnerAccountReadiness, inspect_host_readiness};
+#[cfg(target_os = "linux")]
+use glaeda::host_readiness_verdict::{assess, render_human as render_host_plan};
+#[cfg(target_os = "linux")]
+use glaeda::hot_run_cache_observation::{
+    build_hot_run_cache_observation_report, observe_hot_run_cache,
+    render_hot_run_cache_observation_human,
+};
+#[cfg(target_os = "linux")]
+use glaeda::journal::ExecutionLane;
+#[cfg(target_os = "linux")]
+use glaeda::lane_command::LaneCommandKind;
+#[cfg(target_os = "linux")]
+use glaeda::linux_installation_catalog::{InstallationLookup, find_default_installation};
+#[cfg(target_os = "linux")]
+use glaeda::linux_state::LinuxStateRoot;
+use glaeda::manifest::{ManifestError, load};
+#[cfg(target_os = "linux")]
+use glaeda::owned_linux_jit_enrollment::decode_owned_linux_jit_enrollment;
+#[cfg(target_os = "linux")]
+use glaeda::ownership::ProjectIdentity;
+use glaeda::plan::{build, render_human as render_plan};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use glaeda::process::ProcessExecutor;
+#[cfg(target_os = "linux")]
+use glaeda::runner_user_observation::observe_verified_runner_user;
+#[cfg(target_os = "linux")]
+use glaeda::state::JournalId;
+#[cfg(target_os = "linux")]
+use glaeda::trusted_guest_control_dispatcher::serve_trusted_guest_control_stdio;
 use personal_worker_cancel_command::{
     PersonalWorkerCancelCommandError, cancel_queued_job, render_cancel_receipt_human,
 };
@@ -29,78 +101,18 @@ use personal_worker_submit_command::{
 };
 #[cfg(target_os = "linux")]
 use rustix::rand::{GetRandomFlags, getrandom};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use rustix::{
     fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags},
     process::{getegid, geteuid},
 };
 use serde::Serialize;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use sha2::{Digest as _, Sha256};
-#[cfg(target_os = "macos")]
-use smolrunner::artifact::Sha256Digest;
-use smolrunner::disposable_launchd_service::DisposableLaunchdServiceDesiredState;
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_launchd_service::{
-    DISPOSABLE_LAUNCHD_SERVICE_LABEL, DisposableLaunchdServicePlan,
-    apply_disposable_launchd_service, plan_disposable_launchd_service,
-};
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_launchd_service_status::{
-    DisposableLaunchdServiceObservedState, DisposableLaunchdServiceRemediation,
-    DisposableLaunchdServiceStatusErrorKind, inspect_disposable_launchd_service_status,
-};
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_worker_enrollment::{
-    MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
-};
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_worker_service::serve_disposable_worker;
-use smolrunner::doctor::{inspect_host, render_human as render_doctor};
-#[cfg(target_os = "linux")]
-use smolrunner::durable_journal::StateStoreJournalCheckpoint;
-#[cfg(target_os = "linux")]
-use smolrunner::durable_lane_execution::SystemLaneCommandRunner;
-#[cfg(target_os = "linux")]
-use smolrunner::host_preparation_command::{
-    HostPreparationCommandDecision, HostPreparationCommandDisposition, decide_host_preparation,
-    render_human as render_host_prepare_decision,
-};
-#[cfg(target_os = "linux")]
-use smolrunner::host_preparation_execution::{
-    HostPreparationExecutionDisposition, HostPreparationExecutionError,
-    execute_confirmed_host_preparation, render_human as render_host_prepare_execution,
-};
-#[cfg(target_os = "linux")]
-use smolrunner::host_preparation_plan::{ExecutableHostPreparationAction, plan_host_preparation};
-#[cfg(target_os = "linux")]
-use smolrunner::host_readiness::{RunnerAccountReadiness, inspect_host_readiness};
-#[cfg(target_os = "linux")]
-use smolrunner::host_readiness_verdict::{assess, render_human as render_host_plan};
-#[cfg(target_os = "linux")]
-use smolrunner::journal::ExecutionLane;
-#[cfg(target_os = "linux")]
-use smolrunner::lane_command::LaneCommandKind;
-#[cfg(target_os = "linux")]
-use smolrunner::linux_installation_catalog::{InstallationLookup, find_default_installation};
-#[cfg(target_os = "linux")]
-use smolrunner::linux_state::LinuxStateRoot;
-use smolrunner::manifest::{ManifestError, load};
-#[cfg(target_os = "linux")]
-use smolrunner::ownership::ProjectIdentity;
-use smolrunner::plan::{build, render_human as render_plan};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use smolrunner::process::ProcessExecutor;
-#[cfg(target_os = "linux")]
-use smolrunner::runner_user_observation::observe_verified_runner_user;
-#[cfg(target_os = "linux")]
-use smolrunner::state::JournalId;
-#[cfg(target_os = "linux")]
-use smolrunner::trusted_guest_control_dispatcher::serve_trusted_guest_control_stdio;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "smolrunner",
+    name = "glaeda",
     version,
     about = "Tend a small fleet of self-hosted GitHub Actions runners"
 )]
@@ -120,16 +132,16 @@ enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect whether the current host is ready for SmolRunner.
+    /// Inspect whether the current host is ready for Glaeda.
     Doctor {
         /// Treat warnings as a non-zero result.
         #[arg(long)]
         strict: bool,
     },
-    /// Validate desired state and show the changes SmolRunner would eventually make.
+    /// Validate desired state and show the changes Glaeda would eventually make.
     Plan {
         /// Manifest to validate and plan.
-        #[arg(long, default_value = "smolrunner.yml")]
+        #[arg(long, default_value = "glaeda.yml")]
         file: PathBuf,
     },
     /// Inspect, plan, or explicitly prepare host-level state.
@@ -157,6 +169,45 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
+    /// Classify an explicit path-free hot-state observation document without mutation.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Observe one explicit Linux hot-run root without granting cleanup authority.
+    #[cfg(target_os = "linux")]
+    ObserveHotRun {
+        /// Exact hot-run cache root to traverse without following symlinks.
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Classify every supplied state observation.
+    Status {
+        /// Explicit bounded path-free observation document.
+        #[arg(long)]
+        inventory: PathBuf,
+    },
+    /// Explain one exact opaque state identity.
+    Explain {
+        /// Exact opaque state identity from the observation document.
+        state_id: String,
+        /// Explicit bounded path-free observation document.
+        #[arg(long)]
+        inventory: PathBuf,
+    },
+    /// Show reclaim candidates without changing any host state.
+    Reclaim {
+        /// Mandatory proof that this command is observation-only.
+        #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Explicit bounded path-free observation document.
+        #[arg(long)]
+        inventory: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -169,10 +220,10 @@ enum ServiceCommand {
         /// Explicit absolute normalized operator home directory.
         #[arg(long)]
         operator_home: PathBuf,
-        /// Exact absolute normalized SmolRunner executable path.
+        /// Exact absolute normalized Glaeda executable path.
         #[arg(long)]
         program: PathBuf,
-        /// Exact reviewed SmolRunner executable content digest.
+        /// Exact reviewed Glaeda executable content digest.
         #[arg(long)]
         program_digest: String,
         /// Exact absolute normalized canonical enrollment document.
@@ -187,10 +238,10 @@ enum ServiceCommand {
         /// Explicit absolute normalized operator home directory.
         #[arg(long)]
         operator_home: PathBuf,
-        /// Exact absolute normalized SmolRunner executable path.
+        /// Exact absolute normalized Glaeda executable path.
         #[arg(long)]
         program: PathBuf,
-        /// Exact reviewed SmolRunner executable content digest.
+        /// Exact reviewed Glaeda executable content digest.
         #[arg(long)]
         program_digest: String,
         /// Exact absolute normalized canonical enrollment document.
@@ -208,10 +259,10 @@ enum ServiceCommand {
         /// Explicit absolute normalized operator home directory.
         #[arg(long)]
         operator_home: PathBuf,
-        /// Exact absolute normalized SmolRunner executable path.
+        /// Exact absolute normalized Glaeda executable path.
         #[arg(long)]
         program: PathBuf,
-        /// Exact reviewed SmolRunner executable content digest.
+        /// Exact reviewed Glaeda executable content digest.
         #[arg(long)]
         program_digest: String,
         /// Exact absolute normalized canonical enrollment document.
@@ -246,7 +297,7 @@ enum HostCommand {
     /// Compare bounded host observations with a project manifest.
     Plan {
         /// Manifest to inspect against the current host.
-        #[arg(long, default_value = "smolrunner.yml")]
+        #[arg(long, default_value = "glaeda.yml")]
         file: PathBuf,
         /// Explicit runner account policy. Defaults to MANIFEST.account.yml when present.
         #[arg(long)]
@@ -255,7 +306,7 @@ enum HostCommand {
     /// Execute one exactly confirmed reviewed host-preparation phase.
     Prepare {
         /// Manifest to inspect and prepare against the current host.
-        #[arg(long, default_value = "smolrunner.yml")]
+        #[arg(long, default_value = "glaeda.yml")]
         file: PathBuf,
         /// Explicit runner account policy. Defaults to MANIFEST.account.yml when present.
         #[arg(long)]
@@ -280,6 +331,16 @@ enum WorkerCommand {
         #[arg(long)]
         program_digest: String,
         /// Explicit absolute normalized canonical enrollment document.
+        #[arg(long)]
+        enrollment: PathBuf,
+        /// Exact approved canonical enrollment-document content digest.
+        #[arg(long)]
+        enrollment_digest: String,
+    },
+    /// Run the native owned-Linux JIT controller for one reviewed repository/Scale Set.
+    #[cfg(target_os = "linux")]
+    ServeOwnedLinux {
+        /// Explicit absolute normalized canonical owned-Linux enrollment document.
         #[arg(long)]
         enrollment: PathBuf,
         /// Exact approved canonical enrollment-document content digest.
@@ -542,6 +603,11 @@ fn main() -> ExitCode {
                 enrollment,
                 enrollment_digest,
             } => run_worker_serve(cli.output, &program_digest, &enrollment, &enrollment_digest),
+            #[cfg(target_os = "linux")]
+            WorkerCommand::ServeOwnedLinux {
+                enrollment,
+                enrollment_digest,
+            } => run_owned_linux_worker_serve(cli.output, &enrollment, &enrollment_digest),
         },
         Command::Queue { command } => match command {
             QueueCommand::List {
@@ -598,6 +664,35 @@ fn main() -> ExitCode {
                 &request_id,
             ),
         },
+        Command::Cache { command } => match command {
+            #[cfg(target_os = "linux")]
+            CacheCommand::ObserveHotRun { root } => {
+                run_hot_run_cache_observation(cli.output, &root)
+            }
+            CacheCommand::Status { inventory } => {
+                run_cache_inventory(cli.output, &inventory, CacheReportRequest::Status)
+            }
+            CacheCommand::Explain {
+                state_id,
+                inventory,
+            } => {
+                let state_id = match CacheStateId::parse(&state_id) {
+                    Ok(state_id) => state_id,
+                    Err(error) => {
+                        return emit_runtime_error(cli.output, error.code(), error.to_string());
+                    }
+                };
+                run_cache_inventory(
+                    cli.output,
+                    &inventory,
+                    CacheReportRequest::Explain(state_id),
+                )
+            }
+            CacheCommand::Reclaim { dry_run, inventory } => {
+                debug_assert!(dry_run, "clap requires --dry-run");
+                run_cache_inventory(cli.output, &inventory, CacheReportRequest::ReclaimDryRun)
+            }
+        },
     }
 }
 
@@ -629,6 +724,91 @@ fn run_doctor(output: OutputFormat, strict: bool) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn run_cache_inventory(
+    output: OutputFormat,
+    inventory_path: &Path,
+    request: CacheReportRequest,
+) -> ExitCode {
+    let bytes = match read_bounded_cache_inventory(inventory_path) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return emit_runtime_error(output, "cache_inventory_read_failed", message);
+        }
+    };
+    let inventory = match decode_cache_inventory(&bytes) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    let report = match build_cache_inventory_report(&inventory, &request) {
+        Ok(report) => report,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_cache_inventory_human(&report)),
+        OutputFormat::Json => {
+            if print_json(&report).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(target_os = "linux")]
+fn run_hot_run_cache_observation(output: OutputFormat, root: &Path) -> ExitCode {
+    let observation = match observe_hot_run_cache(root) {
+        Ok(observation) => observation,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    let report = match build_hot_run_cache_observation_report(observation) {
+        Ok(report) => report,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_hot_run_cache_observation_human(&report)),
+        OutputFormat::Json => {
+            if print_json(&report).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn read_bounded_cache_inventory(path: &Path) -> Result<Vec<u8>, String> {
+    let file =
+        std::fs::File::open(path).map_err(|_| "cache inventory could not be opened".to_owned())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cache inventory metadata could not be read".to_owned())?;
+    if !metadata.is_file() {
+        return Err("cache inventory is not a regular file".to_owned());
+    }
+    if metadata.len() > MAX_CACHE_INVENTORY_DOCUMENT_BYTES as u64 {
+        return Err("cache inventory exceeds the reviewed byte limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_CACHE_INVENTORY_DOCUMENT_BYTES)
+            .min(MAX_CACHE_INVENTORY_DOCUMENT_BYTES),
+    );
+    file.take((MAX_CACHE_INVENTORY_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cache inventory could not be read".to_owned())?;
+    if bytes.len() > MAX_CACHE_INVENTORY_DOCUMENT_BYTES {
+        return Err("cache inventory exceeds the reviewed byte limit".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn run_plan(output: OutputFormat, file: &Path) -> ExitCode {
@@ -999,7 +1179,7 @@ fn run_worker_status(output: OutputFormat, store_root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn explicit_normalized_absolute_path(path: &Path) -> bool {
     let normalized = path.components().collect::<PathBuf>();
     path.is_absolute()
@@ -1031,7 +1211,7 @@ fn run_worker_serve(
                 .to_owned(),
         );
     }
-    let bytes = match read_private_disposable_worker_enrollment(enrollment_path) {
+    let bytes = match read_private_worker_enrollment(enrollment_path) {
         Ok(bytes) => bytes,
         Err(()) => {
             return emit_runtime_error(
@@ -1068,7 +1248,7 @@ fn run_worker_serve(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn approved_enrollment_bytes(bytes: &[u8], expected: &str) -> bool {
     let Ok(expected) = Sha256Digest::parse(expected) else {
         return false;
@@ -1078,20 +1258,23 @@ fn approved_enrollment_bytes(bytes: &[u8], expected: &str) -> bool {
     observed == expected
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const ENROLLMENT_DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const ENROLLMENT_FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK)
     .union(OFlags::CLOEXEC);
 
-#[cfg(target_os = "macos")]
-fn read_private_disposable_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()> {
+#[cfg(unix)]
+const MAX_PRIVATE_WORKER_ENROLLMENT_BYTES: usize = 16 * 1024;
+
+#[cfg(unix)]
+fn read_private_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()> {
     if !explicit_normalized_absolute_path(path) {
         return Err(());
     }
@@ -1116,18 +1299,18 @@ fn read_private_disposable_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()>
         return Err(());
     }
 
-    let mut bytes = Vec::with_capacity(MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES);
+    let mut bytes = Vec::with_capacity(MAX_PRIVATE_WORKER_ENROLLMENT_BYTES);
     file.by_ref()
-        .take((MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES + 1) as u64)
+        .take((MAX_PRIVATE_WORKER_ENROLLMENT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| ())?;
-    if bytes.len() > MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES {
+    if bytes.len() > MAX_PRIVATE_WORKER_ENROLLMENT_BYTES {
         return Err(());
     }
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let mut confirmation = Vec::with_capacity(bytes.len());
     file.by_ref()
-        .take((MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES + 1) as u64)
+        .take((MAX_PRIVATE_WORKER_ENROLLMENT_BYTES + 1) as u64)
         .read_to_end(&mut confirmation)
         .map_err(|_| ())?;
     if confirmation != bytes {
@@ -1149,7 +1332,7 @@ fn read_private_disposable_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()>
     Ok(bytes)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_enrollment_directory_chain(path: &Path) -> Result<std::os::fd::OwnedFd, ()> {
     let mut directory =
         rustix_fs::open("/", ENROLLMENT_DIRECTORY_FLAGS, Mode::empty()).map_err(|_| ())?;
@@ -1167,7 +1350,7 @@ fn open_enrollment_directory_chain(path: &Path) -> Result<std::os::fd::OwnedFd, 
     Ok(directory)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn inspect_enrollment_parent(stat: &rustix_fs::Stat) -> Result<(), ()> {
     if !FileType::from_raw_mode(stat.st_mode).is_dir()
         || stat.st_uid != geteuid().as_raw()
@@ -1179,7 +1362,7 @@ fn inspect_enrollment_parent(stat: &rustix_fs::Stat) -> Result<(), ()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn inspect_enrollment_file(stat: &rustix_fs::Stat) -> Result<(), ()> {
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_nlink != 1
@@ -1189,14 +1372,14 @@ fn inspect_enrollment_file(stat: &rustix_fs::Stat) -> Result<(), ()> {
         || stat.st_size < 0
         || usize::try_from(stat.st_size)
             .ok()
-            .is_none_or(|size| size > MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES)
+            .is_none_or(|size| size > MAX_PRIVATE_WORKER_ENROLLMENT_BYTES)
     {
         return Err(());
     }
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn same_enrollment_snapshot(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> bool {
     left.st_dev == right.st_dev
         && left.st_ino == right.st_ino
@@ -1211,13 +1394,63 @@ fn same_enrollment_snapshot(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> 
         && left.st_ctime_nsec == right.st_ctime_nsec
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn same_enrollment_directory(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> bool {
     left.st_dev == right.st_dev
         && left.st_ino == right.st_ino
         && left.st_mode == right.st_mode
         && left.st_uid == right.st_uid
         && left.st_gid == right.st_gid
+}
+
+#[cfg(target_os = "linux")]
+fn run_owned_linux_worker_serve(
+    output: OutputFormat,
+    enrollment_path: &Path,
+    enrollment_digest: &str,
+) -> ExitCode {
+    if !explicit_normalized_absolute_path(enrollment_path) {
+        return emit_runtime_error(
+            output,
+            "owned_linux_jit_service",
+            "owned-Linux JIT enrollment path must be explicit, absolute, and normalized".to_owned(),
+        );
+    }
+    let bytes = match read_private_worker_enrollment(enrollment_path) {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return emit_runtime_error(
+                output,
+                "owned_linux_jit_service",
+                "owned-Linux JIT enrollment is unavailable".to_owned(),
+            );
+        }
+    };
+    if !approved_enrollment_bytes(&bytes, enrollment_digest) {
+        return emit_runtime_error(
+            output,
+            "owned_linux_jit_enrollment_digest_mismatch",
+            "owned-Linux JIT enrollment does not match the approved digest".to_owned(),
+        );
+    }
+    let enrollment = match decode_owned_linux_jit_enrollment(&bytes) {
+        Ok(enrollment) => enrollment,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "owned-Linux JIT enrollment was refused".to_owned(),
+            );
+        }
+    };
+    match serve_owned_linux_jit_worker(enrollment) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => emit_runtime_error(
+            output,
+            error.code(),
+            "owned-Linux JIT service stopped with a durable blocker".to_owned(),
+        ),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1507,7 +1740,7 @@ fn run_host_prepare(
             return emit_runtime_error(
                 output,
                 "installation_missing",
-                "no enrolled SmolRunner installation matches the manifest project; host preparation does not bootstrap state or enroll projects"
+                "no enrolled Glaeda installation matches the manifest project; host preparation does not bootstrap state or enroll projects"
                     .to_owned(),
             );
         }
@@ -1730,7 +1963,7 @@ fn emit_runtime_error(output: OutputFormat, kind: &'static str, message: String)
 fn load_manifest(
     output: OutputFormat,
     file: &Path,
-) -> Result<smolrunner::manifest::Manifest, ExitCode> {
+) -> Result<glaeda::manifest::Manifest, ExitCode> {
     load(file).map_err(|error| {
         match output {
             OutputFormat::Human => eprint!("{error}"),
@@ -1776,30 +2009,122 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     #[cfg(target_os = "linux")]
-    use smolrunner::host_preparation_plan::ExecutableHostPreparationAction;
+    use glaeda::host_preparation_plan::ExecutableHostPreparationAction;
     #[cfg(target_os = "linux")]
-    use smolrunner::journal::{ExecutionLane, RollbackClass};
+    use glaeda::journal::{ExecutionLane, RollbackClass};
     #[cfg(target_os = "linux")]
-    use smolrunner::lane_command::LaneCommandKind;
+    use glaeda::lane_command::LaneCommandKind;
 
     use super::{
-        Cli, Command, HostCommand, JobCommand, QueueCommand, ServiceCommand, ServiceDesiredState,
-        WorkerCommand,
+        CacheCommand, Cli, Command, HostCommand, JobCommand, QueueCommand, ServiceCommand,
+        ServiceDesiredState, WorkerCommand,
     };
     #[cfg(target_os = "linux")]
     use super::{
         HostPreparePhaseKind, Invocation, classify_host_prepare_actions, try_parse_invocation_from,
     };
     #[cfg(target_os = "macos")]
-    use super::{approved_enrollment_bytes, read_private_disposable_worker_enrollment};
+    use super::{approved_enrollment_bytes, read_private_worker_enrollment};
 
     #[cfg(target_os = "macos")]
     static NEXT_ENROLLMENT_ROOT: AtomicU64 = AtomicU64::new(1);
 
     #[test]
+    fn cache_commands_require_explicit_inventory_and_reclaim_dry_run() {
+        #[cfg(target_os = "linux")]
+        {
+            let observe = Cli::try_parse_from([
+                "glaeda",
+                "--output",
+                "json",
+                "cache",
+                "observe-hot-run",
+                "--root",
+                "hot-state",
+            ])
+            .expect("parse hot-run cache observation");
+            let Command::Cache {
+                command: CacheCommand::ObserveHotRun { root },
+            } = observe.command
+            else {
+                panic!("expected hot-run cache observation command");
+            };
+            assert_eq!(root, PathBuf::from("hot-state"));
+        }
+
+        let status = Cli::try_parse_from([
+            "glaeda",
+            "--output",
+            "json",
+            "cache",
+            "status",
+            "--inventory",
+            "observations.json",
+        ])
+        .expect("parse cache status");
+        let Command::Cache {
+            command: CacheCommand::Status { inventory },
+        } = status.command
+        else {
+            panic!("expected cache status command");
+        };
+        assert_eq!(inventory, PathBuf::from("observations.json"));
+
+        let explain = Cli::try_parse_from([
+            "glaeda",
+            "cache",
+            "explain",
+            "state-one",
+            "--inventory",
+            "observations.json",
+        ])
+        .expect("parse cache explain");
+        let Command::Cache {
+            command:
+                CacheCommand::Explain {
+                    state_id,
+                    inventory,
+                },
+        } = explain.command
+        else {
+            panic!("expected cache explain command");
+        };
+        assert_eq!(state_id, "state-one");
+        assert_eq!(inventory, PathBuf::from("observations.json"));
+
+        assert!(
+            Cli::try_parse_from([
+                "glaeda",
+                "cache",
+                "reclaim",
+                "--inventory",
+                "observations.json",
+            ])
+            .is_err()
+        );
+        let reclaim = Cli::try_parse_from([
+            "glaeda",
+            "cache",
+            "reclaim",
+            "--dry-run",
+            "--inventory",
+            "observations.json",
+        ])
+        .expect("parse cache reclaim dry-run");
+        let Command::Cache {
+            command: CacheCommand::Reclaim { dry_run, inventory },
+        } = reclaim.command
+        else {
+            panic!("expected cache reclaim command");
+        };
+        assert!(dry_run);
+        assert_eq!(inventory, PathBuf::from("observations.json"));
+    }
+
+    #[test]
     fn host_prepare_accepts_explicit_confirmation_and_account_policy() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "host",
             "prepare",
             "--file",
@@ -1869,7 +2194,7 @@ mod tests {
     #[test]
     fn personal_worker_read_commands_parse_exact_snapshot_arguments() {
         let status = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "worker",
             "status",
             "--store-root",
@@ -1885,7 +2210,7 @@ mod tests {
         assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
 
         let queue = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "queue",
             "list",
             "--store-root",
@@ -1920,7 +2245,7 @@ mod tests {
         assert_eq!(limit, 5);
 
         let job = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "job",
             "show",
             "--store-root",
@@ -1950,7 +2275,7 @@ mod tests {
         assert_eq!(request_id, "job-one");
 
         let cancel = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "job",
             "cancel",
             "--store-root",
@@ -1987,7 +2312,7 @@ mod tests {
     #[test]
     fn worker_serve_requires_one_explicit_enrollment_identity() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "worker",
             "serve",
             "--program-digest",
@@ -2026,7 +2351,7 @@ mod tests {
     #[test]
     fn launchd_service_plan_parses_exact_private_inputs() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "service",
             "plan",
             "--desired",
@@ -2077,7 +2402,7 @@ mod tests {
     #[test]
     fn launchd_service_status_parses_exact_private_inputs() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "service",
             "status",
             "--operator-home",
@@ -2125,7 +2450,7 @@ mod tests {
     fn launchd_service_apply_requires_exact_plan_approval() {
         assert!(
             Cli::try_parse_from([
-                "smolrunner",
+                "glaeda",
                 "service",
                 "apply",
                 "--desired",
@@ -2144,7 +2469,7 @@ mod tests {
             .is_err()
         );
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "service",
             "apply",
             "--desired",
@@ -2214,7 +2539,7 @@ mod tests {
         fs::write(&enrollment, b"exact-enrollment\n").unwrap();
         fs::set_permissions(&enrollment, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            read_private_disposable_worker_enrollment(&enrollment).unwrap(),
+            read_private_worker_enrollment(&enrollment).unwrap(),
             b"exact-enrollment\n"
         );
         let approved_digest = format!("sha256:{:x}", Sha256::digest(b"exact-enrollment\n"));
@@ -2233,7 +2558,7 @@ mod tests {
 
         let alias = root.join("alias.json");
         symlink(&enrollment, &alias).unwrap();
-        assert!(read_private_disposable_worker_enrollment(&alias).is_err());
+        assert!(read_private_worker_enrollment(&alias).is_err());
         fs::remove_file(alias).unwrap();
         fs::remove_file(enrollment).unwrap();
         fs::remove_dir(root).unwrap();

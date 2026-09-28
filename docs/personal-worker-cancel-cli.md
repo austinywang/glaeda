@@ -3,7 +3,7 @@
 Cancel one exact queued request with caller-supplied durable evidence:
 
 ```text
-smolrunner job cancel \
+glaeda job cancel \
   --store-root /absolute/state/root \
   --revision 7 \
   --generation 11 \

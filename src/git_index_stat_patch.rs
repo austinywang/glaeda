@@ -488,7 +488,7 @@ const fn unsupported_extension() -> GitIndexStatPatchError {
     )
 }
 
-fn sha1(input: &[u8]) -> [u8; 20] {
+pub(crate) fn sha1(input: &[u8]) -> [u8; 20] {
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut message = Vec::with_capacity(input.len().saturating_add(72));
     message.extend_from_slice(input);

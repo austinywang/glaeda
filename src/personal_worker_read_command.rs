@@ -1,23 +1,23 @@
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
-use smolrunner::execution_admission::ExecutionRequestId;
-use smolrunner::personal_worker_queue::{
+use glaeda::execution_admission::ExecutionRequestId;
+use glaeda::personal_worker_queue::{
     PersonalWorkerActivityEvidence, PersonalWorkerQueueGeneration, PersonalWorkerQueueVisibility,
 };
-use smolrunner::personal_worker_read_model::{
+use glaeda::personal_worker_read_model::{
     PersonalWorkerJobReadRequest, PersonalWorkerJobStateView, PersonalWorkerJobView,
     PersonalWorkerQueuePage, PersonalWorkerQueuePageRequest, PersonalWorkerReadError,
     PersonalWorkerReadErrorKind, PersonalWorkerStatusView, personal_worker_job_view,
     personal_worker_queue_page, personal_worker_status,
 };
-use smolrunner::personal_worker_store::{
+use glaeda::personal_worker_store::{
     PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreError,
     PersonalWorkerStoreErrorKind, PersonalWorkerStoreRevision,
 };
 #[cfg(unix)]
-use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
+use glaeda::unix_personal_worker_store::UnixPersonalWorkerStore;
+use serde::Serialize;
 
 pub const PERSONAL_WORKER_READ_COMMAND_SCHEMA_VERSION: u8 = 1;
 

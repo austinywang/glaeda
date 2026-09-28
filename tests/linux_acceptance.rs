@@ -6,21 +6,21 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use smolrunner::debian_package_probe::DpkgQueryProbe;
-use smolrunner::host::Presence;
-use smolrunner::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
-use smolrunner::lane_command::{LaneCommand, LinuxAccountName, PackageName, RunnerUserContext};
-use smolrunner::lane_executable::verify_executable;
-use smolrunner::lane_executor::{RootLaneExecutor, RunnerUserLaneExecutor};
-use smolrunner::process::{CommandExecutor, CommandSpec, ProcessExecutor};
-use smolrunner::runner_account_observation::{
+use glaeda::debian_package_probe::DpkgQueryProbe;
+use glaeda::host::Presence;
+use glaeda::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
+use glaeda::lane_command::{LaneCommand, LinuxAccountName, PackageName, RunnerUserContext};
+use glaeda::lane_executable::{resolve_reviewed_environment_executable, verify_executable};
+use glaeda::lane_executor::{RootLaneExecutor, RunnerUserLaneExecutor};
+use glaeda::process::{CommandExecutor, CommandSpec, ProcessExecutor};
+use glaeda::runner_account_observation::{
     RunnerAccountObservationPaths, getent_command, observe_runner_account,
 };
-use smolrunner::runner_account_plan::{
+use glaeda::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, PreparationObservationState,
     RunnerAccountPlanDisposition, RunnerAccountResourceKind, build_runner_account_plan,
 };
-use smolrunner::runner_user::{
+use glaeda::runner_user::{
     inspect_runtime_directory, parse_passwd_record, parse_subordinate_ranges, verify_runner_user,
 };
 
@@ -110,14 +110,16 @@ fn process_execution_starts_empty_and_adds_only_explicit_environment_values() {
         return;
     }
 
+    let environment_program =
+        resolve_reviewed_environment_executable().expect("resolve reviewed environment executable");
     let empty = ProcessExecutor
-        .execute(&CommandSpec::new("/usr/bin/env"))
+        .execute(&CommandSpec::new(environment_program.path()))
         .expect("execute env with an empty child environment");
     assert!(empty.success);
     assert!(empty.stdout.is_empty());
     assert!(empty.environment_keys.is_empty());
 
-    let allowlisted_spec = CommandSpec::new("/usr/bin/env")
+    let allowlisted_spec = CommandSpec::new(environment_program.path())
         .environment("HOME", "/var/empty")
         .environment("SMOLRUNNER_ACCEPTANCE", "allowed");
     let allowlisted = ProcessExecutor
@@ -142,7 +144,6 @@ fn reviewed_linux_executables_resolve_to_protected_absolute_files() {
 
     for path in [
         "/usr/bin/dpkg-query",
-        "/usr/bin/env",
         "/usr/bin/getent",
         "/usr/bin/git",
         "/usr/bin/install",
@@ -156,6 +157,11 @@ fn reviewed_linux_executables_resolve_to_protected_absolute_files() {
             .unwrap_or_else(|error| panic!("verify {path}: {error}"));
         assert_eq!(verified.path(), Path::new(path));
     }
+    let environment_program =
+        resolve_reviewed_environment_executable().expect("resolve reviewed environment executable");
+    let verified = verify_executable(environment_program.path())
+        .expect("selected environment executable remains reviewed");
+    assert_eq!(verified.path(), environment_program.path());
 }
 
 #[test]

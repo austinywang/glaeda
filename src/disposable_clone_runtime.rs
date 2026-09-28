@@ -107,7 +107,15 @@ impl DisposableCloneAdmissionObservation {
         Ok(())
     }
 
-    fn validate_identity_and_freshness_for(
+    pub(crate) const fn capacity_reserved(&self) -> bool {
+        self.capacity_reserved
+    }
+
+    pub(crate) const fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested
+    }
+
+    pub(crate) fn validate_identity_and_freshness_for(
         &self,
         catalog: &DisposableAttemptCatalogDocument,
         reservation: &DisposableAttemptReservation,
@@ -205,6 +213,14 @@ impl DisposableCloneRuntimeError {
     pub(crate) const fn observation(code: &'static str) -> Self {
         observation(code)
     }
+
+    pub(crate) const fn configuration(code: &'static str) -> Self {
+        invalid_configuration(code)
+    }
+
+    pub(crate) const fn command(code: &'static str) -> Self {
+        command(code)
+    }
 }
 
 impl fmt::Display for DisposableCloneRuntimeError {
@@ -290,6 +306,21 @@ impl DisposableCleanupRunnerSource for ScaleSetBridgeClient {
 }
 
 impl DisposableCloneRuntimeReceipt {
+    pub(crate) fn from_owned_linux(
+        attempt_id: &DisposableAttemptId,
+        catalog_revision: u64,
+        attempt_revision: u64,
+        command_identity: Sha256Digest,
+    ) -> Self {
+        Self {
+            schema_version: DISPOSABLE_CLONE_RUNTIME_SCHEMA_VERSION,
+            attempt_id: attempt_id.as_str().to_owned(),
+            catalog_revision,
+            attempt_revision,
+            command_identity,
+        }
+    }
+
     #[must_use]
     pub const fn schema_version(&self) -> u8 {
         self.schema_version
@@ -1044,6 +1075,39 @@ impl ConfirmedDisposableWorker {
         self.host
             .confirm(&self.request)
             .map_err(|_| observation("clone_worker_identity_drift"))
+    }
+}
+
+impl crate::disposable_runner_runtime::DisposableRunnerTargetRuntime for DisposableCloneRuntime {
+    type Confirmation = ConfirmedDisposableWorker;
+
+    fn confirm_runner_target(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<Self::Confirmation, crate::disposable_runner_runtime::DisposableRunnerRuntimeError>
+    {
+        self.confirm_ready_worker(reservation, executor, clock)
+            .map_err(|_| {
+                crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
+                    "runner_target_not_ready",
+                )
+            })
+    }
+
+    fn reconfirm_runner_target(
+        &self,
+        confirmation: &Self::Confirmation,
+        _reservation: &DisposableAttemptReservation,
+        _executor: &impl TimedCommandExecutor,
+        _clock: &impl CloneRuntimeClock,
+    ) -> Result<(), crate::disposable_runner_runtime::DisposableRunnerRuntimeError> {
+        confirmation.confirm_current().map_err(|_| {
+            crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
+                "runner_target_identity_drift",
+            )
+        })
     }
 }
 

@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from verify_focused_impl import REQUIRED_PROFILE, main
+
+raise SystemExit(main(REQUIRED_PROFILE))

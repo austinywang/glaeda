@@ -2,9 +2,11 @@
 
 > **Historical design:** this persistent-guest/rootless-Podman design is not the current hostile-CI production path. See [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md) for the one-job disposable Lima/VZ boundary. Reusable observation and lifecycle contracts in this document remain relevant.
 
-This guide defines a conservative Lima boundary for running SmolRunner experiments on an Apple-silicon MacBook Air with 24 GiB of unified memory. It covers VM creation, resource-profile transitions, measurement, sleep handling, and cleanup. It stops before live GitHub runner registration.
+This guide defines a conservative Lima boundary for running Glaeda experiments on an Apple-silicon MacBook Air with 24 GiB of unified memory. It covers VM creation, resource-profile transitions, measurement, sleep handling, and cleanup. It stops before live GitHub runner registration.
 
-SmolRunner remains pre-alpha. The current CLI provides read-only diagnostics and planning. Runner installation, registration, reconciliation, and disposable job execution remain roadmap work.
+Glaeda remains pre-alpha. The current CLI provides read-only diagnostics and planning. Runner installation, registration, reconciliation, and disposable job execution remain roadmap work.
+
+The existing `smolrunner` VM, template, path, and helper identities in this historical operator lane remain exact transition names until their owning migration lanes move those live surfaces.
 
 ## Profiles
 
@@ -35,7 +37,7 @@ Both profiles use:
 
 Plain mode is the primary boundary. It disables Lima filesystem sharing, dynamic port forwarding, built-in containerd, the guest agent, Rosetta, and SSH-agent forwarding. The repeated explicit settings make profile review easier and guard against accidental edits.
 
-The VM administrator account is `lima`. The eventual Actions listener and rootless Podman runtime belong under a separate dedicated Linux account created through SmolRunner’s reviewed account path.
+The VM administrator account is `lima`. The eventual Actions listener and rootless Podman runtime belong under a separate dedicated Linux account created through Glaeda’s reviewed account path.
 
 ## Security boundary
 
@@ -51,7 +53,7 @@ Treat checked-out repository code as untrusted. Preserve these rules throughout 
 - retain one job at a time until real measurements support a higher limit;
 - use exact runner-removal and ownership evidence before deleting any registered runner state.
 
-The profiles contain no provisioning scripts. Package preparation, runner-account creation, official-runner installation, and registration should enter through reviewed SmolRunner paths as they become available.
+The profiles contain no provisioning scripts. Package preparation, runner-account creation, official-runner installation, and registration should enter through reviewed Glaeda paths as they become available.
 
 ## Install Lima
 
@@ -232,7 +234,7 @@ limactl stop smolrunner
 limactl delete smolrunner
 ```
 
-Creation from either profile restores only the VM boundary. It does not restore SmolRunner ownership records or GitHub runner registration.
+Creation from either profile restores only the VM boundary. It does not restore Glaeda ownership records or GitHub runner registration.
 
 ## Sleep and wake behavior
 
@@ -314,7 +316,7 @@ A temporary heavy worker should receive its own VM, runner account, runner regis
 
 ## Sources
 
-- [SmolRunner threat model](THREAT_MODEL.md)
+- [Glaeda threat model](THREAT_MODEL.md)
 - [Lima VZ configuration](https://lima-vm.io/docs/config/vmtype/vz/)
 - [Lima plain mode](https://lima-vm.io/docs/config/plain/)
 - [Lima edit command](https://lima-vm.io/docs/reference/limactl_edit/)

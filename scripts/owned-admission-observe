@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Observe an installed focused gate without reserving capacity or launching work."""
+import argparse
+import sys
+
+from owned_linux_admission import canonical, observe
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--root", required=True)
+arguments = parser.parse_args()
+sys.stdout.buffer.write(canonical(observe(arguments.root)))

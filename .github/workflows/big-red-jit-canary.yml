@@ -1,0 +1,72 @@
+name: Big Red JIT canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_big_red:
+        description: Run the reviewed native owned-Linux Scale Set leg as well as hosted baseline
+        required: true
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  hosted-baseline:
+    name: Hosted baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Record hosted job entry
+        run: printf 'github_job_entry_unix_ns=%s\n' "$(date +%s%N)" > /tmp/glaeda-job-entry.txt
+      - name: Check out exact workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          show-progress: false
+      - name: Run controlled canary workload
+        run: |
+          mkdir -p canary-receipt
+          cp /tmp/glaeda-job-entry.txt canary-receipt/job-entry.txt
+          bash scripts/github-actions-jit-canary.sh hosted canary-receipt
+      - name: Publish hosted receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hosted-jit-canary-${{ github.sha }}
+          path: canary-receipt
+          if-no-files-found: error
+          retention-days: 7
+
+  big-red:
+    name: Big Red native JIT
+    if: ${{ inputs.run_big_red }}
+    runs-on: big-red-owned-linux
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Record Big Red job entry
+        run: printf 'github_job_entry_unix_ns=%s\n' "$(date +%s%N)" > /tmp/glaeda-job-entry.txt
+      - name: Check out exact workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          show-progress: false
+      - name: Run controlled canary workload
+        run: |
+          mkdir -p canary-receipt
+          cp /tmp/glaeda-job-entry.txt canary-receipt/job-entry.txt
+          bash scripts/github-actions-jit-canary.sh big-red canary-receipt
+      - name: Publish Big Red receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: big-red-jit-canary-${{ github.sha }}
+          path: canary-receipt
+          if-no-files-found: error
+          retention-days: 7

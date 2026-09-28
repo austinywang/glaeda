@@ -1,0 +1,2296 @@
+#!/usr/bin/env python3
+"""glaeda-disk: say where the disk went, and reclaim what is safe to rebuild.
+
+    glaeda-disk                     report: biggest items, verdicts, reclaimable total
+    glaeda-disk --apply             delete every reclaimable item, largest first
+    glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
+    glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
+    glaeda-disk --pressure --apply waits while a GitHub Actions job runs, unless below --emergency
+    glaeda-disk --refresh           re-measure every size now instead of using the snapshot
+    glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones)
+
+Parallel sessions each keep a full DerivedData, and its SourcePackages artifacts and module
+caches are byte-identical across them. --dedupe replaces each duplicate with a copy-on-write
+clone of one canonical file, keeping the duplicate's mode and timestamps. Builds see the same
+bytes; the disk stores them once. du still counts clones in full; df shows the real saving.
+
+macOS keeps no directory sizes (Spotlight has none for folders), so measuring
+means walking every file, which is disk-latency bound. Sizes are therefore kept
+in a snapshot: a report prints instantly from it, re-judges every verdict live
+(processes, idle time, git), sizes only new items, and re-measures in the
+background once the snapshot is older than --max-age minutes.
+
+Only families whose contents are reproducible build output or scratch space are
+ever deleted. Everything else is reported so the space is at least visible.
+An item is never deleted while a process has its cwd inside it, a process command
+line names it, it holds a git checkout, or it changed within the idle window.
+A cache is recognized by its content, never its name (cache_layout: a CACHEDIR.TAG,
+npm's cacache, a hex-sharded content store like Go's build cache, bun's install cache,
+a rustup toolchain, Go's module cache, a Chromium disk cache, a Bazel output root).
+In the cache families (not tmp or scratch, whose checkouts are judged in full) such a
+tree is "sealed": the git search checks its top two levels, where a person's clone would
+sit, and does not walk the millions of blobs below. Any other tree is searched in full,
+and one too large to finish, unreadable, or holding another filesystem stays unchecked (kept).
+The home-caches family finds caches anywhere in the home directory by the layouts that name
+the tool refilling them (DISCOVERABLE: ~/.npm/_cacache, ~/.bun/install/cache, a cargo-tagged
+~/.cargo/registry, ~/go/pkg/mod, a rustup toolchain nothing pins), never a Python environment
+(uv and direnv tag those too). Least recently used goes first, counting file access where the
+filesystem records it; a cache in use is kept by process evidence. Secrets, keychains,
+checkouts, other filesystems, the Chromium trees and the macOS privacy-protected folders are
+never searched (HOME_NEVER).
+Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
+Every deletion is appended to a JSONL receipt.
+
+On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
+tier, evicted LRU under pressure: parked pull request builds idle over an hour, seeds other than each
+root's newest two current ones, and a root's kept build once the root has been idle two days. The
+Chromium / cmux-browser trees and their caches are never deleted (NEVER_DELETE).
+
+Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
+reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
+Thresholds scale with the disk: "15%:40-150" is 15% of it, at least 40 and at most 150 GiB,
+so the same default fits a 256 GB laptop, a Mac mini and a multi-terabyte Mac Studio.
+
+A tmpfs holds its files in RAM and swap, so its free space says nothing about pressure: a
+16 GiB /tmp at 80% had filled swap while still "2.3G free". A tmpfs is judged by
+--tmpfs-low/--tmpfs-target instead (default: pressure once a quarter of it is in use), and
+its items count from 1 MiB.
+
+The temp dir also counts top-level files (leaked extracted libraries, logs), and a scratch
+checkout there is reclaimable when deleting it loses nothing
+git holds: clean, no stash, no other worktrees, and every commit it points at (refs, HEAD,
+reflogs) on a remote-tracking ref or confirmed by a remote server (`fetch --negotiate-only`:
+no objects move, no refs change; unreachable means keep). Every submodule repository it would
+take along, in its git dir or embedded in its tree, must pass the same test; pinned submodule
+commits fetched by id are what the server confirms. A linked worktree must be unlocked, with
+HEAD on a branch, tag or remote ref of its repository, which survives, and no commit only its
+own reflog holds. Ignored files go with it: in a temp-dir checkout they are
+build output or copies. Nested or unverifiable checkouts stay protected.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import platform
+import pwd
+import math
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+
+HOME = Path.home()
+SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
+DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (the runner hooks and the LaunchAgent)
+# Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
+# re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
+NESTED_KEEP = HOME / ".cache/glaeda-disk/nested-keep.json"
+NESTED_KEEP_S = 24 * 3600
+# Session scratch holds whole source copies nested deeper than git_state's search; finding every
+# checkout in one took ~48 s on a loaded Air Blue (glaeda#1293). Paid only by idle items.
+NESTED_DEPTH, NESTED_BUDGET = 40, 5_000_000
+DEDUPE_SUBDIRS = ("SourcePackages", "ModuleCache.noindex", "SDKExplicitPrecompiledModules")
+DEDUPE_MIN_BYTES = 1024 * 1024
+GIB = 1024**3
+DARWIN = platform.system() == "Darwin"
+
+
+@dataclass(frozen=True)
+class Family:
+    id: str
+    root: Path
+    reclaimable: bool
+    rebuild: str
+    depth: int = 1  # candidates are directories this many levels below root
+    skip: tuple[str, ...] = ()
+    # when set, candidates are directories with this name found up to `depth` levels below
+    # root (the first match on a path wins), instead of every directory exactly `depth` down
+    match: str = ""
+    marker: str = ""  # with match: the candidate must also contain this file
+    files: bool = False  # top-level regular files are candidates too
+    min_bytes: int | None = None  # size floor for this family instead of --min-mib
+    git_disposable: bool = False  # a checkout that loses nothing when deleted is reclaimable
+    nested_git: bool = False  # judge every checkout inside an item, not only one rooted at it
+    owner: str = ""  # who writes it, so a cache nobody owns any more is visible
+    owner_job: str = ""  # launchd service of that owner (e.g. system/ai.x.worker); unloaded = retired
+    rebuild_minutes: float = 10.0  # rough cost of losing it; cheaper items go first under pressure
+    skip_prefixes: tuple[str, ...] = ()  # candidates whose name starts with one of these are skipped
+    # size every missing candidate with one `du -d1` walk of root instead of one du per candidate:
+    # a macOS $TMPDIR holds tens of thousands of small leaked directories (25,730 on Air Blue)
+    bulk_sizes: bool = False
+    build_output: bool = False  # DerivedData-like: SwiftPM clones inside do not make it a checkout
+    include: tuple[str, ...] = ()  # when set, only candidates whose name starts with one of these
+    min_idle_hours: float = 0.0  # an item must also be idle this long, whatever the idle window
+    max_idle_hours: float | None = None  # a hot-tier item goes once idle this long, whatever the idle window
+    # candidates are the sealed caches discover_caches finds below root, not root's children
+    discover: bool = False
+
+
+def idle_window(fam: Family, idle_hours: float) -> float:
+    window = max(idle_hours, fam.min_idle_hours)
+    return window if fam.max_idle_hours is None else min(window, fam.max_idle_hours)
+
+
+# Never deleted by any family, at any pressure (Leo, 2026-09-27): the Chromium / cmux-browser dev trees
+# and their caches. A lost tree is a ~17 min LAN re-seed at best and a multi-hour Chromium build at worst,
+# and a campaign may hold work nowhere else. A candidate at, inside or above one of these paths, or whose
+# name matches NEVER_DELETE_NAMES, is dropped before it is judged.
+NEVER_DELETE = ("cmux-browser-fleet", "Library/Caches/cmux-release-support", "Library/Caches/siso")  # under HOME
+NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-release-support|vpython|cipd", re.I)
+
+
+def never_delete(path: Path) -> bool:
+    if NEVER_DELETE_NAMES.search(path.name):
+        return True
+    p = os.path.realpath(path)
+    for keep in NEVER_DELETE:
+        k = os.path.realpath(HOME / keep)
+        if p == k or p.startswith(k + "/") or k.startswith(p + "/"):
+            return True
+    return False
+
+
+# cmux CI's warm state on an owned mini (cmux scripts/ci/owned_build_state.py, seed_derived_data.py).
+# Root 1 keeps it in FLEET_CI, root k in FLEET_CI/cmux-ci-<k>. This is the local hot tier: every item is
+# a copy of something a job can fetch or rebuild (seed bucket, the PR's next compile), so it is evicted
+# LRU under pressure, keeping what the next job most likely starts from.
+FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
+SEED_SOURCE = "seed-source.json"
+SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
+KEPT_BUILD_IDLE_HOURS = 48.0
+PARKED_IDLE_HOURS = 1.0  # glaeda-idle-warm keeps a live root's build within minutes of main
+
+
+def fleet_stores(ci: Path | None = None) -> list[Path]:
+    ci = FLEET_CI if ci is None else ci
+    if not ci.is_dir():
+        return []
+    return [ci, *sorted(p for p in ci.glob("cmux-ci-*")
+                        if p.name[len("cmux-ci-"):].isdigit() and p.is_dir() and not p.is_symlink())]
+
+
+def fleet_families(ci: Path | None = None) -> list[Family]:
+    fams = []
+    for store in fleet_stores(ci):
+        # A parked pull request build (owned_build_state.py, usable for PR_SLOT_HOURS) has no disk floor of
+        # its own: two per root grew a mini's use by ~38 GiB within hours of landing (cmux14, 2026-09-27).
+        # One parked over PARKED_IDLE_HOURS ago goes first: a re-push soon after its park is the one it helps.
+        fams.append(Family("cmux-pr-builds", store / "pr-builds", True,
+                           "the pull request's next push compiles from main's kept build",
+                           include=("pr-",), build_output=True, max_idle_hours=PARKED_IDLE_HOURS,
+                           owner="cmux owned_build_state.py (park)", rebuild_minutes=6))
+        # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
+        # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
+        fams.append(Family("cmux-seeds", store / "seeds", True,
+                           "glaeda-seed-prefetch or the next job fetches it again", build_output=True,
+                           owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4))
+        # A root's kept build (and a discard a killed job left) goes only when the root is dead.
+        fams.append(Family("cmux-kept-build", store, True, "the next job on this root starts from a seed",
+                           include=("derived-data", ".derived-data.discard-"), build_output=True,
+                           min_idle_hours=KEPT_BUILD_IDLE_HOURS,
+                           owner="cmux owned_build_state.py (keep)", rebuild_minutes=10))
+    return fams
+
+
+def seed_verdict(path: Path) -> str:
+    """Why a seed stays whatever its age, or "": one of its root's newest SEED_KEEP seeds of the prefix the
+    root's last job recorded (seed-source.json), or of any prefix when it recorded none. Dot entries are a
+    download or delete in progress, never a seed."""
+    try:
+        prefix = json.loads((path.parent.parent / SEED_SOURCE).read_text()).get("prefix") or ""
+    except (OSError, ValueError, AttributeError):
+        prefix = ""
+    if not isinstance(prefix, str):
+        prefix = ""
+    if path.name.startswith(".") or not path.name.startswith(prefix):
+        return ""
+    current = []
+    for c in _entries(path.parent):
+        if c.name.startswith(prefix) and not c.name.startswith(".") and c.is_dir(follow_symlinks=False):
+            try:
+                current.append((c.stat(follow_symlinks=False).st_mtime, c.name))
+            except OSError:
+                continue
+    newest = {name for _, name in sorted(current, reverse=True)[:SEED_KEEP]}
+    return f"one of its root's newest {SEED_KEEP} current seeds" if path.name in newest else ""
+
+
+WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
+
+
+def worktree_roots(projects: Path) -> list[Path]:
+    """Worktree parents under ~/Projects: the fixed names plus any `<name>-worktrees`."""
+    names = set(WORKTREE_DIRS)
+    for c in _children(projects):
+        if c.name.endswith("-worktrees") and c.is_dir() and not c.is_symlink():
+            names.add(c.name)
+    return [projects / n for n in sorted(names)]
+
+
+def fs_type(path: Path, mounts: Path = Path("/proc/mounts")) -> str:
+    """Filesystem type of the mount holding path ("" when unknown, e.g. on macOS)."""
+    try:
+        target = str(mount_point(path))
+        best = ""
+        for line in mounts.read_text().splitlines():
+            f = line.split()
+            if len(f) >= 3 and f[1].replace("\\040", " ") == target:
+                best = f[2]  # a later mount on the same point shadows earlier ones
+        return best
+    except OSError:
+        return ""
+
+
+def darwin_user_tmp() -> Path | None:
+    """The per-user temp dir macOS gives every process as $TMPDIR (/var/folders/../T), resolved.
+
+    It is not /private/tmp, so scratch that tools create with mktemp or tempfile lands here
+    unseen: 14.5 GiB of throwaway cmux copies and build traces sat in it on Air Blue (2026-09-25).
+    """
+    out = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True)
+    value = out.stdout.strip() if out.returncode == 0 else ""
+    if not value:
+        return None
+    path = Path(os.path.realpath(value))
+    return path if path.is_dir() and path != Path("/private/tmp") else None
+
+
+def bazel_family(root: Path) -> Family:
+    # Bazel's output root on macOS (Linux keeps it under ~/.cache/bazel, a bazel-output-root layout). One output
+    # base per workspace (an md5 name) and the unpacked install/: all rebuilt by bazel, and external/
+    # holds its repository fetches, so git inside is fetched, not work (as in DerivedData). A running
+    # bazel server holds its output base open and names it on its command line, so the in-use checks
+    # keep it; a `bazel run` binary writing into its runfiles is kept by its cwd while it runs.
+    # cache/ is the repository cache, not a rebuild: its downloads sit too deep for the idle check,
+    # no process names it, newer Bazel links output bases' external/ into it, and it is what an
+    # offline build or a vanished URL needs. install/ bases carry future mtimes, so they read recent.
+    return Family("bazel-output", root, True, "bazel rebuilds it", skip=("cache",), owner="bazel",
+                  rebuild_minutes=30, build_output=True)
+
+
+def default_families() -> list[Family]:
+    tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
+    tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
+    uid = os.getuid()
+    projects = HOME / "Projects"
+    wt_roots = worktree_roots(projects)
+    fams = [
+        Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
+               "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
+               build_output=True),
+        Family("claude-scratchpad", tmp / f"claude-{uid}", True,
+               "session scratch space; the session is idle", depth=2,
+               skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
+               # sessions clone into <session>/scratchpad/<name>; each clone must lose nothing
+               git_disposable=True, nested_git=True),
+        Family("tmp", tmp, True, "agent scratch under the temp dir",
+               skip=(f"claude-{uid}",), files=True,
+               min_bytes=1024**2 if tmpfs else None, git_disposable=True, owner="agents and tools",
+               rebuild_minutes=0.5),
+        # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
+        # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
+        # so a unit's DerivedData can go (see derived_data) while the clones below cmux-base and work
+        # stay protected; hq's cleanup-host.sh ages those out.
+        Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
+               "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True,
+               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30),
+        # Caches are disposable by definition; an idle one goes under pressure, a live one (go-build
+        # while a Go build runs) stays recent. Any git data inside keeps it, as everywhere else.
+        Family("user-cache", HOME / ".cache", True, "the tool re-downloads or rebuilds it",
+               # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
+               # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
+               skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
+               owner="tools (XDG cache)", rebuild_minutes=5),
+        Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
+               # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
+               # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
+               skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
+                     "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
+                     "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
+               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
+        # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
+        # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
+        # so a tool this list never heard of is covered once its cache has a recognized layout.
+        # A day at least: Linux's relatime moves a file's access time once a day, so a cache read every
+        # hour can show a day-old atime.
+        Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
+               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=24.0),
+        Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
+               "use `xcrun simctl delete unavailable` (report only)"),
+        Family("projects", projects, False, "checkouts (report only)",
+               skip=tuple(r.name for r in wt_roots)),
+    ]
+    user_tmp = darwin_user_tmp() if DARWIN else None
+    if user_tmp is not None:
+        # Apple daemons keep live state in com.apple.* entries without holding them open.
+        fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
+                           skip_prefixes=("com.apple.",), git_disposable=True, bulk_sizes=True,
+                           owner="agents and tools", rebuild_minutes=0.5))
+    # The dev-build worker's shared cache (the cmuxterm-hq controller's worker, live only on the dev-build worker
+    # host since cmuxterm-hq#661): visible with its owner, never deleted here. When the worker is unloaded the
+    # report says so, since other tools may still read parts of it (2026-09-24).
+    fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), False,
+                       "report only: the dev-build worker's shared cache",
+                       owner="cmux dev-build worker (hq controller)",
+                       owner_job="system/ai.manaflow.cmux-build-worker"))
+    bazel_user = ""
+    with contextlib.suppress(KeyError):
+        bazel_user = pwd.getpwuid(uid).pw_name
+    if DARWIN and bazel_user:
+        fams.append(bazel_family(Path(f"/private/var/tmp/_bazel_{bazel_user}")))
+    if DARWIN:  # the owned cmux minis
+        fams += fleet_families()
+        # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
+        fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
+                           "report only: its owner evicts LRU to a 24 GiB budget",
+                           owner="cmux node_product_cache.py"))
+    for root in wt_roots:
+        fams.append(Family("worktrees", root, False,
+                           "run glaeda-worktree-reclaim-all (report only)"))
+    # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
+    # Sizes here are also counted inside their checkout under projects or worktrees.
+    fams.append(Family("cargo-target", projects, False,
+                       "report only: cargo clean; also counted in its checkout",
+                       depth=4, match="target", marker="CACHEDIR.TAG"))
+    return [f for f in fams if f.root.is_dir()]
+
+
+@dataclass
+class Item:
+    family: str
+    path: str
+    bytes: int
+    idle_hours: float
+    verdict: str  # reclaimable | recent | in-use | git-checkout | unchecked | report-only | kept
+    reasons: list[str] = field(default_factory=list)
+
+
+def du_bytes(path: Path) -> int:
+    out = subprocess.run(["du", "-xsk", str(path)], capture_output=True, text=True)
+    try:
+        return int(out.stdout.split()[0]) * 1024
+    except (IndexError, ValueError):
+        return 0
+
+
+BULK_SIZE_MIN = 64  # unsized candidates in a bulk_sizes family before one walk beats per-item du
+
+
+def du_children(root: Path) -> dict[str, int]:
+    """Sizes of every directory directly below root from a single walk, keyed like candidates."""
+    out = subprocess.run(["du", "-xk", "-d", "1", str(root)], capture_output=True, text=True)
+    sizes: dict[str, int] = {}
+    for line in out.stdout.splitlines():
+        size, _, path = line.partition("\t")
+        if path and path != str(root) and size.isdigit():
+            sizes[str(root / Path(path).name)] = int(size) * 1024
+    return sizes
+
+
+def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool = False) -> float:
+    """Newest mtime of path and entries up to `levels` below it, visiting at most `budget` entries.
+
+    Build tools touch top-level files (DerivedData info.plist, logs) on every run, so a shallow,
+    bounded look is enough to see activity without walking the whole tree. With `access`, a file's
+    access time counts too, where the filesystem keeps it: a cache is read far more often than written.
+    It is a hint for LRU order, not protection: APFS moves atime lazily and Linux relatime at most daily,
+    and only the top `levels` are seen (npm's cacache and Go's module cache keep their blobs deeper).
+    A cache in use is kept by the process evidence (open files, cwd, command lines), not by atime.
+    Only files count, and never the ones a layout test reads (LAYOUT_PROBES): listing a directory or
+    reading a probe would move the very times being judged.
+    """
+    try:
+        newest = path.lstat().st_mtime
+    except OSError:
+        return 0.0
+    frontier = [str(path)]
+    for _ in range(levels):
+        nxt: list[str] = []
+        for d in frontier:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        if budget <= 0:
+                            return newest
+                        budget -= 1
+                        try:
+                            st = e.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        newest = max(newest, st.st_mtime)
+                        if access and stat.S_ISREG(st.st_mode) and e.name not in LAYOUT_PROBES:
+                            newest = max(newest, st.st_atime)
+                        if stat.S_ISDIR(st.st_mode):
+                            nxt.append(e.path)
+            except OSError:
+                pass
+        frontier = nxt
+    return newest
+
+
+class NoEvidence(Exception):
+    """Process evidence could not be collected; nothing may be deleted."""
+
+
+def process_evidence() -> tuple[list[str], str]:
+    """Every path a process has open (cwd and files) plus all command lines.
+
+    Raises NoEvidence when either source is unavailable, so callers fail closed.
+    """
+    opened: list[str] = []
+    proc = Path("/proc")
+    if not DARWIN and proc.is_dir():
+        for pid in proc.iterdir():
+            if not pid.name.isdigit():
+                continue
+            try:  # other users' processes are unreadable; that is expected, not a finding
+                fds = [pid / "fd" / fd for fd in os.listdir(pid / "fd")]
+            except OSError:
+                fds = []
+            for link in [pid / "cwd", pid / "exe", *fds]:  # exe: a running rustc from a toolchain
+                try:
+                    opened.append(os.readlink(link))
+                except OSError:
+                    pass
+        if not opened:  # at least this process has a cwd, so empty means /proc is unusable
+            raise NoEvidence("/proc showed no open paths")
+    else:
+        lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+        try:
+            out = subprocess.run([lsof, "-n", "-P", "-Fn"], capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise NoEvidence(f"lsof: {e}") from e
+        opened = [line[1:] for line in out.stdout.splitlines() if line.startswith("n/")]
+        if not opened:
+            raise NoEvidence(f"lsof returned nothing (exit {out.returncode})")
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise NoEvidence(f"ps: {e}") from e
+    if ps.returncode != 0 or not ps.stdout.strip():
+        raise NoEvidence(f"ps failed (exit {ps.returncode})")
+    return opened, command_text(ps.stdout)
+
+
+def command_lines() -> str:
+    """Current command lines (command_text), or "" when ps fails."""
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return command_text(ps.stdout) if ps.returncode == 0 else ""
+
+
+def command_text(ps_output: str) -> str:
+    """Command lines with repeated slashes collapsed: $TMPDIR ends in a slash, so a script's
+    "$TMPDIR/x" reads .../T//x, which would not match the path it names."""
+    return re.sub(r"/{2,}", "/", ps_output)
+
+
+def spellings(path: str) -> list[str]:
+    """The same location as processes may name it (macOS /tmp and /var are symlinks into /private)."""
+    out = [path]
+    for real, alias in (("/private/tmp", "/tmp"), ("/private/var", "/var"), ("/private/etc", "/etc")):
+        if path == real or path.startswith(real + "/"):
+            out.append(alias + path[len(real):])
+    return out
+
+
+def named_by(path: str, cmds: str) -> bool:
+    for spelling in spellings(path):
+        if spelling in cmds and re.search(
+                re.escape(spelling) + r"(?=$|[/\s'\"=:,;)\]])", cmds, re.M):
+            return True
+    return False
+
+
+def open_index(opened: list[str]) -> frozenset[str]:
+    """Every opened path and all its ancestors, so in_cwd is one lookup per spelling instead of a
+    scan of every open file (lsof lists tens of thousands; the scan cost ~1 min per survey)."""
+    out: set[str] = set()
+    for o in opened:
+        while o and o not in out:  # an ancestor already present has all of its own ancestors too
+            out.add(o)
+            o = o.rpartition("/")[0]
+    return frozenset(out)
+
+
+def in_cwd(path: str, opened: list[str] | frozenset[str]) -> bool:
+    """True when any process has its cwd or an open file inside path."""
+    index = opened if isinstance(opened, frozenset) else open_index(opened)
+    return any(sp in index for sp in spellings(path))
+
+
+def claude_config_dirs() -> list[Path]:
+    """~/.claude plus alternate config dirs (~/.claude-<account>, $CLAUDE_CONFIG_DIR)."""
+    dirs = [HOME / ".claude", *sorted(HOME.glob(".claude-*"))]
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        dirs.append(Path(os.environ["CLAUDE_CONFIG_DIR"]))
+    return [d for d in dirs if d.is_dir()]
+
+
+def claude_session_active(session_id: str, idle_s: float) -> bool:
+    for config in claude_config_dirs():
+        for transcript in (config / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                if time.time() - transcript.stat().st_mtime < idle_s:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
+
+
+def derived_data(fam: Family, path: Path) -> bool:
+    """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), and a tree
+    remove() had already renamed aside when it was interrupted, which is only ever reclaimed. Neither
+    is searched for git. A tool's own cache is searched, but git_state does not enter its sealed parts."""
+    return bool(fam.build_output
+            or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
+            or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
+
+
+# Cache layouts, recognized by what a tool writes rather than by a directory's name. A tree that
+# matches one is "sealed": the tool alone writes below its top level (content-addressed blobs,
+# unpacked downloads, fetched clones), so git_state checks only that top level and the one below it,
+# where a person's clone would sit, instead of walking millions of files it cannot finish (the Go build
+# cache held 18 GiB and far more than the 20000-entry budget on Air Blue, 2026-09-27). Anything else is
+# searched in full and stays "unchecked" when the search cannot finish. Sealing only shortens the git
+# search in families whose items are caches by where they sit; a layout is never enough to delete
+# something on its own except in discovery, and only for DISCOVERABLE layouts.
+CACHEDIR_TAG = b"Signature: 8a477f597d28d172789f06886806bc55"  # https://bford.info/cachedir/
+# Chromium's blockfile cache index starts with kIndexMagic 0xC103CAC3, little endian.
+CHROMIUM_INDEX_MAGIC = b"\xc3\xca\x03\xc1"
+CHROMIUM_SIMPLE_ENTRY = re.compile(r"[0-9a-f]{16}_[0-9s]")
+HEX_SHARD = re.compile(r"[0-9a-f]{1,2}")
+BUN_ENTRY = re.compile(r".+@[^@/]*@@@[0-9]+")  # bun's install cache: <name>@<version>@@@<n>
+MD5_NAME = re.compile(r"[0-9a-f]{32}")
+# Version-control state: a directory holding one is a checkout, never a cache and never searched past.
+VCS_MARKERS = (".git", ".jj", ".hg", ".sl", ".svn")
+SEALED_BUDGET = 500_000  # entries git_state reads at the tops of sealed caches, per call
+LAYOUT_LISTING = 4096  # entries a layout test reads from one directory
+SHARD_SAMPLE = 16  # entries sampled from each of the first four shards; all must be blobs or shards
+# Files a layout test reads. Reading moves their access time (Linux relatime), so the LRU scan
+# (newest_mtime with access) ignores their atime or every recognized cache would look just used.
+LAYOUT_PROBES = frozenset({"CACHEDIR.TAG", "index"})
+
+
+def _is_file(p: str) -> bool:
+    return os.path.isfile(p) and not os.path.islink(p)
+
+
+def _is_dir(p: str) -> bool:
+    return os.path.isdir(p) and not os.path.islink(p)
+
+
+def _head(p: str, n: int) -> bytes:
+    """The first n bytes of a regular file, or b"". Never opens a FIFO or device, which could block."""
+    try:
+        st = os.lstat(p)
+        if not stat.S_ISREG(st.st_mode):
+            return b""
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOATIME", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return b""
+    try:
+        return os.read(fd, n)
+    except OSError:
+        return b""
+    finally:
+        os.close(fd)
+
+
+def _listing(d: str, limit: int = LAYOUT_LISTING, partial: bool = False) -> list[os.DirEntry] | None:
+    """Up to `limit` entries of d, or None when d is unreadable or, unless `partial`, holds more."""
+    out: list[os.DirEntry] = []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if len(out) >= limit:
+                    return out if partial else None
+                out.append(e)
+    except OSError:
+        return None
+    return out
+
+
+def vcs_at(d: str) -> bool:
+    return any(os.path.lexists(os.path.join(d, m)) for m in VCS_MARKERS) or looks_like_repository(d)
+
+
+def _hash_sharded(d: str, entries: list[os.DirEntry]) -> bool:
+    """A content-addressed store: at least 16 entries, nine in ten of them 1-2 hex digit shard
+    directories of one width with some a-f (Go's build cache, pip's http cache, ccache), and the sampled
+    contents of the first shards all blobs or deeper shards. A git objects directory looks the same; it
+    is never judged here, since git_state and discovery stop at the repository around it."""
+    if len(entries) < 16 or os.path.basename(d) == "objects" or looks_like_repository(os.path.dirname(d)):
+        return False
+    shards = [e for e in entries if HEX_SHARD.fullmatch(e.name) and e.is_dir(follow_symlinks=False)]
+    # one width, and some a-f: numbered directories (Maven's 10..35 versions) are not hex shards
+    if (len(shards) * 10 < len(entries) * 9 or len({len(e.name) for e in shards}) != 1
+            or not any(re.search("[a-f]", e.name) for e in shards)):
+        return False
+    for shard in sorted(shards, key=lambda e: e.name)[:4]:
+        inner = _listing(shard.path, SHARD_SAMPLE, partial=True)
+        if inner is None:
+            return False
+        for e in inner:
+            # blobs, or deeper shards (pip's http cache nests a/b/c/d/e/<hash>)
+            if not (e.is_file(follow_symlinks=False)
+                    or (e.is_dir(follow_symlinks=False) and HEX_SHARD.fullmatch(e.name))):
+                return False
+    return True
+
+
+def _chromium_cache(d: str) -> bool:
+    """A Chromium disk cache: the simple cache (index-dir/the-real-index beside <16 hex>_0 entries) or
+    the blockfile cache (an index carrying Chromium's magic, and data_0 to data_3). An index and a data_0
+    alone are any dataset's names."""
+    if _is_file(os.path.join(d, "index-dir", "the-real-index")):
+        return any(CHROMIUM_SIMPLE_ENTRY.fullmatch(e.name) for e in _listing(d, 64, partial=True) or [])
+    return (_head(os.path.join(d, "index"), 4) == CHROMIUM_INDEX_MAGIC
+            and all(_is_file(os.path.join(d, f"data_{i}")) for i in range(4)))
+
+
+def stat_layout(d: str) -> str:
+    """The layout d matches by a few files a tool writes at its top, or "" (see listing_layout)."""
+    if _head(os.path.join(d, "CACHEDIR.TAG"), len(CACHEDIR_TAG)) == CACHEDIR_TAG:
+        return "cachedir-tag"  # cargo's registry, uv, Gradle and others declare their caches so
+    j = lambda *parts: os.path.join(d, *parts)  # noqa: E731
+    if _is_dir(j("index-v5")) and _is_dir(j("content-v2")):
+        return "npm-cacache"
+    if _is_file(j("lib", "rustlib", "multirust-channel-manifest.toml")) and _is_file(j("lib", "rustlib", "components")):
+        return "rustup-toolchain"
+    if _is_dir(j("cache", "download")) and _is_file(j("cache", "lock")):
+        return "go-module-cache"
+    if _chromium_cache(d):
+        return "chromium-disk-cache"
+    return ""
+
+
+def listing_layout(d: str, entries: list[os.DirEntry]) -> str:
+    """The layout d matches by the names of its entries, or ""."""
+    if _hash_sharded(d, entries):
+        return "hash-sharded-store"
+    names = [e.name for e in entries]
+    bun = sum(1 for n in names if BUN_ENTRY.fullmatch(n))
+    if bun >= 8 and bun * 2 >= sum(1 for n in names if not n.startswith((".", "@"))):
+        return "bun-install-cache"
+    # Bazel's output user root: install/ plus md5-named output bases (~/.cache/bazel/_bazel_$USER),
+    # each holding bazel's own server/, execroot/ or external/
+    if "install" in names and any(
+            MD5_NAME.fullmatch(e.name) and e.is_dir(follow_symlinks=False)
+            and any(_is_dir(os.path.join(e.path, n)) for n in ("server", "execroot", "external"))
+            for e in entries):
+        return "bazel-output-root"
+    return ""
+
+
+def cache_layout(path: Path | str) -> str:
+    """The cache layout a directory matches, or "": never a checkout or repository itself."""
+    d = os.fspath(path)
+    if not _is_dir(d) or vcs_at(d):
+        return ""
+    if (found := stat_layout(d)):
+        return found
+    entries = _listing(d)
+    return listing_layout(d, entries) if entries is not None else ""
+
+
+REPRODUCIBLE_DIRS = frozenset({"node_modules", ".build", "DerivedData", "target", ".venv",
+                               "__pycache__", ".gradle", "Pods"})
+
+
+# Never searched by discover_caches, relative to the home directory: secrets and credentials,
+# keychains (under Library), the roots other families own (~/.cache, ~/Library/Caches, ~/Projects), the
+# folders macOS guards with a privacy prompt, which a LaunchAgent must not trip and which hold no tool's
+# cache, and installed environments that carry a CACHEDIR.TAG without being recreatable (uv tags every
+# venv and tool environment it makes; pipx and virtualenvwrapper keep installs). SECRET_NAME drops any
+# directory named like a credential store at any depth.
+HOME_NEVER = (".ssh", ".gnupg", ".secrets", ".aws", ".azure", ".kube", ".docker", ".password-store",
+              ".config/gh", ".local/share/keyrings", ".local/share/uv", ".local/share/pipx",
+              ".local/pipx", ".virtualenvs", ".pyenv", ".conda", "miniconda3", "anaconda3",
+              ".cache", ".Trash", "Library", "Projects",
+              "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Public", "Applications")
+SECRET_NAME = re.compile(r"secret|credential|token|keychain|keyring|password", re.I)
+# a project's package and build directories belong to it, not to a tool; ~/.gradle is Gradle's own home
+DISCOVER_SKIP = (REPRODUCIBLE_DIRS - {".gradle"}) | {".direnv", "venv", "env"} | set(VCS_MARKERS)
+# What discovery may delete. A CACHEDIR.TAG only says "do not back this up": uv writes one into every
+# venv, direnv into .direnv. So a tagged directory counts only when its tag names a tool that refetches
+# it (TAG_CREATORS) and it holds no Python environment. A hex-sharded store never counts on its own: a
+# backup repository (restic's data/) or an app's only copy of its blobs looks the same. A Chromium disk
+# cache sits inside a browser profile, which the browser owns.
+DISCOVERABLE = ("cachedir-tag", "npm-cacache", "rustup-toolchain", "go-module-cache", "bun-install-cache",
+                "bazel-output-root")
+TAG_CREATORS = re.compile(rb"^# This file is a cache directory tag created by (cargo|Gradle)\.?\s*$", re.M)
+DISCOVER_DEPTH = 5  # deep enough for ~/.rustup/toolchains/<tc>, ~/go/pkg/mod, ~/.bun/install/cache
+DISCOVER_BUDGET = 8000  # entries read below each top-level home directory
+DISCOVER_SECONDS = 30.0  # and the whole discovery stops after this long; it only ever misses caches
+
+
+def discoverable(d: str) -> str:
+    """The layout that lets discovery delete d, or ""."""
+    layout = cache_layout(d)
+    if layout not in DISCOVERABLE:
+        return ""
+    if os.path.lexists(os.path.join(d, "pyvenv.cfg")) or os.path.lexists(os.path.join(d, "conda-meta")):
+        return ""
+    if layout == "cachedir-tag" and not TAG_CREATORS.search(_head(os.path.join(d, "CACHEDIR.TAG"), 512)):
+        return ""
+    # cargo tags its target directory too; one outside a project (CARGO_TARGET_DIR) is a build, not the
+    # registry or git cache cargo refetches
+    if layout == "cachedir-tag" and any(os.path.lexists(os.path.join(d, n))
+                                        for n in ("release", "debug", ".rustc_info.json")):
+        return ""
+    return layout
+
+
+def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCOVER_BUDGET,
+                    seconds: float = DISCOVER_SECONDS) -> list[Path]:
+    """Every discoverable cache (discoverable) up to `depth` levels below root, outermost only.
+
+    Never entered: symlinks, other filesystems, HOME_NEVER, credential-named directories, the Chromium
+    trees (never_delete), a checkout or repository of any VCS, Python environments, and package or
+    build-output directories (they belong to the project around them). Each top-level directory gets its
+    own `budget` of entries and the whole walk stops after `seconds`, so one huge tree can hide caches,
+    never delete anything. The deadline is checked between directories: it cannot interrupt one syscall
+    hung on a dead network mount (st_dev keeps discovery off other filesystems, but the first lstat of
+    the mount point itself can still block).
+    """
+    never = {os.path.realpath(root / n) for n in HOME_NEVER}
+    deadline = time.monotonic() + seconds
+    try:
+        dev = root.stat().st_dev
+    except OSError:
+        return []
+    found: list[Path] = []
+    for top in _entries(root):
+        if not top.is_dir(follow_symlinks=False):
+            continue
+        left = budget
+        level = [top.path]
+        for _ in range(depth):
+            nxt: list[str] = []
+            for d in level:
+                if time.monotonic() > deadline:
+                    return found
+                name = os.path.basename(d)
+                try:
+                    other_fs = os.lstat(d).st_dev != dev
+                except OSError:
+                    continue
+                if (other_fs or os.path.realpath(d) in never or SECRET_NAME.search(name)
+                        or name in DISCOVER_SKIP or never_delete(Path(d)) or vcs_at(d)
+                        or os.path.lexists(os.path.join(d, "pyvenv.cfg"))):
+                    continue
+                if stat_layout(d):
+                    if discoverable(d):
+                        found.append(Path(d))
+                    continue  # a sealed cache discovery may not take is not searched either
+                entries: list[os.DirEntry] = []
+                try:
+                    with os.scandir(d) as it:
+                        for e in it:
+                            left -= 1
+                            if left < 0:
+                                break
+                            entries.append(e)
+                except OSError:
+                    continue
+                if left < 0:
+                    break  # a partial listing can hide a layout, never invent one: stop here
+                if listing_layout(d, entries):
+                    if discoverable(d):
+                        found.append(Path(d))
+                    continue
+                nxt += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
+            if left < 0:
+                break
+            level = nxt
+    return found
+
+
+def _toolchain_pins(projects: Path, budget: int = 2000) -> set[str]:
+    """Toolchains a checkout pins (rust-toolchain.toml `channel`, or a legacy rust-toolchain file), in
+    ~/Projects/* and one level into its worktree directories, reading at most `budget` entries."""
+    pins: set[str] = set()
+    dirs: list[Path] = []
+    for c in _children(projects)[:budget]:
+        if c.is_dir() and not c.is_symlink():
+            dirs.append(c)
+            if c.name in WORKTREE_DIRS or c.name.endswith("-worktrees"):
+                dirs += [w for w in _children(c)[:budget] if w.is_dir() and not w.is_symlink()]
+    for d in dirs[:budget]:
+        for f in ("rust-toolchain.toml", "rust-toolchain"):
+            text = _head(os.fspath(d / f), 4096).decode(errors="replace")
+            if not text:
+                continue
+            m = re.search(r'^\s*channel\s*=\s*"([^"]+)"', text, re.M)
+            if m:
+                pins.add(m.group(1))
+            elif f == "rust-toolchain" and text.strip() and "\n" not in text.strip() and "[" not in text:
+                pins.add(text.strip())
+            break
+    return pins
+
+
+def rustup_verdict(path: Path) -> str:
+    """Why a rustup toolchain stays whatever its age, or "". Only rustup puts one back, so a toolchain
+    goes only from a rustup home (settings.toml beside toolchains/) whose rustup binary exists, and
+    never one that something names: the default, a directory override, $RUSTUP_TOOLCHAIN, or a
+    rust-toolchain file of a checkout under ~/Projects."""
+    home = path.parent.parent
+    settings = home / "settings.toml"
+    if path.parent.name != "toolchains" or not settings.is_file():
+        return "a toolchain outside a rustup home"
+    cargo_home = Path(os.environ.get("CARGO_HOME") or HOME / ".cargo")
+    if not (shutil.which("rustup") or (cargo_home / "bin/rustup").is_file() or (home.parent / ".cargo/bin/rustup").is_file()):
+        return "rustup is not installed to reinstall it"
+    try:
+        text = settings.read_text()
+    except OSError:
+        return "unreadable rustup settings"
+    pinned = set()
+    for m in re.finditer(r'^\s*default_toolchain\s*=\s*"([^"]+)"', text, re.M):
+        pinned.add(m.group(1))
+    overrides = text.partition("[overrides]")[2]
+    for m in re.finditer(r'=\s*"([^"]+)"', overrides):
+        pinned.add(m.group(1))
+    if os.environ.get("RUSTUP_TOOLCHAIN"):
+        pinned.add(os.environ["RUSTUP_TOOLCHAIN"])
+    pinned |= _toolchain_pins(HOME / "Projects")
+    for tc in pinned:
+        if path.name == tc or path.name.startswith(tc + "-"):
+            return "a pinned toolchain (default, override, RUSTUP_TOOLCHAIN or rust-toolchain file)"
+    return ""
+
+
+def keep_verdict(fam: "Family", path: Path) -> str:
+    """Why a candidate stays whatever its age, or ""."""
+    if fam.id == "cmux-seeds":
+        return seed_verdict(path)
+    if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
+        return rustup_verdict(path)
+    return ""
+
+
+def git_state(path: Path, depth: int = 5, budget: int = 20000, sealed: bool = False) -> str:
+    """"git" when version-control state (VCS_MARKERS) exists up to `depth` levels down, "none" when the
+    whole tree was searched without finding one, "unchecked" when the search could not finish.
+
+    A clone inside a scratch directory can hold unpushed commits, so callers treat "unchecked"
+    like "git" (fail closed); so is any read error other than an entry vanishing, and another
+    filesystem mounted inside (a deletion would descend into it). Package and build-output directories
+    are only checked for version control of their own, not searched. With `sealed` (families whose items
+    are caches by where they sit), a sealed cache (stat_layout, listing_layout), at path or anywhere in
+    the walk, is checked at its top level and the one below, where a person's clone would sit, and not
+    entered further; a hex-sharded store is read in full, but only as blobs, and a directory in a shard
+    is walked as usual. Every entry read counts against `budget`, or for sealed caches SEALED_BUDGET.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "none"
+    except OSError:
+        return "unchecked"
+    if not stat.S_ISDIR(st.st_mode):
+        return "none"  # a file (a leaked library in the temp dir) holds no checkout
+    dev = st.st_dev
+    sealed_left = SEALED_BUDGET
+
+    def mounted(e: os.DirEntry) -> bool:
+        try:
+            return e.stat(follow_symlinks=False).st_dev != dev
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
+    def listing(d: str, sealed_budget: bool) -> list[os.DirEntry] | str:
+        """d's entries, or "git" / "unchecked" / "gone"."""
+        nonlocal budget, sealed_left
+        out: list[os.DirEntry] = []
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if sealed_budget:
+                        sealed_left -= 1
+                        if sealed_left < 0:
+                            return "unchecked"
+                    else:
+                        budget -= 1
+                        if budget < 0:
+                            return "unchecked"
+                    if e.name in VCS_MARKERS or (e.name == "HEAD" and looks_like_repository(d)):
+                        return "git"  # a bare repository holds commits just like a checkout
+                    out.append(e)
+        except (FileNotFoundError, NotADirectoryError):
+            return "gone"  # vanished, or replaced by a file, since it was listed
+        except OSError:
+            return "unchecked"  # EIO, ESTALE, EACCES: not evidence that nothing is there
+        return out
+
+    frontier = [str(path)]
+    for _ in range(depth + 1):
+        nxt: list[str] = []
+        for d in frontier:
+            if sealed and stat_layout(d) and not vcs_at(d):
+                entries = listing(d, True)
+                if isinstance(entries, str):
+                    if entries == "gone":
+                        continue
+                    return entries
+                for e in entries:
+                    if e.is_dir(follow_symlinks=False) and (mounted(e) or vcs_at(e.path)):
+                        return "unchecked" if mounted(e) else "git"
+                continue
+            entries = listing(d, False)
+            if isinstance(entries, str):
+                if entries == "gone":
+                    continue
+                return entries
+            dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
+            if any(mounted(e) for e in dirs):
+                return "unchecked"
+            layout = listing_layout(d, entries) if sealed else ""
+            if layout == "hash-sharded-store":
+                # blobs are cheap to list and the shards were only sampled: read every shard (on the
+                # sealed budget) and walk anything in one that is neither a blob nor a deeper shard
+                stack = [e.path for e in dirs if HEX_SHARD.fullmatch(e.name)]
+                dirs = [e for e in dirs if not HEX_SHARD.fullmatch(e.name)]
+                while stack:
+                    inner = listing(stack.pop(), True)
+                    if isinstance(inner, str):
+                        if inner == "gone":
+                            continue
+                        return inner
+                    for e in inner:
+                        if e.is_dir(follow_symlinks=False):
+                            if mounted(e):
+                                return "unchecked"
+                            if HEX_SHARD.fullmatch(e.name):
+                                stack.append(e.path)
+                            else:
+                                dirs.append(e)
+            elif layout:
+                # sealed: its entries were just read; a clone one level below its top is the last look
+                if any(vcs_at(e.path) for e in dirs):
+                    return "git"
+                continue
+            for e in dirs:
+                if e.name in REPRODUCIBLE_DIRS:
+                    if vcs_at(e.path):
+                        return "git"  # e.g. `git clone x target`; not searched deeper
+                else:
+                    nxt.append(e.path)
+        frontier = nxt
+    return "unchecked" if frontier else "none"
+
+
+def looks_like_repository(d: str) -> bool:
+    """A bare repository or a copied git dir: no .git entry of its own, but HEAD, objects and refs."""
+    return (os.path.isfile(os.path.join(d, "HEAD")) and os.path.isdir(os.path.join(d, "objects"))
+            and os.path.isdir(os.path.join(d, "refs")))
+
+
+def checkouts(path: Path, depth: int = 5, budget: int = 20000) -> list[Path] | None:
+    """Every checkout (a directory holding .git) or bare repository up to `depth` levels below
+    path, not searching inside one; None when the search could not finish."""
+    found: list[Path] = []
+    frontier = [str(path)]
+    for _ in range(depth + 1):
+        nxt: list[str] = []
+        for d in frontier:
+            if os.path.lexists(os.path.join(d, ".git")) or looks_like_repository(d):
+                found.append(Path(d))
+                continue
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return None
+                        if e.is_dir(follow_symlinks=False):
+                            if e.name not in REPRODUCIBLE_DIRS:
+                                nxt.append(e.path)
+                            elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
+                                found.append(Path(e.path))  # as git_state: not searched deeper
+            except PermissionError:
+                return None
+            except OSError:
+                pass
+        frontier = nxt
+    return None if frontier else found
+
+
+_NESTED_WALKS: dict[str, list[Path] | None] = {}  # one walk per item per survey or apply pass
+
+
+def nested_checkouts(path: Path) -> list[Path] | None:
+    key = str(path)
+    if key not in _NESTED_WALKS:
+        _NESTED_WALKS[key] = checkouts(path, NESTED_DEPTH, NESTED_BUDGET)
+    return _NESTED_WALKS[key]
+
+
+def family_git_state(fam: "Family", path: Path) -> str:
+    """git_state, or for a nested_git family the full-depth checkout search."""
+    if not fam.nested_git:
+        # a family whose items are caches by where they sit may skip their sealed parts; one that deletes
+        # disposable checkouts (tmp, scratch) searches everything
+        return git_state(path, sealed=not fam.git_disposable)
+    roots = nested_checkouts(path)
+    return "unchecked" if roots is None else "git" if roots else "none"
+
+
+def bare_loss(gitdir: Path) -> str:
+    """repo_loss for a bare repository or copied git dir, and for every submodule repository
+    kept under its modules/ (they are deleted with it)."""
+    if (loss := repo_loss(gitdir)):
+        return loss
+    modules = gitdir / "modules"
+    if not modules.is_dir() or modules.is_symlink():
+        return ""
+    unreadable: list[str] = []
+    for dirpath, dirnames, _ in os.walk(modules, onerror=lambda e: unreadable.append(str(e.filename))):
+        if unreadable:
+            return "unreadable submodule store"
+        if looks_like_repository(dirpath):
+            if (loss := repo_loss(Path(dirpath))):
+                return f"{os.path.relpath(dirpath, gitdir)}: {loss}"
+            dirnames[:] = ["modules"] if "modules" in dirnames else []  # nested submodules only
+    return "unreadable submodule store" if unreadable else ""
+
+
+def _load_keep() -> dict:
+    try:
+        keep = json.loads(NESTED_KEEP.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in keep.items() if isinstance(v, dict) and isinstance(v.get("at"), (int, float))} \
+        if isinstance(keep, dict) else {}
+
+
+def family_git_loss(fam: "Family", path: Path) -> str:
+    """git_loss for the checkout at path, or with fam.nested_git for every checkout inside it."""
+    if not fam.nested_git:
+        return git_loss(path)
+    keep = _load_keep()
+    hit = keep.get(str(path))
+    if isinstance(hit, dict) and time.time() - hit.get("at", 0) < NESTED_KEEP_S and hit.get("loss"):
+        return str(hit["loss"])
+    loss = _nested_loss(path)
+    if loss:
+        keep = {k: v for k, v in keep.items()
+                if isinstance(v, dict) and time.time() - v.get("at", 0) < NESTED_KEEP_S}
+        keep[str(path)] = {"at": time.time(), "loss": loss}
+        try:
+            NESTED_KEEP.parent.mkdir(parents=True, exist_ok=True)
+            tmp = NESTED_KEEP.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(keep))
+            os.replace(tmp, NESTED_KEEP)
+        except OSError:
+            pass
+    return loss
+
+
+def ignored_checkout_loss(root: Path) -> str:
+    """checkouts() stops at a checkout, and its status hides ignored directories, so a clone kept
+    in one (vendor/ in .gitignore) would go unjudged. Build-output directories are skipped as
+    everywhere else: SwiftPM and friends keep reproducible dependency clones there."""
+    try:
+        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-z", "--ignored=matching",
+                            "--untracked-files=normal"], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.TimeoutExpired):
+        return "unreadable ignored files"
+    if r.returncode != 0:
+        return "unreadable ignored files"
+    for entry in r.stdout.split("\0"):  # -z: paths unquoted, so none is misread and skipped
+        if not entry.startswith("!! ") or not entry.endswith("/"):
+            continue
+        rel = entry[3:].rstrip("/")
+        if Path(rel).name in REPRODUCIBLE_DIRS:
+            continue
+        inner = checkouts(root / rel, NESTED_DEPTH, NESTED_BUDGET)
+        if inner is None:
+            return f"{rel}: too deep or large to find every checkout"
+        for sub in inner:
+            if not os.path.lexists(sub / ".git"):
+                if (loss := bare_loss(sub)):
+                    return f"{sub.relative_to(root)}: {loss}"
+            elif (loss := git_loss(sub)) or (loss := ignored_checkout_loss(sub)):
+                return f"{sub.relative_to(root)}: {loss}"
+    return ""
+
+
+def _nested_loss(path: Path) -> str:
+    roots = nested_checkouts(path)
+    if roots is None:
+        return "too deep or large to find every checkout"
+    inside = os.path.realpath(path) + "/"
+    for root in roots:
+        where = root.relative_to(path)
+        if not os.path.lexists(root / ".git"):
+            if (loss := bare_loss(root)):
+                return f"{where}: {loss}"
+            continue
+        if (loss := git_loss(root)):
+            return f"{where}: {loss}"
+        if (loss := ignored_checkout_loss(root)):
+            return f"{where}: {loss}"
+        # git_loss keeps a linked worktree because its repository stays; here the repository
+        # may be inside the item being deleted
+        if (root / ".git").is_file():
+            common = git_common_dir(root)
+            if not common or (os.path.realpath(common) + "/").startswith(inside):
+                return f"{where}: worktree of a repository inside this item"
+    return ""
+
+
+def has_git(path: Path) -> bool:
+    return git_state(path) != "none"
+
+
+def git_loss(path: Path) -> str:
+    """"" when deleting this checkout loses nothing git holds, else what it would lose.
+
+    Only a checkout rooted at path is judged; any failure or doubt counts as a loss.
+    """
+    dotgit = path / ".git"
+    if not os.path.lexists(dotgit) or dotgit.is_symlink():
+        return "checkout below the top level"
+
+    def git(*args: str) -> str | None:
+        try:
+            r = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True,
+                               timeout=60, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    top = git("rev-parse", "--show-toplevel")
+    if top is None or os.path.realpath(top.strip()) != os.path.realpath(path):
+        return "not a readable checkout"
+    # --ignore-submodules=none overrides submodule.*.ignore, so dirty submodules count
+    status = git("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+    if status is None or status.strip():
+        return "uncommitted or untracked changes"
+    # status hides edits to files flagged assume-unchanged (lowercase tag) or skip-worktree (S)
+    flags = git("ls-files", "-v")
+    if flags is None or any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
+        return "files hidden from status"
+    own = git("rev-parse", "--path-format=absolute", "--git-dir")
+    if own is None:
+        return "not a readable checkout"
+    # submodule repositories live in this checkout's git dir (a linked worktree's own one),
+    # so they are deleted with it
+    if (loss := submodule_loss(path, Path(own.strip()))):
+        return loss
+    if dotgit.is_dir():
+        wts = git("worktree", "list", "--porcelain")
+        if wts is None or sum(ln.startswith("worktree ") for ln in wts.splitlines()) != 1:
+            return "other worktrees use this repository"
+        if (loss := repo_loss(dotgit)):
+            return loss
+    else:  # linked worktree: branches and stash live in the repository, which stays
+        common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+        if common is None or os.path.realpath(common.strip()).startswith(os.path.realpath(path) + "/"):
+            return "repository inside the worktree"
+        if os.path.lexists(os.path.join(own.strip(), "locked")):
+            return "locked worktree"
+        # refs/bisect and refs/worktree belong to the worktree and go with it
+        refs = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)",
+                   "refs/heads", "refs/tags", "refs/remotes")
+        if refs is None or not refs.strip():
+            return "HEAD on no ref"
+        # so does its HEAD reflog: a commit made here and then checked away from lives only there
+        tips = local_tips(Path(own.strip()), worktree_only=True)
+        if tips is None:
+            return "unreadable worktree reflog"
+        left = git("rev-list", "-n1", *tips, "--not", "--branches", "--tags", "--remotes") \
+            if tips else ""
+        if left is None or left.strip():
+            return "commits only this worktree's reflog holds"
+    return ""
+
+
+def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
+                 network: bool = False) -> str | None:
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
+    if network and "GIT_SSH_COMMAND" not in env:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
+    try:
+        r = subprocess.run(["git", "--git-dir", str(gitdir), *args], capture_output=True,
+                           text=True, timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+ZERO = re.compile(r"0{40}(0{24})?$")
+
+
+# refs a linked worktree keeps for itself; they are deleted with it
+WORKTREE_REFS = ("refs/bisect", "refs/worktree", "refs/rewritten")
+
+
+def local_tips(gitdir: Path, worktree_only: bool = False) -> list[str] | None:
+    """Every commit this repository points at on its own: HEAD, all refs but remote-tracking
+    ones, and every reflog entry (a commit left behind by `submodule update` lives only there).
+    With worktree_only, only what a linked worktree's git dir holds for itself: HEAD, its
+    per-worktree refs and its reflogs. None when they cannot all be read."""
+    refs = _git_dir_run(gitdir, "for-each-ref",
+                        "--format=%(refname)%09%(objectname)%09%(*objectname)",
+                        *(WORKTREE_REFS if worktree_only else ()))
+    head = _git_dir_run(gitdir, "rev-parse", "--verify", "-q", "HEAD")
+    if refs is None or head is None:
+        return None
+    tips = {head.strip()}
+    for line in refs.splitlines():
+        name, obj, peeled = (line.split("\t") + ["", ""])[:3]
+        if not name.startswith("refs/remotes/"):
+            tips.add(peeled or obj)
+    logs = gitdir / "logs"
+    if logs.is_dir():
+        for f in logs.rglob("*"):
+            if f.is_file() and not f.relative_to(logs).parts[:2] == ("refs", "remotes"):
+                try:
+                    lines = f.read_text(errors="replace").splitlines()
+                except OSError:
+                    return None
+                tips.update(ln.split(" ", 2)[1] for ln in lines if ln.count(" ") >= 2)
+    return sorted(t for t in tips if t and not ZERO.match(t))
+
+
+NETWORK_URL = re.compile(r"(https?|ssh|git|git\+ssh|ssh\+git)://|[^/.][^/:]*:(?!//)")
+
+
+TRUSTED_LOCAL_REMOTES: tuple[str, ...] = ()  # tests: local repos standing in for a server
+
+
+def network_remotes(gitdir: Path) -> list[str] | None:
+    """Remotes on another machine. A local path or file:// remote can be one more scratch repo
+    about to be deleted too (two clones fetching from each other vouch for commits that exist
+    nowhere else), so it never counts as a copy. None when the config cannot be read."""
+    out = _git_dir_run(gitdir, "config", "--get-regexp", r"^remote\..*\.url$")
+    if out is None:
+        return [] if _git_dir_run(gitdir, "rev-parse", "--git-dir") is not None else None
+    names = set()
+    for line in out.splitlines():
+        key, _, url = line.partition(" ")
+        name = key[len("remote."):-len(".url")]
+        trusted = any(url == t or url.startswith(t + "/") for t in TRUSTED_LOCAL_REMOTES)
+        if trusted or (NETWORK_URL.match(url) and not url.startswith("file:")):
+            names.add(name)
+        else:
+            names.discard(name)  # a remote with any local URL is not trusted
+            names.add(f"\0{name}")
+    return sorted(n for n in names if not n.startswith("\0") and f"\0{n}" not in names)
+
+
+def remote_has(gitdir: Path, commits: list[str]) -> bool:
+    """True when some remote of this repository confirms it holds every one of `commits`.
+
+    `fetch --negotiate-only` asks the server which of these it has in common and transfers no
+    objects and writes no refs. An unreachable server, a refusal or a partial answer is False.
+    """
+    remotes = network_remotes(gitdir)
+    if not remotes:
+        return False
+    missing = set(commits)
+    for remote in remotes:
+        acked = _git_dir_run(gitdir, "-c", "protocol.version=2", "fetch", "--negotiate-only",
+                             *[f"--negotiation-tip={c}" for c in sorted(missing)], remote,
+                             network=True)
+        if acked is not None:
+            missing -= set(acked.split())
+        if not missing:
+            return True
+    return False
+
+
+def repo_loss(gitdir: Path) -> str:
+    """"" when deleting this (submodule) repository loses nothing: no stash, no worktrees of
+    its own, and every local commit on a remote-tracking ref or confirmed by a remote."""
+    if (gitdir / "worktrees").is_dir() and any((gitdir / "worktrees").iterdir()):
+        return "has worktrees of its own"
+    stash = _git_dir_run(gitdir, "for-each-ref", "--count=1", "refs/stash")
+    if stash is None or stash.strip():
+        return "stash entries"
+    tips = local_tips(gitdir)
+    if tips is None:
+        return "unreadable refs"
+    if not tips:
+        return ""
+    remotes = network_remotes(gitdir)
+    if remotes is None:
+        return "unreadable remotes"
+    try:
+        r = subprocess.run(["git", "--git-dir", str(gitdir), "rev-list", "--max-count=5001",
+                            "--stdin", "--not", *[f"--remotes={n}/*" for n in remotes]],
+                           input="\n".join(tips) + "\n",
+                           capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.TimeoutExpired):
+        return "unreadable history"
+    if r.returncode != 0 or len(r.stdout.split()) > 5000:
+        return "unreadable history"
+    outside = set(r.stdout.split())
+    unconfirmed = [t for t in tips if t in outside]  # every outside commit is below one of these
+    if not unconfirmed:
+        return ""
+    if len(unconfirmed) > 64 or not remote_has(gitdir, unconfirmed):
+        return "commits no remote confirms"
+    return ""
+
+
+def submodule_loss(worktree: Path, gitdir: Path, seen: set[str] | None = None,
+                   depth: int = 0) -> str:
+    """"" when every submodule repository this checkout would take with it loses nothing.
+
+    Those are the repositories stored under its git dir (`modules/`, nested ones included) and
+    any embedded in its tree (a submodule whose `.git` is a directory), recursively.
+    """
+    seen = set() if seen is None else seen
+    if depth > 8 or len(seen) > 200:
+        return "submodules nested too deep to check"
+    repos: list[tuple[str, Path]] = []
+    frontier = [gitdir / "modules"] if (gitdir / "modules").exists() else []
+    while frontier:
+        d = frontier.pop()
+        if d.is_symlink() or not d.is_dir():
+            return "unreadable submodule store"
+        for c in _children(d):
+            if c.is_symlink() or not c.is_dir():
+                continue
+            if (c / "HEAD").is_file() and (c / "objects").is_dir():
+                repos.append((os.path.relpath(c, gitdir / "modules"), c))
+                if (c / "modules").exists():
+                    frontier.append(c / "modules")
+            else:
+                frontier.append(c)  # a path component of a nested submodule name
+    links = subprocess.run(["git", "-C", str(worktree), "ls-files", "-s"], capture_output=True,
+                           text=True, timeout=60, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if links.returncode != 0:
+        return "unreadable index"
+    subs = [worktree / ln.split("\t", 1)[1] for ln in links.stdout.splitlines()
+            if ln.startswith("160000 ")]
+    for sub in subs:
+        dotgit = sub / ".git"
+        if dotgit.is_dir() and not dotgit.is_symlink():
+            repos.append((os.path.relpath(sub, worktree), dotgit))
+    for name, repo in repos:
+        key = os.path.realpath(repo)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (loss := repo_loss(repo)):
+            return f"submodule {name}: {loss}"
+    for sub in subs:  # submodules of submodules, wherever their repositories live
+        if not os.path.lexists(sub / ".git"):
+            continue  # not initialized: nothing of it is here
+        own = subprocess.run(["git", "-C", str(sub), "rev-parse", "--path-format=absolute",
+                              "--git-dir"], capture_output=True, text=True, timeout=60)
+        if own.returncode != 0:
+            return f"submodule {os.path.relpath(sub, worktree)}: not readable"
+        if (loss := submodule_loss(sub, Path(own.stdout.strip()), seen, depth + 1)):
+            return loss
+    return ""
+
+
+def git_common_dir(path: Path) -> str:
+    """The repository of a linked worktree, so its record can be pruned after deletion."""
+    if not (path / ".git").is_file():
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+                            "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""  # callers treat an unknown repository as one to keep
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+UNREADABLE: set[str] = set()
+
+
+def _entries(path: Path) -> list[os.DirEntry]:
+    """Like _children, but entries carry their type, so filtering tens of thousands (a macOS
+    $TMPDIR) costs no stat per entry."""
+    try:
+        with os.scandir(path) as it:
+            return list(it)
+    except PermissionError:
+        UNREADABLE.add(str(path))
+        return []
+    except OSError:
+        return []
+
+
+def _children(path: Path) -> list[Path]:
+    try:
+        return list(path.iterdir())
+    except PermissionError:
+        UNREADABLE.add(str(path))
+        return []
+    except OSError:
+        return []
+
+
+def owner_retired(fam: Family) -> bool:
+    """True when the family names its owner's launchd service and that service is not loaded."""
+    if not fam.owner_job or not DARWIN:
+        return False
+    try:
+        # 113 is launchctl's "could not find service"; any other failure is not evidence of retirement
+        return subprocess.run(["launchctl", "print", fam.owner_job], capture_output=True,
+                              timeout=10).returncode == 113
+    except (OSError, subprocess.SubprocessError):
+        return False  # unknown: say nothing rather than call a live owner retired
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # someone else's live process
+    return True
+
+
+def cmux_active(path: Path, levels: int = 3, budget: int = 5000) -> bool:
+    """cmuxterm-hq's reload-cloud marks a slot busy while a job runs: <slot>/.cmux-active/pid with a
+    live pid, or work/<slot>/.lock (lib/cloud-slot-runtime.sh). Either, at or up to `levels` below path,
+    means in use. An unreadable pid, or a tree too big to search within `budget`, counts as busy."""
+    level = [path]
+    for depth in range(levels + 1):
+        nxt: list[Path] = []
+        for d in level:
+            if d.parent.name == "work" and (d / ".lock").exists():  # hq's slot lock, not any tool's .lock
+                return True
+            marker = d / ".cmux-active" / "pid"
+            if marker.exists():
+                try:
+                    if _pid_alive(int(marker.read_text().split()[0])):
+                        return True
+                except (OSError, ValueError, IndexError):
+                    return True
+            if depth == levels:
+                continue
+            for c in _children(d):
+                budget -= 1
+                if budget < 0:
+                    return True
+                if c.name != ".cmux-active" and not c.is_symlink() and c.is_dir():
+                    nxt.append(c)
+        level = nxt
+    return False
+
+
+def job_busy(fam: Family, path: Path) -> bool:
+    """A cmux job unit's slots are marked in work/<slot>, not beside DerivedData/<slot>, so a
+    candidate in the job cache is busy when any slot of its whole unit (path.parent) is."""
+    if fam.id == "cmux-job-cache":
+        return cmux_active(path.parent)
+    # a sealed cache (home-caches) is never a job unit, and cmux_active calls a tree larger than its
+    # budget busy, which would keep bun's install cache forever
+    return fam.reclaimable and not fam.discover and cmux_active(path)
+
+
+def value(item: "Item", fam: Family) -> float:
+    """Deletion order under pressure: space freed per minute of rebuild, favouring what has sat idle
+    longest (a tree untouched for days is less likely to be read again)."""
+    return item.bytes * (1 + item.idle_hours / 24) / max(fam.rebuild_minutes, 0.1)
+
+
+def holds_socket(path: Path, levels: int = 2, budget: int = 3000) -> bool:
+    """True when a Unix socket sits up to `levels` below path (tmux, ssh-agent, X11, IDE servers).
+
+    /proc shows a socket a process holds as socket:[inode], not as a path, so neither the open
+    file nor the command line check sees it. A directory holding one is treated as in use.
+    """
+    frontier = [str(path)]
+    for _ in range(levels):
+        nxt: list[str] = []
+        for d in frontier:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return False
+                        try:
+                            st = e.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if stat.S_ISSOCK(st.st_mode):
+                            return True
+                        if stat.S_ISDIR(st.st_mode):
+                            nxt.append(e.path)
+            except OSError:
+                pass
+        frontier = nxt
+    return False
+
+
+SEARCH_SKIP = REPRODUCIBLE_DIRS | {".git"}
+
+
+def _search(fam: Family, budget: int = 20000) -> list[Path]:
+    found: list[Path] = []
+    level = [fam.root]
+    for _ in range(fam.depth):
+        nxt: list[Path] = []
+        for p in level:
+            for c in _children(p):
+                budget -= 1
+                if budget < 0:
+                    return found
+                if c.name in fam.skip or c.is_symlink() or not c.is_dir():
+                    continue
+                if c.name == fam.match and (not fam.marker or (c / fam.marker).exists()):
+                    found.append(c)
+                elif c.name not in SEARCH_SKIP:
+                    nxt.append(c)
+        level = nxt
+    return found
+
+
+_DISCOVERED: dict[str, list[Path]] = {}
+
+
+def candidates(fam: Family) -> list[Path]:
+    if fam.discover:
+        key = os.fspath(fam.root)
+        if key not in _DISCOVERED:  # one walk per run: main() and survey both ask
+            _DISCOVERED[key] = discover_caches(fam.root)
+        level = list(_DISCOVERED[key])
+    elif fam.match:
+        level = _search(fam)
+    else:
+        level = [fam.root]
+        for _ in range(fam.depth):
+            level = [Path(e.path) for p in level for e in _entries(p)
+                     if e.name not in fam.skip
+                     and not (fam.skip_prefixes and e.name.startswith(fam.skip_prefixes))
+                     and (e.is_dir(follow_symlinks=False)
+                          or (fam.files and e.is_file(follow_symlinks=False)))]
+        if fam.include:
+            level = [p for p in level if p.name.startswith(fam.include)]
+    uid = os.getuid()
+    owned = []
+    for p in level:
+        if never_delete(p):
+            continue
+        try:
+            if p.lstat().st_uid == uid:
+                owned.append(p)
+        except OSError:
+            pass  # vanished mid-scan
+    return owned
+
+
+def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]:
+    """The snapshot sizes an --apply may reuse: sizes decide what gets deleted under pressure, so every
+    reclaimable candidate is re-measured. A discovering family's root is the whole home directory, so
+    only its current candidates are dropped, not every size below it (that re-measured the report-only
+    checkouts too and ran past the hooks' timeout on the minis)."""
+    drop = {os.fspath(p) for f in fams if f.reclaimable and f.discover for p in candidates(f)}
+
+    def candidate_of_selected(k: str) -> bool:
+        if k in drop:
+            return True
+        for f in fams:
+            if not f.reclaimable or f.discover:
+                continue
+            root = str(f.root) + "/"
+            if k.startswith(root) and k[len(root):].split("/")[0] not in f.skip:
+                return True
+        return False
+    return {k: v for k, v in known.items() if not candidate_of_selected(k)}
+
+
+def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
+    try:
+        doc = json.loads(path.read_text())
+        return float(doc["at"]), {k: int(v) for k, v in doc["sizes"].items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0, {}
+
+
+def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT, at: float | None = None) -> None:
+    """`at` is when the oldest size was measured; only a full measurement moves it to now."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"at": time.time() if at is None else at, "sizes": sizes}))
+    os.replace(tmp, path)
+
+
+def _fresh(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < seconds
+    except OSError:
+        return False
+
+
+def survey(families: list[Family], idle_hours: float, min_bytes: int,
+           known: dict[str, int] | None = None, defer_bulk: bool = False) -> list[Item]:
+    """Judge every candidate live. Sizes come from `known` when present; the rest are measured.
+
+    With defer_bulk, unsized candidates of bulk_sizes families are left out instead of measured,
+    so a report stays fast; the background refresh sizes them for the next one.
+    """
+    with ThreadPoolExecutor(max_workers=1) as bg:
+        evidence = bg.submit(process_evidence)  # lsof is the slowest single call; overlap it
+        return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk)
+
+
+def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) -> list[Item]:
+    _NESTED_WALKS.clear()
+    now = time.time()
+    items: list[Item] = []
+    known = known if known is not None else {}
+    work = [(fam, path) for fam in families for path in candidates(fam)]
+    if defer_bulk:
+        work = [(fam, path) for fam, path in work if not fam.bulk_sizes or str(path) in known]
+    for fam in families:
+        # a few new entries are cheaper to size one by one than by re-walking the whole root
+        if fam.bulk_sizes and sum(str(p) not in known for f, p in work if f is fam) >= BULK_SIZE_MIN:
+            known.update({k: v for k, v in du_children(fam.root).items() if k not in known})
+    missing = [path for _, path in work if str(path) not in known]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        measured = dict(zip(map(str, missing), pool.map(du_bytes, missing)))
+    known.update(measured)
+    sizes = [known[str(path)] for _, path in work]
+    floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
+    idles = [(now - newest_mtime(path, 2 if fam.reclaimable else 1,
+                                 3000 if fam.reclaimable else 300, access=fam.discover)) / 3600
+             if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
+    try:
+        cwds, cmds = evidence.result()
+        blind = ""
+    except NoEvidence as e:
+        cwds, cmds, blind = [], "", f"no process evidence ({e})"
+    opened = open_index(cwds)
+    for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
+        if size < floor:
+            continue
+        sp = str(path)
+        reasons = []
+        if blind:
+            reasons.append(blind)
+        if in_cwd(sp, opened):
+            reasons.append("open by a process")
+        if named_by(sp, cmds):
+            reasons.append("named by a running command")
+        if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
+            reasons.append("claude session active")
+        # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
+        # so only an item old enough to delete pays for them (apply re-checks before deleting).
+        window = idle_window(fam, idle_hours)
+        keep = keep_verdict(fam, path)
+        deletable_age = fam.reclaimable and idle >= window
+        if deletable_age and holds_socket(path):
+            reasons.append("holds a socket")
+        if deletable_age and job_busy(fam, path):
+            reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
+        if not fam.reclaimable:
+            verdict = "report-only"
+        elif keep:
+            verdict = "kept"
+            reasons.append(keep)
+        elif reasons:
+            verdict = "in-use"
+        elif (not derived_data(fam, path) and (g := family_git_state(fam, path)) != "none"
+              and not (g == "git" and fam.git_disposable and idle >= window
+                       and not (loss := family_git_loss(fam, path)))):
+            verdict = "git-checkout" if g == "git" else "unchecked"
+            if g == "unchecked":
+                reasons.append("too deep or large to rule out a git checkout")
+            elif fam.git_disposable and idle >= window:
+                reasons.append(loss)
+        elif idle < window:
+            verdict = "recent"
+        else:
+            verdict = "reclaimable"
+        items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons))
+    items.sort(key=lambda i: i.bytes, reverse=True)
+    return items
+
+
+def free_bytes(path: Path) -> tuple[int, int]:
+    u = shutil.disk_usage(path)
+    return u.free, u.total
+
+
+def space(spec: str, total: int) -> int:
+    """A threshold as bytes: "60" is 60 GiB, "15%" is 15% of this filesystem's size, and
+    "15%:40-150" is that share held between 40 and 150 GiB. LO never lifts it past twice the
+    share, so a small disk (a 30 GiB VM) is not left permanently under pressure."""
+    spec = str(spec).strip()
+    share, _, bounds = spec.partition(":")
+    if not share.endswith("%"):
+        if bounds:
+            raise ValueError(f"bounds need a percentage: {spec!r}")
+        return int(float(share) * GIB)
+    n = int(total * float(share[:-1]) / 100)
+    if bounds:
+        lo, sep, hi = bounds.partition("-")
+        if not sep:
+            raise ValueError(f"bounds are LOW-HIGH GiB: {spec!r}")
+        lo_b, hi_b = int(float(lo) * GIB), int(float(hi) * GIB)
+        if lo_b > hi_b:
+            raise ValueError(f"bounds are LOW-HIGH GiB: {spec!r}")
+        n = min(max(n, min(lo_b, 2 * n)), hi_b)
+    return n
+
+
+# A GitHub Actions job in progress (any runner dir: actions-runner, actions-runner-glaeda-2, ...). An
+# auto-updated runner's bin is a symlink to bin.<version>, which ps shows resolved.
+CI_WORKER = re.compile(r"/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
+
+
+def ci_jobs() -> list[str]:
+    """Command lines of running CI jobs; empty when ps fails (apply's own evidence then fails closed)."""
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip()[:160] for line in out.splitlines() if CI_WORKER.search(line)]
+
+
+def emergency_bytes(fs: "Fs", emergency: str, floor_gib: float = 0.0) -> int:
+    """The emergency floor on fs: --emergency, lifted on HOME's volume to RUNNER_FLOOR_TARGET_GIB above a
+    runner's disk floor. A busy mini always has a job running, so below this is the only place pressure
+    deletes happen; under the gate's floor they would wait until the runners stopped taking jobs
+    (cmux9s, 2026-09-27: every run deferred at 71 GiB free, emergency 46 GiB, floor 50 GiB)."""
+    n = space(emergency, fs.total)
+    if floor_gib > 0 and not fs.tmpfs and fs.dev == HOME.stat().st_dev:
+        n = max(n, min(int((floor_gib + RUNNER_FLOOR_TARGET_GIB) * GIB), fs.total // 2))
+    return n
+
+
+def ci_defer(fss: dict[int, Fs], jobs: list[str], emergency: str, floor_gib: float = 0.0) -> str:
+    """Why a pressure run should wait for a running CI job, or "" to go ahead. A bulk delete competes
+    with the job's compile for disk and CPU (a 30 GiB delete starved one on a build mini), so it waits
+    unless some filesystem under pressure is below the emergency floor (emergency_bytes)."""
+    if not jobs:
+        return ""
+    if any(fs.under and fs.free < emergency_bytes(fs, emergency, floor_gib) for fs in fss.values()):
+        return ""
+    return f"deferred: a CI job is running ({jobs[0]}); pressure deletes wait unless free drops below {emergency} or {RUNNER_FLOOR_TARGET_GIB:g} GiB above a runner floor"
+
+
+def mount_point(path: Path) -> Path:
+    path = Path(os.path.realpath(path))
+    dev = path.stat().st_dev
+    while path.parent != path and path.parent.stat().st_dev == dev:
+        path = path.parent
+    return path
+
+
+@dataclass
+class Fs:
+    dev: int
+    mount: str
+    free: int
+    total: int
+    low: int
+    target: int
+    tmpfs: bool = False
+
+    @property
+    def under(self) -> bool:
+        return self.free < self.low
+
+
+# A glaeda runner's listener gate holds the runner while free disk is under its job-started hook's --min-free-gib,
+# and resumes only GATE_DISK_RESUME_GIB (2 GiB) above it. Pressure on a disk must start by then, or a 460 GiB mini
+# between the default low (25%:60-200, about 115 GiB) and a 150 GiB floor stays held with nothing freed. The
+# target sits RUNNER_FLOOR_TARGET_GIB higher, so one run lifts the mini well clear of the floor.
+RUNNER_FLOOR_LOW_GIB = 4.0
+RUNNER_FLOOR_TARGET_GIB = 20.0
+RUNNER_HOOKS = "actions-runner*/glaeda-hooks/job-started.sh"  # glaeda-cmux-runner's default --runner-dir
+MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"  # the hook's min_free_gib reads the same
+
+
+def runner_floor_gib(home: Path = HOME) -> float:
+    """The highest --min-free-gib among this user's glaeda runner hooks (the last one in each), or 0."""
+    floor = 0.0
+    for hook in home.glob(RUNNER_HOOKS):
+        try:
+            values = re.findall(MIN_FREE_GIB_RE, hook.read_text())
+            value = float(values[-1]) if values else 0.0
+            if math.isfinite(value):
+                floor = max(floor, value)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+    return floor
+
+
+def filesystems(fams: list[Family], low: str, target: str,
+                tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0) -> dict[int, Fs]:
+    out: dict[int, Fs] = {}
+    for f in fams:
+        dev = f.root.stat().st_dev
+        if dev not in out:
+            free, total = free_bytes(f.root)
+            tmpfs = not DARWIN and fs_type(f.root) == "tmpfs"
+            lo, tg = (tmpfs_low, tmpfs_target) if tmpfs else (low, target)
+            lo_b, tg_b = space(lo, total), space(tg, total)
+            # a runner's disk floor (runner_floor_gib) lifts both on HOME's volume, where the gate measures it,
+            # never past half the disk, as space() keeps a small disk from permanent pressure
+            if floor_gib > 0 and not tmpfs and dev == HOME.stat().st_dev:
+                lo_b = max(lo_b, min(int((floor_gib + RUNNER_FLOOR_LOW_GIB) * GIB), total // 2))
+                tg_b = max(tg_b, min(int((floor_gib + RUNNER_FLOOR_TARGET_GIB) * GIB), total // 2))
+            out[dev] = Fs(dev, str(mount_point(f.root)), free, total, lo_b, tg_b, tmpfs)
+    return out
+
+
+def gib(n: int) -> str:
+    return f"{n / GIB:6.1f}G"
+
+
+def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
+           notes: dict[str, str] | None = None, fams: dict[str, Family] | None = None) -> None:
+    for fs in fss:
+        print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
+              f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
+              f"{gib(fs.low).strip()}{' (tmpfs: RAM and swap)' if fs.tmpfs else ''}"
+              f"{' (under pressure)' if fs.under else ''}")
+    print(f"idle window {idle_hours:g}h\n")
+    by_fam: dict[str, int] = {}
+    for i in items:
+        by_fam[i.family] = by_fam.get(i.family, 0) + i.bytes
+    print("by family")
+    for fam, n in sorted(by_fam.items(), key=lambda kv: -kv[1]):
+        r = sum(i.bytes for i in items if i.family == fam and i.verdict == "reclaimable")
+        note = f"  ({notes[fam]})" if notes and fam in notes else ""
+        f = (fams or {}).get(fam)
+        if f and f.owner:
+            note += f"  owner: {f.owner}" + (" (RETIRED: its service is not loaded)" if owner_retired(f) else "")
+        print(f"  {gib(n)}  {fam:20s}  reclaimable {gib(r).strip()}{note}")
+    print(f"\ntop {limit}")
+    for i in items[:limit]:
+        why = f" ({', '.join(i.reasons)})" if i.reasons else ""
+        path = i.path.replace(str(HOME), "~")
+        print(f"  {gib(i.bytes)}  {i.verdict:12s} {i.idle_hours:6.1f}h  {path}{why}")
+    for u in sorted(UNREADABLE):
+        hint = (f"background jobs need Full Disk Access for {os.path.realpath(sys.executable)}"
+                if DARWIN else f"not readable by uid {os.getuid()}; its items are skipped")
+        print(f"\ncannot read {u}: permission denied ({hint})", file=sys.stderr)
+    total_r = sum(i.bytes for i in items if i.verdict == "reclaimable")
+    print(f"\nreclaimable now: {gib(total_r).strip()}  ->  glaeda-disk --apply")
+
+
+def remove(path: Path, after_rename=None) -> None:
+    """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
+    if path.is_symlink():
+        raise OSError("refusing symlink")
+    if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
+        raise OSError("refusing a mount point")
+    if not path.is_dir():
+        path.unlink()
+        return
+    # Move it out of the way first (same directory, so one atomic rename): a job that starts during a
+    # minutes-long delete then finds nothing at the path instead of a half-deleted tree it might reuse.
+    # A read-only parent makes the rename fail and apply records the item incomplete: nothing is lost.
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+    os.rename(path, doomed)
+    if after_rename is not None:
+        after_rename()
+    shutil.rmtree(doomed, ignore_errors=False, onerror=_chmod_retry)
+
+
+def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
+    rwx = stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR
+    parent = os.path.dirname(p)
+    if not os.path.islink(parent):
+        os.chmod(parent, rwx)
+    if not os.path.islink(p):  # never chmod through a symlink to something outside the tree
+        os.chmod(p, rwx)
+    func(p)
+
+
+APPLY_LSOF_ITEMS, APPLY_LSOF_S = 8, 20.0  # apply re-takes lsof for discovered items this often
+
+
+def apply(items: list[Item], families: dict[str, Family], receipt: Path,
+          targets: dict[int, int] | None, idle_hours: float) -> int:
+    """Delete reclaimable items, largest first. With `targets` (filesystem device -> free bytes
+    to stop at), only items on those filesystems are touched, each until its own target."""
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    released = 0
+    _NESTED_WALKS.clear()  # re-observe every checkout right before deleting
+    try:
+        cwds, cmds = process_evidence()
+    except NoEvidence as e:
+        print(f"refusing to delete anything: {e}", file=sys.stderr)
+        return 0
+    cwds = open_index(cwds)
+    lsof_at, lsof_items = time.monotonic(), 0
+    # cheapest loss per byte first, not simply largest first
+    for i in sorted(items, key=lambda i: value(i, families[i.family]), reverse=True):
+        if i.verdict != "reclaimable":
+            continue
+        p = Path(i.path)
+        if targets is not None:
+            try:
+                dev = p.parent.stat().st_dev
+            except OSError:
+                continue
+            if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
+                continue
+        # fresh re-observation right before the destructive step. cmux jobs clone their warm state with
+        # `cp -cR SOURCE ...` at any moment and a clone leaves the source's times alone, so those families
+        # re-read the command lines per item rather than trusting the ones from the start of a long run.
+        if families[i.family].build_output and families[i.family].root.is_relative_to(FLEET_CI):
+            cmds = command_lines() or cmds
+        fresh_layout = ""
+        if families[i.family].discover:
+            # a discovered cache is deleted only on its own layout, so both are re-read now: the layout,
+            # and the open files (a build may have started using it since the survey's lsof)
+            # (lsof costs seconds on a loaded mini, so it is re-taken every APPLY_LSOF_ITEMS items or
+            # APPLY_LSOF_S seconds, keeping --pressure --apply inside the hooks' timeout; ps is per item)
+            fresh_layout = discoverable(i.path)
+            lsof_items += 1
+            if lsof_items >= APPLY_LSOF_ITEMS or time.monotonic() - lsof_at >= APPLY_LSOF_S:
+                try:
+                    opened, cmds = process_evidence()
+                except NoEvidence as e:
+                    print(f"refusing to delete the rest: {e}", file=sys.stderr)
+                    break
+                cwds = open_index(opened)
+                lsof_at, lsof_items = time.monotonic(), 0
+            else:
+                cmds = command_lines()
+                if not cmds:
+                    print("refusing to delete the rest: ps failed", file=sys.stderr)
+                    break
+        if families[i.family].discover and not fresh_layout:
+            outcome = "changed:layout"
+        elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
+                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
+            outcome = "changed:in-use"
+        elif (time.time() - newest_mtime(p, access=families[i.family].discover)) / 3600 \
+                < idle_window(families[i.family], idle_hours):
+            outcome = "changed:modified"
+        elif keep_verdict(families[i.family], p):
+            outcome = "changed:kept"
+        elif families[i.family].discover and git_state(p, sealed=True) != "none":
+            outcome = "changed:git"  # a clone appeared at the top of the cache since the survey
+        elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
+              and (g := family_git_state(families[i.family], p)) != "none"
+              and (g != "git" or family_git_loss(families[i.family], p))):
+            outcome = "changed:git"  # the checkout gained something to lose since the survey
+        else:
+            try:
+                common = git_common_dir(p) if families[i.family].git_disposable else ""
+                # rustup skips reinstalling a toolchain whose update hash still matches the channel
+                # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
+                stale_hash = (p.parent.parent / "update-hashes" / p.name
+                              if fresh_layout == "rustup-toolchain" else None)
+                remove(p, after_rename=None if stale_hash is None
+                       else lambda h=stale_hash: h.unlink(missing_ok=True))
+                outcome = "reclaimed"
+                released += i.bytes
+                if common:  # drop the deleted worktree's record from its repository
+                    subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
+                                   capture_output=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as e:
+                outcome = f"incomplete:{e.__class__.__name__}"
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+               "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i)}
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome:16s} {gib(i.bytes)}  {i.path.replace(str(HOME), '~')}")
+    print(f"released {gib(released).strip()}; receipt {receipt}")
+    return released
+
+
+def dedupe_roots(derived_data: Path) -> list[Path]:
+    roots = [derived_data / sub for sub in DEDUPE_SUBDIRS]
+    for d in _children(derived_data):
+        if not d.is_symlink():
+            roots += [d / sub for sub in DEDUPE_SUBDIRS]
+    return [r for r in roots if r.is_dir() and not r.is_symlink()]
+
+
+def _file_key(st: os.stat_result) -> list[int]:
+    return [st.st_size, st.st_mtime_ns, st.st_ino]
+
+
+def _sha256(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def clone_over(canonical: str, target: str, expect: list[int],
+               canonical_expect: list[int] | None = None) -> bool:
+    """Replace target with an APFS clone of canonical, keeping target's mode and times.
+
+    Refuses when target or canonical changed since they were hashed, checked before and
+    after the copy, so a file rewritten mid-run can never be cloned over a verified one. A process that has target open keeps
+    reading the old inode; the rename only swaps the directory entry.
+    """
+    st = os.lstat(target)
+    if _file_key(st) != expect or not stat.S_ISREG(st.st_mode):
+        return False
+    if canonical_expect is not None and _file_key(os.lstat(canonical)) != canonical_expect:
+        return False
+    tmp = os.path.join(os.path.dirname(target), f".{os.path.basename(target)}.glaeda-clone-{os.getpid()}")
+    try:
+        subprocess.run(["/bin/cp", "-c", canonical, tmp], check=True, capture_output=True)
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        if _file_key(os.lstat(target)) != expect:
+            return False
+        if canonical_expect is not None and _file_key(os.lstat(canonical)) != canonical_expect:
+            return False
+        os.rename(tmp, target)
+        return True
+    finally:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+
+
+def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
+           min_bytes: int = DEDUPE_MIN_BYTES, settle_s: float = 0) -> dict[str, int]:
+    """Clone-dedupe identical files. Files modified within settle_s are left for a later run."""
+    try:
+        state: dict[str, dict] = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    files: dict[str, list[int]] = {}
+    young = 0
+    cutoff = time.time() - settle_s
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+            for name in filenames:
+                if ".glaeda-clone-" in name:
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_size >= min_bytes and st.st_nlink == 1:
+                    if st.st_mtime > cutoff:
+                        young += 1  # still being downloaded or written
+                        continue
+                    files[path] = _file_key(st)
+    by_size: dict[int, list[str]] = {}
+    for path, key in files.items():
+        by_size.setdefault(key[0], []).append(path)
+    new_state: dict[str, dict] = {}
+    groups: dict[str, list[str]] = {}
+    hashed = 0
+    for paths in by_size.values():
+        if len(paths) < 2:
+            continue
+        for path in paths:
+            old = state.get(path)
+            if old and old.get("key") == files[path]:
+                sha, cloned = old["sha"], old.get("cloned", False)
+            else:
+                try:
+                    sha = _sha256(path)
+                except OSError:
+                    continue
+                cloned, hashed = False, hashed + files[path][0]
+            new_state[path] = {"key": files[path], "sha": sha, "cloned": cloned}
+            groups.setdefault(sha, []).append(path)
+    cloned_bytes = refused = 0
+    for sha, paths in groups.items():
+        if len(paths) < 2:
+            continue
+        paths.sort(key=lambda p: (not new_state[p]["cloned"], p))
+        canonical = paths[0]
+        for target in paths[1:]:
+            if new_state[target]["cloned"]:
+                continue
+            try:
+                ok = clone_over(canonical, target, files[target], files[canonical])
+                if ok:
+                    new_state[target] = {"key": _file_key(os.lstat(target)), "sha": sha,
+                                         "cloned": True}
+            except (OSError, subprocess.CalledProcessError):
+                ok = False
+                new_state.pop(target, None)  # vanished or unreadable; rehash next run
+            if ok:
+                cloned_bytes += files[target][0]
+            else:
+                refused += 1
+        new_state[canonical]["cloned"] = True
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(new_state))
+    os.replace(tmp, state_path)
+    return {"files": len(files), "hashed_bytes": hashed, "cloned_bytes": cloned_bytes,
+            "refused": refused, "young": young}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
+    ap.add_argument("--pressure", action="store_true",
+                    help="only act when free space is below --low; stop at --target")
+    # Air Blue sat at 3-7% free for a day with the old 15%/25%: act earlier and free more per run
+    ap.add_argument("--low", default="25%:60-200",
+                    help="pressure threshold per filesystem: GiB free, N%% of its size, or "
+                         "N%%:LO-HI to hold that share between LO and HI GiB (default %(default)s)")
+    ap.add_argument("--target", default="35%:100-350",
+                    help="stop freeing at this much free, same forms (default %(default)s)")
+    ap.add_argument("--tmpfs-low", default="75%",
+                    help="pressure threshold for a tmpfs, whose files live in RAM and swap "
+                         "(default %(default)s free)")
+    ap.add_argument("--tmpfs-target", default="90%",
+                    help="stop freeing a tmpfs at this much free (default %(default)s)")
+    # One cold cmux job can write 10-36 GiB between two 15-minute runs, so the floor sits well above empty.
+    ap.add_argument("--emergency", default="10%:30-60",
+                    help="with --pressure --apply: delete even while a CI job runs once free space is "
+                         "below this, same forms as --low (default %(default)s)")
+    ap.add_argument("--floor-gib", type=float, default=0.0,
+                    help="a runner disk floor to honour besides the ones read from runner hooks (runner_floor_gib): "
+                         "the runner hook passes its own --min-free-gib when it evicts before refusing a job")
+    ap.add_argument("--idle-hours", type=float, default=None,
+                    help="idle window (default 24h, or 6h under pressure)")
+    ap.add_argument("--family", action="append", help="limit to these family ids")
+    ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--min-mib", type=int, default=50)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="clone-dedupe identical Xcode package and module-cache files, then exit")
+    ap.add_argument("--settle-minutes", type=float, default=0,
+                    help="with --dedupe: skip files changed this recently, wait and retry (up to 3 passes)")
+    ap.add_argument("--refresh", action="store_true", help="re-measure all sizes now")
+    ap.add_argument("--max-age", type=float, default=15,
+                    help="minutes before the size snapshot is refreshed in the background (default 15)")
+    ap.add_argument("--no-snapshot", action="store_true", help=argparse.SUPPRESS)  # tests
+    ap.add_argument("--receipt", type=Path,
+                    default=HOME / "Projects/recovery/disk-reclaim/receipts.jsonl")
+    ap.add_argument("--root-override", action="append", default=[], metavar="ID=PATH",
+                    help=argparse.SUPPRESS)  # tests
+    a = ap.parse_args(argv)
+
+    fams = default_families()
+    for ov in a.root_override:
+        fid, _, p = ov.partition("=")
+        fams = [replace(f, root=Path(p), files=False, min_bytes=None, git_disposable=False)
+                if f.id == fid else f for f in fams]
+    if a.family:
+        fams = [f for f in fams if f.id in a.family]
+    if a.dedupe:
+        dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
+        if dd is None or not DARWIN:
+            print("nothing to dedupe (APFS clones of Xcode DerivedData are macOS only)")
+            return 0
+        before, _ = free_bytes(dd)
+        started = time.time()
+        for attempt in range(3):
+            r = dedupe(dedupe_roots(dd), settle_s=a.settle_minutes * 60)
+            after, _ = free_bytes(dd)
+            print(f"dedupe: {r['files']} files >= 1 MiB, hashed {gib(r['hashed_bytes']).strip()}, "
+                  f"cloned {gib(r['cloned_bytes']).strip()}, refused {r['refused']}, "
+                  f"still settling {r['young']}, free {gib(before).strip()} -> {gib(after).strip()} "
+                  f"in {time.time() - started:.0f}s", flush=True)
+            if not r["young"] or attempt == 2:
+                break
+            time.sleep(a.settle_minutes * 60)
+        return 0
+    try:
+        floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
+        fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
+                          a.tmpfs_low, a.tmpfs_target, floor_gib)
+        space(a.emergency, GIB)
+    except ValueError:
+        ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
+                 f"{a.tmpfs_low!r}, {a.tmpfs_target!r}, {a.emergency!r}")
+    # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
+    # pressure runs, which then touch nothing but that filesystem's families
+    under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
+    if a.pressure:
+        if not under:
+            for fs in fss.values():
+                print(f"no pressure: {gib(fs.free).strip()} free >= {gib(fs.low).strip()} on {fs.mount}")
+            return 0
+        # only families on a filesystem under pressure are surveyed or touched
+        fams = [f for f in fams if fss[f.root.stat().st_dev].under]
+        if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
+            print(why)
+            return 0
+    if a.apply:
+        # a second eviction would only race the first for the same items; its caller re-reads free space instead
+        EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        evict_lock = EVICT_LOCK.open("a")  # held until this process exits
+        try:
+            fcntl.flock(evict_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another eviction running; skipped")
+            return 0
+    idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
+    at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
+    if a.apply:
+        # sizes decide what gets deleted under pressure, so never trust stale ones there
+        known = fresh_for_apply(known, fams)
+    known = {k: v for k, v in known.items() if os.path.lexists(k)}
+    before = len(known)
+    items = survey(fams, idle, a.min_mib * 1024**2, known, defer_bulk=bool(at) and not a.apply)
+    age_min = (time.time() - at) / 60 if at else 0.0
+    if not a.no_snapshot:
+        lock = SNAPSHOT.with_suffix(".refreshing")
+        if a.refresh:
+            # merge, so a --family refresh keeps the other families' sizes
+            save_snapshot({**load_snapshot()[1], **known})
+            lock.unlink(missing_ok=True)
+        elif not at or len(known) != before or a.apply:
+            # adding a few new paths does not make the old sizes fresh: keep their stamp, so the
+            # background refresh still comes due (a status probe that runs often must not defer it)
+            save_snapshot(known, at=at or None)
+        if at and age_min > a.max_age and not a.apply and not _fresh(lock, 600):
+            lock.touch()
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
+                              "--min-mib", "0"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    if at and not a.json:
+        print(f"sizes from {age_min:.0f} min ago"
+              f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
+              " verdicts are live\n")
+    shown = [fs for fs in fss.values() if not a.pressure or fs.under]
+    if a.json:
+        print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
+                          "filesystems": [asdict(fs) for fs in shown],
+                          "owners": {f.id: {"owner": f.owner, "retired": owner_retired(f)}
+                                     for f in fams if f.owner},
+                          "items": [asdict(i) for i in items]}, indent=2))
+    else:
+        report(items, shown, a.top, idle,
+               {f.id: f.rebuild for f in fams if f.id == "cargo-target"}, {f.id: f for f in fams})
+    if a.apply:
+        print()
+        apply(items, {f.id: f for f in fams}, a.receipt,
+              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,6 +1,6 @@
 # Manifest reference
 
-`smolrunner.yml` describes the host and execution boundary SmolRunner should reconcile for one project. It is deliberately not a pipeline language: dependency installation, test commands, build logic, and GitHub workflow triggers remain in the project repository.
+`glaeda.yml` describes the host and execution boundary Glaeda should reconcile for one project. It is deliberately not a pipeline language: dependency installation, test commands, build logic, and GitHub workflow triggers remain in the project repository.
 
 ## Versioning
 
@@ -24,17 +24,17 @@ Organization scope targets the owner component of `repository`. Repository selec
 
 ### `container`
 
-- `image`: local image reference SmolRunner should build or inspect.
+- `image`: local image reference Glaeda should build or inspect.
 - `file`: project-relative Containerfile path. Absolute paths and parent traversal are rejected.
 
-The repository owns the Containerfile. SmolRunner should record the resulting immutable image digest rather than trusting a mutable tag alone.
+The repository owns the Containerfile. Glaeda should record the resulting immutable image digest rather than trusting a mutable tag alone.
 
 ### `verify`
 
 - `command`: project-relative verification entry point.
 - `suites`: stable names mapped to one command argument each.
 
-SmolRunner does not interpret npm, Maven, Python, Convex, Blender, Renderprove, or other project-specific concepts. It invokes the repository-owned entry point inside the disposable execution boundary.
+Glaeda does not interpret npm, Maven, Python, Convex, Blender, Renderprove, or other project-specific concepts. It invokes the repository-owned entry point inside the disposable execution boundary.
 
 A Renderprove enrolment uses the same generic command boundary. `examples/renderprove.yml` points to the checked-in `examples/renderprove/run-renderprove-review.sh` wrapper. The wrapper accepts one stable `render` suite, requires an explicit trusted Renderprove checkout, selects one project-relative evidence directory, and delegates browser policy and receipt generation to Renderprove.
 
@@ -99,6 +99,6 @@ trust:
 Validate it without changing the host:
 
 ```bash
-smolrunner plan --file smolrunner.yml
-smolrunner --output json plan --file smolrunner.yml
+glaeda plan --file glaeda.yml
+glaeda --output json plan --file glaeda.yml
 ```
