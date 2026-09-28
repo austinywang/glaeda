@@ -97,6 +97,8 @@ class Proc:
     start: str  # ps lstart, the identity component a reused PID cannot share
     command: str
     path: str = ""  # executable path from ps comm, which may contain spaces
+    tty: str = ""  # ps tty, `??` without a controlling terminal
+    cputime: float = 0.0  # CPU seconds, with exited children folded in by a snapshot (ps -S)
 
     @property
     def exe(self) -> str:
@@ -128,19 +130,29 @@ def parse_etime(text: str) -> int:
     return (int(days) if days else 0) * 86400 + h * 3600 + m * 60 + s
 
 
-PS_FIELDS = "pid=,ppid=,uid=,etime=,rss=,%cpu=,stat=,lstart=,command="
+def parse_cputime(text: str) -> float:
+    """ps time: [dd-][hh:]mm:ss[.cc], as CPU seconds."""
+    days, _, rest = text.rpartition("-")
+    total = 0.0
+    for part in rest.split(":"):
+        total = total * 60 + float(part)
+    return round((int(days) if days else 0) * 86400 + total, 2)
+
+
+PS_FIELDS = "pid=,ppid=,uid=,etime=,rss=,%cpu=,stat=,tty=,time=,lstart=,command="
 
 
 def parse_ps(text: str) -> list[Proc]:
     procs = []
     for line in text.splitlines():
         # lstart is always five tokens in the C locale: "Sat Sep 26 04:21:22 2026"
-        f = line.split(None, 12)
-        if len(f) < 12:
+        f = line.split(None, 14)
+        if len(f) < 14:
             continue
         try:
             procs.append(Proc(int(f[0]), int(f[1]), int(f[2]), parse_etime(f[3]), int(f[4]),
-                              float(f[5]), f[6], " ".join(f[7:12]), f[12] if len(f) > 12 else ""))
+                              float(f[5]), f[6], " ".join(f[9:14]), f[14] if len(f) > 14 else "",
+                              tty=f[7], cputime=parse_cputime(f[8])))
         except ValueError:
             continue
     return procs
@@ -156,7 +168,7 @@ def parse_comm(text: str) -> dict[int, str]:
 
 
 def snapshot() -> list[Proc]:
-    procs = parse_ps(run([PS, "-axo", PS_FIELDS]))
+    procs = parse_ps(run([PS, "-axS", "-o", PS_FIELDS]))
     # comm is a second column that may contain spaces, so it needs its own listing
     paths = parse_comm(run([PS, "-axo", "pid=,comm="]))
     procs = [dataclasses.replace(p, path=paths.get(p.pid, "")) for p in procs]

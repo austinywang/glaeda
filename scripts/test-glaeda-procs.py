@@ -38,11 +38,16 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(gp.parse_etime("3-02:01:05"), 3 * 86400 + 7265)
 
     def test_ps_row_keeps_command_with_spaces(self) -> None:
-        row = f"  42     1   501  1-00:00:01  4704   0.0 SNs  {START} {PAUSE}\n"
+        row = f"  42     1   501  1-00:00:01  4704   0.0 SNs  ??   2:53.01 {START} {PAUSE}\n"
         [p] = gp.parse_ps(row + "garbage\n")
         self.assertEqual((p.pid, p.ppid, p.uid, p.elapsed, p.rss_kib), (42, 1, 501, 86401, 4704))
+        self.assertEqual((p.tty, p.cputime), ("??", 173.01))
         self.assertEqual(p.start, START)
         self.assertEqual(p.command, PAUSE)
+
+    def test_cpu_time(self) -> None:
+        self.assertEqual([gp.parse_cputime(t) for t in ("0:00.07", "486:30.13", "1-01:00:00.50")],
+                         [0.07, 29190.13, 90000.5])
 
     def test_comm_paths_with_spaces(self) -> None:
         paths = gp.parse_comm("  7 /Applications/Claude.app/Contents/MacOS/Claude Helper\n")

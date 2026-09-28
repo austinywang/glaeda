@@ -27,7 +27,8 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
     ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
-                                               agent session on a hygiene-only Mac; a no-op on build hosts)
+                                               agent session on a hygiene-only Mac, and on every Mac shell -c trees
+                                               left under launchd that stopped using CPU)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
@@ -717,9 +718,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-mini-health.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-mini-health.err"),
         },
-        # Tests and builds that outlived their agent session on a personal Mac (scripts/glaeda-local-guard): every
-        # 30 seconds it ends the orphaned ones. It exits at once on a build host. Not ProcessType Background:
-        # it has to get CPU while the orphans it stops hold the machine.
+        # Tests and builds that outlived their agent session on a personal Mac, and stale orphaned commands on any
+        # Mac (scripts/glaeda-local-guard): every 30 seconds it ends them. Not ProcessType Background: it has to
+        # get CPU while the orphans it stops hold the machine.
         LABEL_PREFIX + "local-guard": {
             "Label": LABEL_PREFIX + "local-guard",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-local-guard"), "--apply"],
