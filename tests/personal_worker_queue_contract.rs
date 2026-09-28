@@ -21,8 +21,12 @@ fn time(value: u64) -> EpochMillis {
     EpochMillis::new(value).expect("time")
 }
 
+fn limits_with_pids(cpu_millis: u32, memory_gib: u64, pids: u32) -> ExecutionResourceLimits {
+    ExecutionResourceLimits::new(cpu_millis, memory_gib * GIB, pids).expect("limits")
+}
+
 fn limits(cpu_millis: u32, memory_gib: u64) -> ExecutionResourceLimits {
-    ExecutionResourceLimits::new(cpu_millis, memory_gib * GIB, 2_048).expect("limits")
+    limits_with_pids(cpu_millis, memory_gib, 512)
 }
 
 fn source(repository: &str, digit: char) -> PersonalWorkerSourceIdentity {
@@ -97,7 +101,7 @@ fn active(
         requested_limits: applied_limits,
         host_capacity: Some(HostCapacityObservation::new(
             time(observed_at),
-            limits(8_000, 10),
+            limits_with_pids(8_000, 10, 4_096),
         )),
         applied_limits: Some(applied_limits),
         queue_position: None,
@@ -753,4 +757,122 @@ fn active_and_pending_state_require_observed_profile_evidence() {
     let error = evaluate_personal_worker_queue(&pending_queue, None)
         .expect_err("profile intent without observed profile");
     assert_eq!(error.code, "profile_intent_requires_observation");
+}
+
+#[test]
+fn aggregate_pid_capacity_blocks_two_individually_valid_light_requests() {
+    let observed_at = 23_000_000;
+    let first = request(
+        "pid-first",
+        "example/pid-first",
+        'a',
+        PersonalWorkerPriority::Interactive,
+        observed_at - 2_000,
+        limits_with_pids(2_000, 2, 2_000),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let second = request(
+        "pid-second",
+        "example/pid-second",
+        'b',
+        PersonalWorkerPriority::Normal,
+        observed_at - 1_000,
+        limits_with_pids(2_000, 2, 2_000),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+
+    let decision =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![second, first], vec![]), None)
+            .expect("PID-bounded decision");
+
+    assert_eq!(decision.schedulable_pids, 3_072);
+    assert_eq!(decision.selected.len(), 1);
+    assert_eq!(decision.selected[0].request_id.as_str(), "pid-first");
+    let second_visibility = decision
+        .visibility
+        .iter()
+        .find(|entry| entry.request_id.as_str() == "pid-second")
+        .expect("second request visibility");
+    assert_eq!(
+        second_visibility.state,
+        PersonalWorkerQueueEntryState::Queued
+    );
+}
+
+#[test]
+fn exact_aggregate_pid_boundary_allows_two_light_requests() {
+    let observed_at = 24_000_000;
+    let first = request(
+        "pid-boundary-a",
+        "example/pid-boundary-a",
+        'a',
+        PersonalWorkerPriority::Normal,
+        observed_at - 2_000,
+        limits_with_pids(2_000, 2, 1_536),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let second = request(
+        "pid-boundary-b",
+        "example/pid-boundary-b",
+        'b',
+        PersonalWorkerPriority::Normal,
+        observed_at - 1_000,
+        limits_with_pids(2_000, 2, 1_536),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+
+    let decision =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![first, second], vec![]), None)
+            .expect("exact PID boundary decision");
+
+    assert_eq!(decision.selected.len(), 2);
+    assert_eq!(decision.schedulable_pids, 3_072);
+    let encoded = serde_json::to_string(&decision).expect("queue decision JSON");
+    assert!(encoded.contains("\"schema_version\":3"));
+    assert!(encoded.contains("\"schedulable_pids\":3072"));
+}
+
+#[test]
+fn active_pid_overcommit_fails_closed() {
+    let observed_at = 25_000_000;
+    let first = active(
+        "pid-active-a",
+        "example/pid-active-a",
+        'a',
+        observed_at,
+        limits_with_pids(1_000, 1, 2_048),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let second = active(
+        "pid-active-b",
+        "example/pid-active-b",
+        'b',
+        observed_at,
+        limits_with_pids(1_000, 1, 1_025),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+
+    let error =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![], vec![first, second]), None)
+            .expect_err("active PID overcommit must fail closed");
+    assert_eq!(error.code, "active_resource_overcommit");
+}
+
+#[test]
+fn individual_pid_request_must_preserve_the_queue_reserve() {
+    let observed_at = 26_000_000;
+    let oversized = request(
+        "pid-oversized",
+        "example/pid-oversized",
+        'a',
+        PersonalWorkerPriority::Interactive,
+        observed_at - 1_000,
+        limits_with_pids(1_000, 1, 3_073),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+
+    let error =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![oversized], vec![]), None)
+            .expect_err("individual PID reserve violation");
+    assert_eq!(error.code, "personal_worker_reserve_violation");
 }

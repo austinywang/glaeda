@@ -9,9 +9,12 @@ use crate::execution_admission::{
     EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionRecord, ExecutionAdmissionState,
     ExecutionRequestId, ExecutionResourceLimits, FallbackProfileEligibility, RunnerProfileId,
 };
+use crate::personal_worker_pid_capacity::{
+    PERSONAL_WORKER_SCHEDULABLE_PID_CAPACITY, admit_personal_worker_pid_reservation,
+};
 use crate::verification_profile::{CacheId, VerificationProfileId};
 
-pub const PERSONAL_WORKER_QUEUE_SCHEMA_VERSION: u8 = 2;
+pub const PERSONAL_WORKER_QUEUE_SCHEMA_VERSION: u8 = 3;
 pub const MAX_PERSONAL_WORKER_QUEUE_ENTRIES: usize = 256;
 pub const MAX_PERSONAL_WORKER_ACTIVE_RESERVATIONS: usize = 2;
 pub const PERSONAL_WORKER_TOTAL_CPU_MILLIS: u32 = 8_000;
@@ -359,6 +362,7 @@ pub struct PersonalWorkerQueueDecision {
     pub profile_change_permitted: bool,
     pub schedulable_cpu_millis: u32,
     pub schedulable_memory_bytes: u64,
+    pub schedulable_pids: u32,
     pub selected: Vec<PersonalWorkerSelection>,
     pub visibility: Vec<PersonalWorkerQueueVisibility>,
 }
@@ -418,6 +422,7 @@ pub fn evaluate_personal_worker_queue(
     let mut selected = Vec::new();
     let mut used_cpu = active_limits.cpu_millis;
     let mut used_memory = active_limits.memory_bytes;
+    let mut used_pids = active_limits.pids;
     let active_heavy = input
         .active
         .iter()
@@ -439,8 +444,12 @@ pub fn evaluate_personal_worker_queue(
             }
             let next_cpu = used_cpu.saturating_add(request.requested_limits.cpu_millis);
             let next_memory = used_memory.saturating_add(request.requested_limits.memory_bytes);
+            let pid_capacity_available =
+                admit_personal_worker_pid_reservation(&[used_pids], request.requested_limits.pids)
+                    .is_ok();
             next_cpu <= PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS
                 && next_memory <= PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES
+                && pid_capacity_available
                 && lease_conflict(&held_leases, &request.cache_namespace, request.cache_access)
                     .is_none()
         });
@@ -458,6 +467,10 @@ pub fn evaluate_personal_worker_queue(
             .or_default() += 1;
         used_cpu = used_cpu.saturating_add(request.requested_limits.cpu_millis);
         used_memory = used_memory.saturating_add(request.requested_limits.memory_bytes);
+        used_pids =
+            admit_personal_worker_pid_reservation(&[used_pids], request.requested_limits.pids)
+                .expect("selected PID capacity was checked before reservation")
+                .projected_reserved_pids();
         selected_heavy = job_class == PersonalWorkerJobClass::Heavy;
         selected.push(PersonalWorkerSelection {
             request_id: request.identity.request_id.clone(),
@@ -497,6 +510,7 @@ pub fn evaluate_personal_worker_queue(
         profile_change_permitted,
         schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
         schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        schedulable_pids: PERSONAL_WORKER_SCHEDULABLE_PID_CAPACITY,
         selected,
         visibility,
     })
@@ -789,6 +803,7 @@ fn validate_active(
 fn validate_limits(limits: ExecutionResourceLimits) -> Result<(), PersonalWorkerQueueError> {
     if limits.cpu_millis > PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS
         || limits.memory_bytes > PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES
+        || limits.pids > PERSONAL_WORKER_SCHEDULABLE_PID_CAPACITY
     {
         return Err(PersonalWorkerQueueError::new(
             "requested_limits",
@@ -840,13 +855,20 @@ fn aggregate_active_limits(
                     "active memory reservations exceed the bounded aggregate",
                 )
             })?;
-        pids = pids.saturating_add(limits.pids);
+        pids = pids.checked_add(limits.pids).ok_or_else(|| {
+            PersonalWorkerQueueError::new(
+                "active.requested_limits.pids",
+                "active_pid_overflow",
+                "active PID reservations exceed the bounded aggregate",
+            )
+        })?;
         if reservation.request.job_class() == PersonalWorkerJobClass::Heavy {
             heavy_count += 1;
         }
     }
     if cpu_millis > PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS
         || memory_bytes > PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES
+        || pids > PERSONAL_WORKER_SCHEDULABLE_PID_CAPACITY
         || heavy_count > 1
         || (heavy_count == 1 && active.len() > 1)
     {

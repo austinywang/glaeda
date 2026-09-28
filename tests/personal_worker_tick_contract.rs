@@ -187,6 +187,7 @@ fn queue(
         }),
         schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
         schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        schedulable_pids: 3_072,
         selected,
         visibility,
     }

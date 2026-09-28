@@ -527,6 +527,7 @@ fn start_tick(lifecycle: &LimaLifecycleObservation, store_revision: u64) -> Pers
         profile_change_permitted: true,
         schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
         schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        schedulable_pids: 3_072,
         selected: Vec::new(),
         visibility: Vec::new(),
     };
@@ -651,6 +652,7 @@ fn lifecycle_tick(
         profile_change_permitted: true,
         schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
         schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        schedulable_pids: 3_072,
         selected: Vec::new(),
         visibility: Vec::new(),
     };

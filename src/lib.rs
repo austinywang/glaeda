@@ -293,6 +293,8 @@ pub mod personal_worker_operator_mutation;
 pub mod personal_worker_operator_read;
 /// Config-bound read-only discovery and explicit first initialization of durable worker state.
 pub mod personal_worker_operator_store;
+/// Pure queue-level aggregate PID admission policy and checked reservation arithmetic.
+pub mod personal_worker_pid_capacity;
 pub mod personal_worker_queue;
 /// Pure bounded projection of durable personal-worker status, queue pages, and job state.
 pub mod personal_worker_read_model;

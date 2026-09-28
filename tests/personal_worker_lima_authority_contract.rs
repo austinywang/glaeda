@@ -406,6 +406,7 @@ fn worker_tick_with_snapshot(
         profile_change_permitted: true,
         schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
         schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        schedulable_pids: 3_072,
         selected: vec![selection],
         visibility: vec![visibility],
     };
@@ -469,6 +470,7 @@ fn stop_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
         profile_change_permitted: true,
         schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
         schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        schedulable_pids: 3_072,
         selected: Vec::new(),
         visibility: Vec::new(),
     };

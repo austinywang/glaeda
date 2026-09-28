@@ -31,7 +31,7 @@ fn time(value: u64) -> EpochMillis {
 }
 
 fn limits(cpu_millis: u32, memory_gib: u64) -> ExecutionResourceLimits {
-    ExecutionResourceLimits::new(cpu_millis, memory_gib * GIB, 2_048).expect("limits")
+    ExecutionResourceLimits::new(cpu_millis, memory_gib * GIB, 512).expect("limits")
 }
 
 fn identity(id: &str) -> ExecutionAdmissionIdentity {
@@ -376,7 +376,7 @@ fn job_view_exposes_exact_queued_and_active_evidence() {
     assert_eq!(admission.observed_at(), time(BASE - 10_000));
     assert_eq!(admission.requested_limits(), limits(2_000, 2));
     assert_eq!(admission.applied_limits(), limits(2_000, 2));
-    assert_eq!(admission.requested_limits().pids, 2_048);
+    assert_eq!(admission.requested_limits().pids, 512);
     assert_eq!(active.operator_deadline(), Some(time(BASE + 1_800_000)));
     assert_eq!(
         admission.reservation().id().as_str(),

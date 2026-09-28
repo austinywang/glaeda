@@ -35,8 +35,8 @@ being measured.
 
 ## Totals
 
-- Exported modules: **204**
-- Reach: **96 binary**, **63 library**, **11 tests**, **34 none**
+- Exported modules: **205**
+- Reach: **97 binary**, **63 library**, **11 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -210,6 +210,7 @@ let the gate hold the line.
 | `personal_worker_operator_mutation` | `all` | tests | 1 |
 | `personal_worker_operator_read` | `all` | library | 7 |
 | `personal_worker_operator_store` | `all` | library | 5 |
+| `personal_worker_pid_capacity` | `all` | binary | 2 |
 | `personal_worker_queue` | `all` | binary | 50 |
 | `personal_worker_read_model` | `all` | library | 11 |
 | `personal_worker_repository_result` | `all` | library | 4 |

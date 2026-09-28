@@ -153,7 +153,7 @@ fn time(value: u64) -> EpochMillis {
 }
 
 fn limits() -> ExecutionResourceLimits {
-    ExecutionResourceLimits::new(2_000, 2 * GIB, 2_048).expect("limits")
+    ExecutionResourceLimits::new(2_000, 2 * GIB, 512).expect("limits")
 }
 
 fn request(id: &str, submitted_at: u64) -> PersonalWorkerJobRequest {
