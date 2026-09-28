@@ -26,6 +26,11 @@ An item is never deleted while a process has its cwd inside it, a process comman
 line names it, it holds a git checkout, or it changed within the idle window.
 Every deletion is appended to a JSONL receipt.
 
+On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
+tier, evicted LRU under pressure: parked pull request builds idle over an hour, seeds other than each
+root's newest two current ones, and a root's kept build once the root has been idle two days. The
+Chromium / cmux-browser trees and their caches are never deleted (NEVER_DELETE).
+
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
 Thresholds scale with the disk: "15%:40-150" is 15% of it, at least 40 and at most 150 GiB,
@@ -104,6 +109,99 @@ class Family:
     # size every missing candidate with one `du -d1` walk of root instead of one du per candidate:
     # a macOS $TMPDIR holds tens of thousands of small leaked directories (25,730 on Air Blue)
     bulk_sizes: bool = False
+    build_output: bool = False  # DerivedData-like: SwiftPM clones inside do not make it a checkout
+    include: tuple[str, ...] = ()  # when set, only candidates whose name starts with one of these
+    min_idle_hours: float = 0.0  # an item must also be idle this long, whatever the idle window
+    max_idle_hours: float | None = None  # a hot-tier item goes once idle this long, whatever the idle window
+
+
+def idle_window(fam: Family, idle_hours: float) -> float:
+    window = max(idle_hours, fam.min_idle_hours)
+    return window if fam.max_idle_hours is None else min(window, fam.max_idle_hours)
+
+
+# Never deleted by any family, at any pressure (Leo, 2026-09-27): the Chromium / cmux-browser dev trees
+# and their caches. A lost tree is a ~17 min LAN re-seed at best and a multi-hour Chromium build at worst,
+# and a campaign may hold work nowhere else. A candidate at, inside or above one of these paths, or whose
+# name matches NEVER_DELETE_NAMES, is dropped before it is judged.
+NEVER_DELETE = ("cmux-browser-fleet", "Library/Caches/cmux-release-support", "Library/Caches/siso")  # under HOME
+NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-release-support|vpython|cipd", re.I)
+
+
+def never_delete(path: Path) -> bool:
+    if NEVER_DELETE_NAMES.search(path.name):
+        return True
+    p = os.path.realpath(path)
+    for keep in NEVER_DELETE:
+        k = os.path.realpath(HOME / keep)
+        if p == k or p.startswith(k + "/") or k.startswith(p + "/"):
+            return True
+    return False
+
+
+# cmux CI's warm state on an owned mini (cmux scripts/ci/owned_build_state.py, seed_derived_data.py).
+# Root 1 keeps it in FLEET_CI, root k in FLEET_CI/cmux-ci-<k>. This is the local hot tier: every item is
+# a copy of something a job can fetch or rebuild (seed bucket, the PR's next compile), so it is evicted
+# LRU under pressure, keeping what the next job most likely starts from.
+FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
+SEED_SOURCE = "seed-source.json"
+SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
+KEPT_BUILD_IDLE_HOURS = 48.0
+PARKED_IDLE_HOURS = 1.0  # glaeda-idle-warm keeps a live root's build within minutes of main
+
+
+def fleet_stores(ci: Path | None = None) -> list[Path]:
+    ci = FLEET_CI if ci is None else ci
+    if not ci.is_dir():
+        return []
+    return [ci, *sorted(p for p in ci.glob("cmux-ci-*")
+                        if p.name[len("cmux-ci-"):].isdigit() and p.is_dir() and not p.is_symlink())]
+
+
+def fleet_families(ci: Path | None = None) -> list[Family]:
+    fams = []
+    for store in fleet_stores(ci):
+        # A parked pull request build (owned_build_state.py, usable for PR_SLOT_HOURS) has no disk floor of
+        # its own: two per root grew a mini's use by ~38 GiB within hours of landing (cmux14, 2026-09-27).
+        # One parked over PARKED_IDLE_HOURS ago goes first: a re-push soon after its park is the one it helps.
+        fams.append(Family("cmux-pr-builds", store / "pr-builds", True,
+                           "the pull request's next push compiles from main's kept build",
+                           include=("pr-",), build_output=True, max_idle_hours=PARKED_IDLE_HOURS,
+                           owner="cmux owned_build_state.py (park)", rebuild_minutes=6))
+        # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
+        # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
+        fams.append(Family("cmux-seeds", store / "seeds", True,
+                           "glaeda-seed-prefetch or the next job fetches it again", build_output=True,
+                           owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4))
+        # A root's kept build (and a discard a killed job left) goes only when the root is dead.
+        fams.append(Family("cmux-kept-build", store, True, "the next job on this root starts from a seed",
+                           include=("derived-data", ".derived-data.discard-"), build_output=True,
+                           min_idle_hours=KEPT_BUILD_IDLE_HOURS,
+                           owner="cmux owned_build_state.py (keep)", rebuild_minutes=10))
+    return fams
+
+
+def seed_verdict(path: Path) -> str:
+    """Why a seed stays whatever its age, or "": one of its root's newest SEED_KEEP seeds of the prefix the
+    root's last job recorded (seed-source.json), or of any prefix when it recorded none. Dot entries are a
+    download or delete in progress, never a seed."""
+    try:
+        prefix = json.loads((path.parent.parent / SEED_SOURCE).read_text()).get("prefix") or ""
+    except (OSError, ValueError, AttributeError):
+        prefix = ""
+    if not isinstance(prefix, str):
+        prefix = ""
+    if path.name.startswith(".") or not path.name.startswith(prefix):
+        return ""
+    current = []
+    for c in _entries(path.parent):
+        if c.name.startswith(prefix) and not c.name.startswith(".") and c.is_dir(follow_symlinks=False):
+            try:
+                current.append((c.stat(follow_symlinks=False).st_mtime, c.name))
+            except OSError:
+                continue
+    newest = {name for _, name in sorted(current, reverse=True)[:SEED_KEEP]}
+    return f"one of its root's newest {SEED_KEEP} current seeds" if path.name in newest else ""
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -154,7 +252,8 @@ def default_families() -> list[Family]:
     wt_roots = worktree_roots(projects)
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
-               "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15),
+               "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
+               build_output=True),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
@@ -203,6 +302,12 @@ def default_families() -> list[Family]:
                        "report only: the dev-build worker's shared cache",
                        owner="cmux dev-build worker (hq controller)",
                        owner_job="system/ai.manaflow.cmux-build-worker"))
+    if DARWIN:  # the owned cmux minis
+        fams += fleet_families()
+        # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
+        fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
+                           "report only: its owner evicts LRU to a 24 GiB budget",
+                           owner="cmux node_product_cache.py"))
     for root in wt_roots:
         fams.append(Family("worktrees", root, False,
                            "run glaeda-worktree-reclaim-all (report only)"))
@@ -220,7 +325,7 @@ class Item:
     path: str
     bytes: int
     idle_hours: float
-    verdict: str  # reclaimable | recent | in-use | git-checkout | unchecked | report-only
+    verdict: str  # reclaimable | recent | in-use | git-checkout | unchecked | report-only | kept
     reasons: list[str] = field(default_factory=list)
 
 
@@ -323,6 +428,15 @@ def process_evidence() -> tuple[list[str], str]:
     return opened, command_text(ps.stdout)
 
 
+def command_lines() -> str:
+    """Current command lines (command_text), or "" when ps fails."""
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return command_text(ps.stdout) if ps.returncode == 0 else ""
+
+
 def command_text(ps_output: str) -> str:
     """Command lines with repeated slashes collapsed: $TMPDIR ends in a slash, so a script's
     "$TMPDIR/x" reads .../T//x, which would not match the path it names."""
@@ -388,7 +502,7 @@ DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this be
 def derived_data(fam: Family, path: Path) -> bool:
     """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), and a tree
     remove() had already renamed aside when it was interrupted, which is only ever reclaimed."""
-    return bool(fam.id == "xcode-derived-data" or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
+    return bool(fam.build_output or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
             or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
 
 
@@ -1005,9 +1119,13 @@ def candidates(fam: Family) -> list[Path]:
                      and not (fam.skip_prefixes and e.name.startswith(fam.skip_prefixes))
                      and (e.is_dir(follow_symlinks=False)
                           or (fam.files and e.is_file(follow_symlinks=False)))]
+        if fam.include:
+            level = [p for p in level if p.name.startswith(fam.include)]
     uid = os.getuid()
     owned = []
     for p in level:
+        if never_delete(p):
+            continue
         try:
             if p.lstat().st_uid == uid:
                 owned.append(p)
@@ -1093,24 +1211,29 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("claude session active")
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
-        deletable_age = fam.reclaimable and idle >= idle_hours
+        window = idle_window(fam, idle_hours)
+        keep = seed_verdict(path) if fam.id == "cmux-seeds" else ""
+        deletable_age = fam.reclaimable and idle >= window
         if deletable_age and holds_socket(path):
             reasons.append("holds a socket")
         if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
         if not fam.reclaimable:
             verdict = "report-only"
+        elif keep:
+            verdict = "kept"
+            reasons.append(keep)
         elif reasons:
             verdict = "in-use"
         elif (not derived_data(fam, path) and (g := family_git_state(fam, path)) != "none"
-              and not (g == "git" and fam.git_disposable and idle >= idle_hours
+              and not (g == "git" and fam.git_disposable and idle >= window
                        and not (loss := family_git_loss(fam, path)))):
             verdict = "git-checkout" if g == "git" else "unchecked"
             if g == "unchecked":
                 reasons.append("too deep or large to rule out a git checkout")
-            elif fam.git_disposable and idle >= idle_hours:
+            elif fam.git_disposable and idle >= window:
                 reasons.append(loss)
-        elif idle < idle_hours:
+        elif idle < window:
             verdict = "recent"
         else:
             verdict = "reclaimable"
@@ -1160,15 +1283,26 @@ def ci_jobs() -> list[str]:
     return [line.strip()[:160] for line in out.splitlines() if CI_WORKER.search(line)]
 
 
-def ci_defer(fss: dict[int, Fs], jobs: list[str], emergency: str) -> str:
+def emergency_bytes(fs: "Fs", emergency: str, floor_gib: float = 0.0) -> int:
+    """The emergency floor on fs: --emergency, lifted on HOME's volume to RUNNER_FLOOR_TARGET_GIB above a
+    runner's disk floor. A busy mini always has a job running, so below this is the only place pressure
+    deletes happen; under the gate's floor they would wait until the runners stopped taking jobs
+    (cmux9s, 2026-09-27: every run deferred at 71 GiB free, emergency 46 GiB, floor 50 GiB)."""
+    n = space(emergency, fs.total)
+    if floor_gib > 0 and not fs.tmpfs and fs.dev == HOME.stat().st_dev:
+        n = max(n, min(int((floor_gib + RUNNER_FLOOR_TARGET_GIB) * GIB), fs.total // 2))
+    return n
+
+
+def ci_defer(fss: dict[int, Fs], jobs: list[str], emergency: str, floor_gib: float = 0.0) -> str:
     """Why a pressure run should wait for a running CI job, or "" to go ahead. A bulk delete competes
     with the job's compile for disk and CPU (a 30 GiB delete starved one on a build mini), so it waits
-    unless some filesystem under pressure is below the emergency floor, where the job would fail anyway."""
+    unless some filesystem under pressure is below the emergency floor (emergency_bytes)."""
     if not jobs:
         return ""
-    if any(fs.under and fs.free < space(emergency, fs.total) for fs in fss.values()):
+    if any(fs.under and fs.free < emergency_bytes(fs, emergency, floor_gib) for fs in fss.values()):
         return ""
-    return f"deferred: a CI job is running ({jobs[0]}); pressure deletes wait unless free drops below {emergency}"
+    return f"deferred: a CI job is running ({jobs[0]}); pressure deletes wait unless free drops below {emergency} or {RUNNER_FLOOR_TARGET_GIB:g} GiB above a runner floor"
 
 
 def mount_point(path: Path) -> Path:
@@ -1322,11 +1456,15 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 continue
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
-        # fresh re-observation right before the destructive step
+        # fresh re-observation right before the destructive step. cmux jobs clone their warm state with
+        # `cp -cR SOURCE ...` at any moment and a clone leaves the source's times alone, so those families
+        # re-read the command lines per item rather than trusting the ones from the start of a long run.
+        if families[i.family].build_output and families[i.family].root.is_relative_to(FLEET_CI):
+            cmds = command_lines() or cmds
         if (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
-        elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
+        elif (time.time() - newest_mtime(p)) / 3600 < idle_window(families[i.family], idle_hours):
             outcome = "changed:modified"
         elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
               and (g := family_git_state(families[i.family], p)) != "none"
@@ -1545,8 +1683,9 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(a.settle_minutes * 60)
         return 0
     try:
+        floor_gib = runner_floor_gib()
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
-                          a.tmpfs_low, a.tmpfs_target, runner_floor_gib())
+                          a.tmpfs_low, a.tmpfs_target, floor_gib)
         space(a.emergency, GIB)
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
@@ -1561,7 +1700,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # only families on a filesystem under pressure are surveyed or touched
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
-        if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency)):
+        if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
             return 0
     idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)

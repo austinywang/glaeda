@@ -325,6 +325,79 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.ci_defer({1: critical}, [job], "10%:30-60"), "")  # the job would fail anyway
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             gd.main(["--pressure", "--emergency", "lots"])
+        # a 50 GiB runner floor lifts the floor to 70 GiB on HOME's volume, so a busy mini reclaims before
+        # its gate stops the runners, not only after
+        home = gd.replace(low, dev=gd.HOME.stat().st_dev)
+        self.assertIn("deferred", gd.ci_defer({1: home}, [job], "10%:30-60", floor_gib=40))
+        self.assertEqual(gd.ci_defer({1: home}, [job], "10%:30-60", floor_gib=50), "")
+        self.assertIn("deferred", gd.ci_defer({1: gd.replace(home, free=75 * gd.GIB)}, [job], "10%:30-60", 50))
+
+    def test_chromium_trees_are_never_candidates(self) -> None:
+        saved = gd.HOME
+        gd.HOME = self.root
+        try:
+            caches = self.root / "Library/Caches"
+            for name in ("siso", "cmux-release-support", "go-build", "chromium-cache"):
+                make(caches / name)
+            make(self.root / "cmux-browser-fleet/build/chromium/src")
+            make(self.root / "other")
+            fams = [gd.Family("library-caches", caches, True, "rebuild"),
+                    gd.Family("home", self.root, True, "rebuild"),
+                    gd.Family("deep", self.root / "cmux-browser-fleet", True, "rebuild", depth=2)]
+            got = {Path(i.path).name: i.verdict for i in gd.survey(fams, 1, 0)}
+            self.assertEqual(got, {"go-build": "reclaimable", "other": "reclaimable"})
+            for rel in ("cmux-browser-fleet", "cmux-browser-fleet/build", "Library/Caches/siso",
+                        "Library/Caches/cmux-release-support/ghostty", "Library"):  # Library holds some
+                self.assertTrue(gd.never_delete(self.root / rel), rel)
+            self.assertTrue(gd.never_delete(Path("/private/tmp/chromium-out")))
+            self.assertFalse(gd.never_delete(self.root / "Library/Caches/go-build"))
+        finally:
+            gd.HOME = saved
+
+    def test_fleet_ci_hot_tier(self) -> None:
+        ci = self.root / "ci"
+        (ci / "seeds").mkdir(parents=True)
+        (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
+        for name, age in (("p-a", 1), ("p-b", 2), ("p-c", 48), ("q-x", 48)):
+            make(ci / "seeds" / name, age_hours=age)
+        make(ci / "pr-builds/pr-1", age_hours=0.5)
+        make(ci / "pr-builds/pr-2", age_hours=10)
+        make(ci / "pr-builds/.pr-3.discard-9", age_hours=2)  # cmux's clear() owns it
+        make(ci / "pr-builds/other", age_hours=10)
+        make(ci / "derived-data", age_hours=10)
+        make(ci / ".derived-data.discard-7", age_hours=60)
+        make(ci / "source-packages", age_hours=60)
+        make(ci / "cmux-ci-2/derived-data", age_hours=60)
+        # a root with no seed source keeps its newest two of any prefix; dot entries are never seeds
+        for name, age in (("p-y", 48), ("p-z", 49), ("q-z", 50), (".q-w.incoming-3", 50)):
+            make(ci / "cmux-ci-2/seeds" / name, age_hours=age)
+        make(ci / "cmux-ci-x/derived-data", age_hours=60)  # not a root store
+        # SwiftPM checkouts inside DerivedData do not make it a checkout
+        (ci / "pr-builds/pr-2/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
+        for rel in ("SourcePackages/checkouts/dep/.git", "SourcePackages/checkouts/dep", "SourcePackages/checkouts",
+                    "SourcePackages", ""):
+            os.utime(ci / "pr-builds/pr-2" / rel, (time.time() - 36000,) * 2)
+        self.assertEqual(gd.fleet_stores(ci), [ci, ci / "cmux-ci-2"])
+        items = gd.survey(gd.fleet_families(ci), 6, 0)
+        got = {str(Path(i.path).relative_to(ci)): i.verdict for i in items}
+        self.assertEqual(got, {
+            "seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
+            "pr-builds/pr-1": "recent", "pr-builds/pr-2": "reclaimable",
+            "derived-data": "recent", ".derived-data.discard-7": "reclaimable",
+            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "kept",
+            "cmux-ci-2/seeds/q-z": "reclaimable", "cmux-ci-2/seeds/.q-w.incoming-3": "reclaimable"})
+        # apply keeps the hot-tier windows, and re-reads command lines per item: a job that starts cloning a
+        # parked build during the run keeps it
+        # (apply looks families up by id, as main passes them: every root's family of an id behaves the same)
+        fams = {f.id: f for f in gd.fleet_families(ci)}
+        with mock.patch.object(gd, "FLEET_CI", ci), \
+                mock.patch.object(gd, "command_lines", lambda: f"cp -cR {ci}/pr-builds/pr-2 /tmp/x\n"):
+            reclaimable = [i for i in items if i.verdict == "reclaimable"]
+            gd.apply(reclaimable, fams, self.root / "r.jsonl", None, 6)
+        self.assertTrue((ci / "pr-builds/pr-2").exists())
+        self.assertFalse((ci / "seeds/p-c").exists())
+        self.assertTrue((ci / "seeds/p-a").exists())
+        self.assertFalse((ci / "cmux-ci-2/derived-data").exists())
 
     def test_pressure_targets_are_per_filesystem(self) -> None:
         make(self.root / "old")
