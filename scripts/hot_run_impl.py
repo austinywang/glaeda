@@ -93,7 +93,6 @@ MAX_HOT_STATE_RECONCILE_CATALOG_BYTES = 4 * 1024
 MAX_HOT_STATE_RECONCILE_TICKET_BYTES = 4 * 1024
 MAX_HOT_STATE_CREATING_ENTRIES = 2
 MAX_HOT_STATE_DELETE_ENTRIES = 2048
-MAX_HOT_STATE_DELETE_DEPTH = 128
 HOT_STATE_RETIRE_START_USED_PERCENT = 90
 HOT_STATE_RETIRE_STOP_USED_PERCENT = 85
 RENAME_NOREPLACE = 1
@@ -1141,7 +1140,12 @@ def write_producer_manifest(directory: Path, encoded: bytes) -> None:
     fsync_directory(directory)
 
 
-def rename_noreplace(source: Path, destination: Path) -> None:
+def rename_noreplace_at(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+) -> None:
     # Keep ctypes off the warm path; it is needed only for publication or retirement.
     import ctypes
 
@@ -1158,15 +1162,28 @@ def rename_noreplace(source: Path, destination: Path) -> None:
     )
     rename.restype = ctypes.c_int
     result = rename(
-        -100,
-        os.fsencode(source),
-        -100,
-        os.fsencode(destination),
+        source_directory,
+        os.fsencode(source_name),
+        destination_directory,
+        os.fsencode(destination_name),
         RENAME_NOREPLACE,
     )
     if result != 0:
         error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+
+
+def rename_noreplace(source: Path, destination: Path) -> None:
+    rename_noreplace_at(
+        -100,
+        os.fspath(source),
+        -100,
+        os.fspath(destination),
+    )
 
 
 def fsync_directory(path: Path) -> None:
@@ -1318,82 +1335,174 @@ def manifest_generation_reachable(document: dict[str, object]) -> bool | None:
     return True
 
 
+def promoted_delete_name(details: os.stat_result) -> str:
+    return (
+        f".delete-v2-{details.st_dev:016x}-"
+        f"{details.st_ino:016x}-{details.st_ctime_ns:016x}"
+    )
+
+
 def delete_directory_contents_bounded(
     descriptor: int,
     expected_device: int,
     budget: DeleteBudget,
-    depth: int,
     *,
     preserve_manifest: bool,
 ) -> bool:
-    if depth > MAX_HOT_STATE_DELETE_DEPTH:
-        return False
-    try:
-        with os.scandir(descriptor) as entries:
-            for entry in entries:
-                if preserve_manifest and entry.name == HOT_STATE_MANIFEST:
-                    continue
-                if budget.remaining_entries <= 0:
-                    return False
+    # Nested directories are promoted to the held retired-root descriptor one
+    # level at a time. Every unlink, promotion, or rmdir spends one work unit.
+    # Descriptor use is constant with tree depth; the mutated retired tree plus
+    # its retirement record is durable continuation state for the next pass.
+    while budget.remaining_entries > 0:
+        selected_name: str | None = None
+        try:
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    if preserve_manifest and entry.name == HOT_STATE_MANIFEST:
+                        continue
+                    selected_name = entry.name
+                    break
+        except OSError:
+            return False
+        if selected_name is None:
+            return True
+
+        try:
+            details = os.stat(
+                selected_name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if details.st_uid != os.getuid() or details.st_dev != expected_device:
+            return False
+
+        if stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
+            try:
+                os.unlink(selected_name, dir_fd=descriptor)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            budget.remaining_entries -= 1
+            continue
+
+        if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+            return False
+
+        try:
+            child = os.open(
+                selected_name,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+        except OSError:
+            return False
+        try:
+            pinned = os.fstat(child)
+            if (
+                pinned.st_dev != expected_device
+                or pinned.st_uid != os.getuid()
+                or pinned.st_ino != details.st_ino
+            ):
+                return False
+
+            child_name: str | None = None
+            try:
+                with os.scandir(child) as child_entries:
+                    for child_entry in child_entries:
+                        child_name = child_entry.name
+                        break
+            except OSError:
+                return False
+
+            if child_name is None:
                 try:
-                    details = os.stat(
-                        entry.name, dir_fd=descriptor, follow_symlinks=False
-                    )
+                    os.rmdir(selected_name, dir_fd=descriptor)
                 except FileNotFoundError:
                     continue
-                if details.st_uid != os.getuid() or details.st_dev != expected_device:
+                except OSError:
                     return False
-                if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
-                    try:
-                        child = os.open(
-                            entry.name,
-                            os.O_RDONLY
-                            | os.O_DIRECTORY
-                            | os.O_CLOEXEC
-                            | os.O_NOFOLLOW,
-                            dir_fd=descriptor,
-                        )
-                    except OSError:
-                        return False
-                    try:
-                        pinned = os.fstat(child)
-                        if (
-                            pinned.st_dev != expected_device
-                            or pinned.st_uid != os.getuid()
-                            or pinned.st_ino != details.st_ino
-                        ):
-                            return False
-                        complete = delete_directory_contents_bounded(
-                            child,
-                            expected_device,
-                            budget,
-                            depth + 1,
-                            preserve_manifest=False,
-                        )
-                    finally:
-                        os.close(child)
-                    if not complete or budget.remaining_entries <= 0:
-                        return False
-                    try:
-                        os.rmdir(entry.name, dir_fd=descriptor)
-                    except FileNotFoundError:
-                        continue
-                    except OSError:
-                        return False
-                    budget.remaining_entries -= 1
-                elif stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
-                    try:
-                        os.unlink(entry.name, dir_fd=descriptor)
-                    except FileNotFoundError:
-                        continue
-                    except OSError:
-                        return False
-                    budget.remaining_entries -= 1
-                else:
+                budget.remaining_entries -= 1
+                continue
+
+            try:
+                child_details = os.stat(
+                    child_name,
+                    dir_fd=child,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if (
+                child_details.st_uid != os.getuid()
+                or child_details.st_dev != expected_device
+            ):
+                return False
+
+            if (
+                stat.S_ISREG(child_details.st_mode)
+                or stat.S_ISLNK(child_details.st_mode)
+            ):
+                try:
+                    os.unlink(child_name, dir_fd=child)
+                except FileNotFoundError:
+                    continue
+                except OSError:
                     return False
-    except OSError:
-        return False
-    return True
+                budget.remaining_entries -= 1
+                continue
+
+            if (
+                not stat.S_ISDIR(child_details.st_mode)
+                or stat.S_ISLNK(child_details.st_mode)
+            ):
+                return False
+
+            promoted_name = promoted_delete_name(child_details)
+            try:
+                rename_noreplace_at(
+                    child,
+                    child_name,
+                    descriptor,
+                    promoted_name,
+                )
+            except (FileExistsError, OSError):
+                return False
+            try:
+                promoted = os.stat(
+                    promoted_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return False
+            if (
+                not stat.S_ISDIR(promoted.st_mode)
+                or stat.S_ISLNK(promoted.st_mode)
+                or promoted.st_uid != os.getuid()
+                or promoted.st_dev != child_details.st_dev
+                or promoted.st_ino != child_details.st_ino
+            ):
+                return False
+            try:
+                os.fsync(child)
+                os.fsync(descriptor)
+            except OSError:
+                return False
+            budget.remaining_entries -= 1
+        finally:
+            os.close(child)
+
+    return False
 
 
 def retirement_record_name(retired_name: str, state_identity: str) -> str:
@@ -2731,7 +2840,6 @@ def delete_retired_state_bounded(
             state_descriptor,
             state_details.st_dev,
             budget,
-            0,
             preserve_manifest=True,
         )
         if not complete or budget.remaining_entries <= 0:
