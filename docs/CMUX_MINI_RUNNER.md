@@ -732,12 +732,24 @@ takes 190 to 280 s.
   requests in flight (further ones get `busy` at once), at most two streaming (60 s wait for a slot),
   each cut off after 180 s however slowly the client reads; nice 10 and utility disk I/O. The forced
   command runs `python3 -I` (no user site-packages or PYTHON* variables).
-- **Mini load.** While a job runs, the LAN extraction is paced to 64 MiB/s (about 140 s for a seed).
+- **Mini load.** The stream spools to a file at line rate (2.3 GB in ~25 s), so the seeder's slot frees at
+  once; only the extraction is paced beside a job, to 64 MiB/s (about 140 s for a seed). Pacing the stream
+  itself held the slot 140 to 180 s, so the 180 s serve limit cut streams off (ssh exit 255, "Truncated tar
+  archive") and other minis got `busy` (cmuxterm-hq#658, 2026-09-28: 4 of 10 LAN fetches succeeded).
+- **Retries.** A `busy` answer is asked again after 15 to 45 s, and a cut stream or one that fails
+  `zstd -t` after 2 to 8 s, up to 4 attempts inside 900 s. The record's `lan.attempts` counts them.
+- **R2 pacing.** The R2 fetch after the LAN step used a fixed 3 MB/s whenever a job existed, which on
+  2026-09-28 was every fetch (p50 766 s). Its Governor now reads the mini's inbound bytes on `en*` each
+  second, subtracts the download's own, and pauses the download's process group only while a job is
+  running, that job's traffic was over 512 KiB/s in the last 15 s, and the download is ahead of 3 MiB/s.
+  A compiling or testing job leaves the link to the download. The record's `paced` has `hot_seconds`,
+  `paused_seconds` and `peak_job_bps`.
 - **Remaining exposure.** A PR job on a mini can rewrite `~/.config/glaeda/seed-lan/config.json` and
   `known_hosts` (same user), pointing that mini's LAN step at another host. That host could only feed
   that mini a seed, which a PR job there can already write directly; the seeder and other minis are
   unaffected. A follow-up could have `glaeda-mini-fleet check` hash both files.
-- **Integrity.** The mini extracts into `seeds/.lan-<pid>`, requires exactly one top-level directory
+- **Integrity.** The spooled stream must end with ssh exit 0 and pass `zstd -t` (every frame carries an
+  XXH64 checksum of its content). The mini then extracts into `seeds/.lan-<pid>/x`, requires exactly one top-level directory
   named by the requested key with `cmux-seed-input-mtimes.json`, caps the stream at 16 GiB, and renames it
   into place. Any failure removes the staging directory. R2's prefetch then runs unchanged: it finds the
   seed already kept (and prunes), or downloads a nearer one. A miss or any error is today's behaviour.

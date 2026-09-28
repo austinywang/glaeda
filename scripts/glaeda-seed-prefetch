@@ -22,11 +22,13 @@ never takes the host lock and never touches a job's tree, and cmux's prune spare
 in the last 10 minutes. One run at a time (flock on ci/.prefetch/lock). Once every root has main's
 head's own seed kept, later runs stop after one `git fetch` until main moves. Prints one JSON line.
 
-It fetches while jobs run, at BUSY_RATE. It used to wait for an idle mini, but a PR mini is almost
-never idle: on 2026-09-25 about 90% of runs were deferred, every mini kept 2 to 8 seeds, and compile
-admission's kept seeds sat 12 to 20 commits behind main (cmuxterm-hq#661, workstream 6). A seed is
-about 1.9 GB. At BUSY_RATE, 3 of the minis' ~8 MB/s, it takes about 11 minutes and leaves a job most
-of the link; on an idle mini it runs at full speed.
+It fetches while jobs run. It used to wait for an idle mini, but a PR mini is almost never idle: on
+2026-09-25 about 90% of runs were deferred, and compile admission's kept seeds sat 12 to 20 commits behind
+main (cmuxterm-hq#661, workstream 6). It then fetched at a fixed 3 MB/s whenever a job existed, which on
+2026-09-28 was every R2 fetch (p50 766 s), so minis started a p50 of 2.5 seeds behind the newest
+(cmuxterm-hq#658). Now the Governor paces the R2 download by the job's measured traffic: BUSY_RATE only
+while the job itself is downloading (checkout, seeds, products, packages), the link's speed while it
+compiles or tests, which is most of a job.
 
 It fetches only when it pays. A start at most NEAR_APP_SWIFT_FILES app Swift files from the build
 never recompiled the `cmux` module (0 of 21 admissions, 2026-09-25), while 6 or more did in 26 of 40,
@@ -37,14 +39,18 @@ count cannot say when main is quiet; its content can. Measured on the same day, 
 seeds per root instead of 34 for the same distance from main.
 
 Seeds come over the LAN first when this mini is configured for it (glaeda-seed-lan install writes
-LAN_CONFIG): the trusted seeder (cmux15) keeps every seed it builds, and glaeda-seed-serve there streams
-the nearest one it keeps in about 25 s (2.3 GB of zstd at ~90 MB/s) instead of R2's 190 to 280 s. The
-candidates are the keys cmux's prefetch looks for, nearest first: this mini's width over main's
-first-parent history (seed_derived_data.lineage), up to the nearest seed already kept here. The stream is
-extracted into a staging directory beside the cache, checked (one top-level directory named by the key,
-holding the seed manifest, under LAN_MAX_BYTES), and renamed into place; any failure removes the staging
-directory. cmux's R2 prefetch then runs exactly as before: it finds the LAN seed "already kept" and
-prunes, or downloads a nearer seed the seeder did not have. So a miss or any error is today's behaviour.
+LAN_CONFIG): the seeder (the seed archive on cmux-lawrence, or the trusted seeder cmux15) streams the
+nearest seed it keeps. The candidates are the keys cmux's prefetch looks for, nearest first: this mini's
+width over main's first-parent history (seed_derived_data.lineage), up to the nearest seed already kept
+here. The stream is spooled to a file at line rate (2.3 GB of zstd in ~25 s), so the seeder's slot is free
+again at once and its 180 s serve limit never cuts a slow reader off; then checked whole (ssh's exit
+status, and `zstd -t`, which verifies every frame's content checksum); then extracted into a staging
+directory beside the cache (paced to LAN_BUSY_RATE beside a job), checked (one top-level directory named
+by the key, holding the seed manifest, under LAN_MAX_BYTES), and renamed into place. A busy seeder or a
+cut or corrupt stream is asked again after a pause, up to LAN_ATTEMPTS times; any failure removes the
+staging directory. cmux's R2 prefetch then runs exactly as before: it finds the LAN seed "already kept"
+and prunes, or downloads a nearer seed the seeder did not have. So a miss or any error is today's
+behaviour.
 
 macOS Local Network Privacy blocks LAN connections from a LaunchAgent whose program is not Apple's
 (measured 2026-09-25: Homebrew python3 and its /usr/bin/ssh child got "No route to host"; /usr/bin/python3
@@ -56,9 +62,11 @@ and its children connected). So glaeda-mini-setup runs this agent with /usr/bin/
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -68,6 +76,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 STATE = Path(os.environ.get("GLAEDA_SEED_STATE", "/Users/Shared/cmux-build-fleet/ci"))
 REPO_URL = os.environ.get("GLAEDA_SEED_REPO", "https://github.com/manaflow-ai/cmux.git")
@@ -82,10 +91,20 @@ BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 FETCH_TIMEOUT = 180
 PREFETCH_TIMEOUT = 900
-# While a job runs: curl's --limit-rate for the download (r2-cache.sh's curl reads CURL_HOME/.curlrc),
-# and a longer timeout for the slower download. r2-cache.sh stops a download after 900 s, so this rate
-# fetches up to 2.7 GB.
-BUSY_RATE = "3M"
+# While a job runs, the R2 download is paced by the Governor: at most BUSY_RATE bytes a second while the
+# job's own traffic is over FOREIGN_BUSY_BPS (or was, within HOT_HOLD seconds), the link's speed otherwise.
+# r2-cache.sh stops a download after 900 s, and BUSY_RATE fetches up to 2.7 GB in that time; a job's
+# download phases are minutes, so a seed usually lands in a few.
+BUSY_RATE = 3 * 1024**2
+FOREIGN_BUSY_BPS = 512 * 1024
+HOT_HOLD = 15.0
+BURST_SECONDS = 2.0
+JOB_CHECK_SECONDS = 10.0
+WINDOW = 5.0
+# Received bytes per byte of download payload (Ethernet, IP, TCP, TLS headers), measured on cmux9s,
+# and the share of the download's rate by which that measurement may be off.
+WIRE_OVERHEAD = 1.05
+WIRE_TOLERANCE = 0.03
 BUSY_PREFETCH_TIMEOUT = 1500
 # A kept seed this near main's head is a start that does not recompile the app: skip the download.
 NEAR_APP_SWIFT_FILES = 5
@@ -112,7 +131,7 @@ TAR = "/usr/bin/tar"
 # zstd. It only decompresses a pipe, so Local Network Privacy does not concern it.
 ZSTD_CANDIDATES = ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd")
 LAN_CONNECT_TIMEOUT = 5
-LAN_TIMEOUT = 600  # the seeder may wait 60 s for a serve slot; a seed takes ~25 s at LAN speed
+LAN_TIMEOUT = 900  # every attempt (the seeder may wait 60 s for a slot; ~25 s to spool) and the extraction
 LAN_MAX_BYTES = 16 * 1024**3  # raw tar bytes; cmux saves no seed over 12 GiB (MAX_RAW_BYTES)
 LAN_MIN_FREE_BYTES = 40 * 1024**3
 # The same pattern as glaeda-seed-serve's KEY_RE.
@@ -126,6 +145,13 @@ HEADER_SCAN_BYTES = 4096
 # lands in ~140 s beside the job's compile rather than as fast as the disk takes it (and inside the
 # seeder's 180 s serve limit).
 LAN_BUSY_RATE = 64 * 1024**2
+# A busy seeder (every serve slot taken) or a stream cut part way is asked again, up to LAN_ATTEMPTS times
+# inside LAN_TIMEOUT, after a random pause in these bounds (seconds): the client queues instead of going
+# to R2. The seeder holds a slot only while the spool fills at line rate (~25 s), so a turn comes soon.
+LAN_ATTEMPTS = 4
+LAN_BUSY_BACKOFF = (10.0, 30.0)
+LAN_RETRY_BACKOFF = (2.0, 8.0)
+LAN_BUSY_BUDGET = 120.0  # seconds a busy seeder is waited for, from the first attempt
 
 
 def running_commands() -> list[str] | None:
@@ -364,10 +390,19 @@ class Pipeline:
     def spawn(self, argv: list[str], **kwargs) -> subprocess.Popen:
         proc = subprocess.Popen(argv, start_new_session=True, **kwargs)
         self.procs.append(proc)
+        if self.timed_out:  # the deadline passed while it started: it never runs past it
+            self.stop()
         return proc
 
     def stop(self) -> None:
+        """SIGKILL every process group whose leader is not reaped yet.
+
+        A reaped leader's pid (and so its group id) may already belong to another process; an unreaped
+        one, running or a zombie, still holds it.
+        """
         for proc in self.procs:
+            if proc.returncode is not None:
+                continue
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
@@ -377,9 +412,10 @@ class Pipeline:
         self.timed_out = True
         self.stop()
 
-    def reap(self) -> list[int]:
+    def reap(self, since: int = 0) -> list[int]:
+        """The exit codes of the processes spawned from index SINCE on, once each has exited."""
         codes = []
-        for proc in self.procs:
+        for proc in self.procs[since:]:
             try:
                 codes.append(proc.wait(timeout=30))
             except subprocess.TimeoutExpired:
@@ -388,10 +424,14 @@ class Pipeline:
         return codes
 
 
-def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: list[str], codec: str,
-                staging: Path, rate: int | None = None) -> dict | None:
-    """One address: the result, or None when it could not be reached (then the next address is tried)."""
-    with tempfile.TemporaryFile() as ssh_err, tempfile.TemporaryFile() as tar_err:
+def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: list[str], codec: str,
+                 spool: Path) -> dict | None:
+    """Spool one address's answer into SPOOL at line rate: the result, or None when it could not be reached.
+
+    The stream is read as fast as the LAN delivers it, whatever the mini is doing, so the seeder's slot is
+    held for seconds and its SERVE_TIMEOUT never cuts a paced reader off mid-stream (a truncated tar).
+    """
+    with tempfile.TemporaryFile() as ssh_err:
         ssh = run.spawn(ssh_command(config, address, request), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                         stderr=ssh_err)
         header = read_header(ssh.stdout.fileno())
@@ -410,7 +450,8 @@ def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: l
             run.stop()
             run.reap()
             ssh.stdout.close()
-            return {"fetched": "false", "reason": f"seeder: {' '.join(words)[:120] or 'empty answer'}"}
+            answer = " ".join(words)[:120] or "empty answer"
+            return {"fetched": "false", "reason": f"seeder: {answer}", "retry": words[:1] == ["busy"]}
         if len(words) != 3 or words[1] not in keys or words[2] not in ("zstd", "tar") \
                 or (words[2] == "zstd" and codec != "zstd"):
             run.stop()
@@ -418,14 +459,75 @@ def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: l
             ssh.stdout.close()
             return {"fetched": "false", "reason": "seeder answered a key or codec it was not asked for"}
         key, their_codec = words[1], words[2]
-        source = ssh.stdout
-        if their_codec == "zstd":
-            source = run.spawn([zstd_tool(), "-d", "-q", "-c"], stdin=ssh.stdout, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL).stdout
+        total, over, spool_error = 0, False, ""
+        try:
+            with open(spool, "wb") as out:
+                while True:
+                    chunk = os.read(ssh.stdout.fileno(), 1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > LAN_MAX_BYTES:
+                        over = True
+                        run.stop()
+                        break
+                    try:
+                        out.write(chunk)
+                    except OSError as error:  # the disk, not the stream: another attempt would not help
+                        spool_error = errno.errorcode.get(error.errno, type(error).__name__)
+                        run.stop()
+                        break
+        except OSError:  # the pipeline was stopped
+            run.stop()
+        finally:
             ssh.stdout.close()
-        tar = run.spawn([TAR, "-x", "-f", "-", "-C", os.fspath(staging)], stdin=subprocess.PIPE,
+        codes = run.reap()
+        if spool_error:
+            return {"fetched": "false", "reason": f"spool: {spool_error}", "key": key}
+        if over:
+            return {"fetched": "false", "reason": f"seed stream over {LAN_MAX_BYTES} bytes", "key": key}
+        if run.timed_out:
+            return {"fetched": "false", "reason": "stream timed out", "key": key}
+        if any(codes):
+            # The seeder or the link dropped the stream part way (the serve timeout, a reset): try again.
+            ssh_err.seek(0)
+            detail = ssh_err.read().decode(errors="replace").strip()[-120:]
+            return {"fetched": "false", "reason": f"transfer cut at {total} bytes: ssh exit {codes[0]} {detail}".strip(),
+                    "key": key, "retry": True}
+        if their_codec == "zstd":
+            # Every zstd frame ends in a checksum of its content, which `zstd -t` checks: a stream cut at a
+            # frame boundary or damaged on the way fails here, before anything is extracted.
+            first = len(run.procs)
+            with tempfile.TemporaryFile() as test_err:
+                try:
+                    run.spawn([zstd_tool(), "-t", "-q", os.fspath(spool)], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=test_err)
+                except OSError as error:
+                    return {"fetched": "false", "reason": f"zstd -t: {type(error).__name__}", "key": key}
+                run.procs[first].wait()  # as long as it takes: the attempt's timer (run.expire) bounds it
+                tested = run.reap(first)[0]
+                test_err.seek(0)
+                detail = test_err.read().decode(errors="replace").strip()[-120:]
+            if run.timed_out:
+                return {"fetched": "false", "reason": "stream timed out", "key": key}
+            if tested != 0:
+                return {"fetched": "false", "reason": f"stream fails its checksum: {detail}".strip(), "key": key,
+                        "retry": True}
+        return {"fetched": "true", "key": key, "distance": keys.index(key), "codec": their_codec, "bytes": total}
+
+
+def lan_extract(run: Pipeline, spool: Path, codec: str, into: Path, rate: int | None = None) -> str:
+    """Extract the spooled seed into INTO, paced to RATE raw tar bytes a second; '' or why it failed."""
+    first = len(run.procs)
+    with tempfile.TemporaryFile() as tar_err:
+        if codec == "zstd":
+            source = run.spawn([zstd_tool(), "-d", "-q", "-c", os.fspath(spool)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+        else:
+            source = open(spool, "rb")
+        tar = run.spawn([TAR, "-x", "-f", "-", "-C", os.fspath(into)], stdin=subprocess.PIPE,
                         stdout=subprocess.DEVNULL, stderr=tar_err)
-        total, over, into_tar = 0, False, True
+        total, into_tar = 0, True
         paced = time.monotonic()
         try:
             while True:
@@ -433,20 +535,19 @@ def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: l
                 if not chunk:
                     break
                 total += len(chunk)
-                if rate:  # busy: pace to RATE raw bytes a second
+                if rate:  # busy: pace the disk writes to RATE raw bytes a second
                     ahead = paced + total / rate - time.monotonic()
                     if ahead > 0:
                         time.sleep(ahead)
                 if total > LAN_MAX_BYTES:
-                    over = True
                     run.stop()
-                    break
+                    return f"seed stream over {LAN_MAX_BYTES} bytes"
                 if into_tar:
                     try:
                         tar.stdin.write(chunk)
                     except BrokenPipeError:
                         # bsdtar exits at the end-of-archive marker and leaves the padding unread (cmux
-                        # r2-cache.sh unpack): drain the rest so ssh and zstd exit cleanly; tar's own exit
+                        # r2-cache.sh unpack): drain the rest so zstd exits cleanly; tar's own exit
                         # status still decides.
                         into_tar = False
         except OSError:  # the pipeline was stopped
@@ -457,45 +558,97 @@ def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: l
                     pipe.close()
                 except OSError:
                     pass
-        codes = run.reap()
-        if over:
-            return {"fetched": "false", "reason": f"seed stream over {LAN_MAX_BYTES} bytes", "key": key}
+        codes = run.reap(first)
         if run.timed_out:
-            return {"fetched": "false", "reason": "stream timed out", "key": key}
+            return "stream timed out"
         if any(codes):
             tar_err.seek(0)
             detail = tar_err.read().decode(errors="replace").strip()[-120:]
-            return {"fetched": "false", "reason": f"stream exits {codes} {detail}".strip(), "key": key}
-        return {"fetched": "true", "key": key, "distance": keys.index(key), "codec": their_codec, "bytes": total}
+            return f"stream exits {codes} {detail}".strip()
+        return ""
+
+
+def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: list[str], codec: str,
+                staging: Path, rate: int | None = None) -> dict | None:
+    """One address, once: spool the stream, check it whole, then extract it into STAGING/x.
+
+    None when the address could not be reached (then the next address is tried). A result carrying
+    "retry" failed in a way another attempt may not (busy, a cut stream).
+    """
+    spool, into = staging / "stream", staging / "x"
+    for leftover in (spool, into):
+        if leftover.is_dir():
+            shutil.rmtree(leftover)
+        elif leftover.exists():
+            leftover.unlink()
+    into.mkdir()
+    started = time.monotonic()
+    result = lan_download(run, config, address, request, keys, codec, spool)
+    if result is None or result.get("fetched") != "true":
+        return result
+    result["transfer_seconds"] = f"{time.monotonic() - started:.1f}"
+    why = lan_extract(run, spool, result["codec"], into, rate)
+    try:
+        spool.unlink()  # 2+ GB the cache does not need once extracted
+    except OSError:
+        pass
+    if why:
+        return {"fetched": "false", "reason": why, "key": result["key"]}
+    return result
 
 
 def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float, rate: int | None = None) -> dict:
-    """Ask the seeder for the first of KEYS it keeps and extract it into STAGING; addresses in order."""
+    """Ask the seeder for the first of KEYS it keeps and extract it into STAGING/x; addresses in order.
+
+    A busy seeder or a cut stream is asked again, after LAN_BUSY_BACKOFF or LAN_RETRY_BACKOFF seconds, up
+    to LAN_ATTEMPTS times, all inside TIMEOUT: the client waits its turn instead of falling back to R2.
+    """
     codec = "zstd" if zstd_tool() else "tar"
     request = " ".join(["seed-v1", codec, *keys])
     unreachable = []
+    deadline = time.monotonic() + timeout
+    answered = None
     for address in config["addresses"]:
-        run = Pipeline()
+        attempts, result, run = 0, None, Pipeline()
+        busy_until = time.monotonic() + LAN_BUSY_BUDGET
+        while attempts < LAN_ATTEMPTS and time.monotonic() < deadline:
+            attempts += 1
+            run = Pipeline()
 
-        # launchd's bootout signals only this job's process group; the pipeline runs in others.
-        def on_signal(signum, _frame, run=run) -> None:
-            run.stop()
-            shutil.rmtree(staging, ignore_errors=True)
-            sys.exit(128 + signum)
+            # launchd's bootout signals only this job's process group; the pipeline runs in others.
+            def on_signal(signum, _frame, run=run) -> None:
+                run.stop()
+                shutil.rmtree(staging, ignore_errors=True)
+                sys.exit(128 + signum)
 
-        previous = {signum: signal.signal(signum, on_signal)
-                    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
-        timer = threading.Timer(timeout, run.expire)
-        timer.start()
-        try:
-            result = lan_attempt(run, config, address, request, keys, codec, staging, rate)
-        finally:
-            timer.cancel()
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
+            previous = {signum: signal.signal(signum, on_signal)
+                        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+            timer = threading.Timer(max(0.0, deadline - time.monotonic()), run.expire)
+            timer.start()
+            try:
+                result = lan_attempt(run, config, address, request, keys, codec, staging, rate)
+            finally:
+                timer.cancel()
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
+            if result is not None:
+                answered = {**result, "address": address, "attempts": attempts}
+            if result is None or not result.get("retry") or attempts >= LAN_ATTEMPTS:
+                break
+            busy = result["reason"].startswith("seeder: busy")
+            low, high = LAN_BUSY_BACKOFF if busy else LAN_RETRY_BACKOFF
+            pause = random.uniform(low, high)
+            # Queue for a busy seeder only so long: R2 at link speed takes a seed in a minute or two.
+            if time.monotonic() + pause >= (min(deadline, busy_until) if busy else deadline):
+                break
+            time.sleep(pause)
         if result is not None:
-            return {**result, "address": address}
-        unreachable.append(run.unreachable)
+            answered.pop("retry", None)
+            return answered
+        unreachable.append(run.unreachable or f"{address}: out of time")
+    if answered is not None:  # an address answered (busy, say) and then stopped answering
+        answered.pop("retry", None)
+        return answered
     return {"fetched": "false", "reason": "unreachable: " + "; ".join(unreachable)[:300]}
 
 
@@ -526,7 +679,8 @@ def lan_fetch(store: Path, mirror: Path, head: str, config: dict, timeout: float
         if result.get("fetched") != "true":
             return result
         key = result["key"]
-        if sorted(os.listdir(staging)) != [key] or not seed_complete(staging / key):
+        extracted = staging / "x"
+        if sorted(os.listdir(extracted)) != [key] or not seed_complete(extracted / key):
             return {"fetched": "false", "reason": "stream is not one complete seed", "key": key}
         target = cache / key
         if seed_complete(target):
@@ -534,7 +688,7 @@ def lan_fetch(store: Path, mirror: Path, head: str, config: dict, timeout: float
             result = {**result, "fetched": "false", "reason": "kept meanwhile"}
         else:
             shutil.rmtree(target, ignore_errors=True)  # an incomplete leftover under the final name
-            (staging / key).rename(target)
+            (extracted / key).rename(target)
         os.utime(target)
         return {**result, "seconds": f"{time.monotonic() - started:.1f}"}
     except OSError as error:
@@ -543,33 +697,206 @@ def lan_fetch(store: Path, mirror: Path, head: str, config: dict, timeout: float
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def prefetch(scripts: Path, store: Path, head: str, mirror: Path, throttled: bool = False) -> dict:
-    env = {key: value for key, value in os.environ.items() if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT")}
-    timeout = PREFETCH_TIMEOUT
-    if throttled:
-        curl_home = mirror.parent / "curl-busy"
-        curl_home.mkdir(exist_ok=True)
-        (curl_home / ".curlrc").write_text(f"limit-rate = {BUSY_RATE}\n")
-        env["CURL_HOME"] = os.fspath(curl_home)
-        timeout = BUSY_PREFETCH_TIMEOUT
-    else:
-        env.pop("CURL_HOME", None)
+def interface_bytes() -> int | None:
+    """Bytes received so far on the physical interfaces (en*), from `netstat -ibn`; None if unreadable.
+
+    Only en* link rows count: a tunnel (utun, Tailscale) carries bytes that en0 also counts.
+    """
+    try:
+        out = subprocess.run(["/usr/sbin/netstat", "-ibn"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    total, seen = 0, False
+    for line in out.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 10 or not re.fullmatch(r"en[0-9]+", fields[0]) or not fields[2].startswith("<Link#"):
+            continue
+        # Name Mtu Network [Address] Ipkts Ierrs Ibytes ...: Address is blank on some links.
+        ibytes = fields[6] if len(fields) >= 11 else fields[5]
+        if ibytes.isdigit():
+            total, seen = total + int(ibytes), True
+    return total if seen else None
+
+
+class DownloadBytes:
+    """The bytes the downloads in process group PGID have written so far, counted as they grow.
+
+    r2-cache.sh's curl writes each archive with `-o PATH` into a `mktemp -d` directory (macOS mktemp puts
+    it in the per-user temp directory, whatever TMPDIR says), so the curls in the group are found with ps
+    and their -o files are measured. Growth only: a file that is deleted or replaced adds nothing.
+    """
+
+    def __init__(self, pgid: int) -> None:
+        self.pgid, self.sizes, self.total = pgid, {}, 0
+
+    def outputs(self) -> list[str]:
+        paths = []
+        for line in running_group_commands(self.pgid):
+            argv = line.split()
+            if not argv or os.path.basename(argv[0]) != "curl":
+                continue
+            for flag, value in zip(argv, argv[1:]):
+                if flag in ("-o", "--output") and value.startswith("/"):
+                    paths.append(value)
+        return paths
+
+    def __call__(self) -> int:
+        for path in self.outputs():
+            try:
+                size = os.stat(path).st_size
+            except OSError:
+                continue
+            self.total += max(0, size - self.sizes.get(path, 0))
+            self.sizes[path] = size
+        return self.total
+
+
+def running_group_commands(pgid: int) -> list[str]:
+    """The command lines of the processes in process group PGID."""
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "pgid=,command="], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    commands = []
+    for line in out.stdout.splitlines():
+        group, _, command = line.strip().partition(" ")
+        if group == str(pgid):
+            commands.append(command.strip())
+    return commands
+
+
+class Governor:
+    """Paces an R2 download by the running job's own use of the network, not by the job's existence.
+
+    Each TICK it reads the bytes the mini received (interface_bytes) and the bytes the download has
+    written (DownloadBytes). Over the last WINDOW seconds, the received bytes less the download's (times
+    WIRE_OVERHEAD, the headers its payload arrives in) are the job's traffic; a window absorbs the socket
+    buffer that fills during a pause and drains after it. While a job runs and its traffic exceeded
+    FOREIGN_BUSY_BPS (plus WIRE_TOLERANCE of the download's own rate, for the overhead's error) within the
+    last HOT_HOLD seconds (checkout, a seed or product download, package resolution), the download's
+    process group is stopped whenever it is ahead of RATE bytes a second, and continued when it is not.
+    Otherwise (a job compiling or testing, or no job) it runs at the link's speed. A pause holds TCP's
+    window closed for a second or two, well inside any server or curl timeout. When the traffic cannot be
+    read, every job counts as network-heavy.
+
+    The group is signalled only under the lock and before stop(): the caller stops the Governor before it
+    reaps the group's leader, so a signal never reaches a reused process group.
+    """
+
+    def __init__(self, pgid: int, rate: int, job: Callable[[], str],
+                 read_interface: Callable[[], int | None] = interface_bytes,
+                 read_own: Callable[[], int] | None = None, tick: float = 1.0) -> None:
+        self.pgid, self.rate, self.job, self.tick = pgid, rate, job, tick
+        self.read_interface, self.read_own = read_interface, read_own or DownloadBytes(pgid)
+        self.stop_event = threading.Event()
+        self.lock = threading.RLock()  # stop() may run in a signal handler on a thread inside stop()
+        self.paused = False
+        self.stats = {"hot_seconds": 0.0, "paused_seconds": 0.0, "peak_job_bps": 0}
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    def set_paused(self, paused: bool) -> None:
+        with self.lock:
+            if self.stop_event.is_set() or paused == self.paused:
+                return
+            try:
+                os.killpg(self.pgid, signal.SIGSTOP if paused else signal.SIGCONT)
+            except OSError:
+                pass
+            self.paused = paused
+
+    def loop(self) -> None:
+        last_in, last_own, last = self.read_interface(), self.read_own(), time.monotonic()
+        hot_until, job_checked, has_job, allowance = 0.0, 0.0, True, self.rate * BURST_SECONDS
+        window: list[tuple[float, int | None, int]] = []
+        while not self.stop_event.wait(self.tick):
+            now = time.monotonic()
+            dt = max(now - last, 1e-3)
+            received, own = self.read_interface(), self.read_own()
+            own_delta = max(0, own - last_own)
+            rx_delta = None if received is None or last_in is None else received - last_in
+            window = [*window, (dt, rx_delta, own_delta)]
+            while sum(item[0] for item in window) > WINDOW + 1e-6 and len(window) > 1:
+                window = window[1:]
+            span = sum(item[0] for item in window)
+            if any(item[1] is None for item in window):
+                foreign, own_rate = None, 0.0
+            else:
+                own_rate = sum(item[2] for item in window) / span
+                foreign = max(0.0, sum(item[1] for item in window) / span - own_rate * WIRE_OVERHEAD)
+                self.stats["peak_job_bps"] = max(self.stats["peak_job_bps"], int(foreign))
+            if now - job_checked >= JOB_CHECK_SECONDS:
+                has_job, job_checked = bool(self.job()), now
+            if has_job and (foreign is None or foreign >= FOREIGN_BUSY_BPS + WIRE_TOLERANCE * own_rate):
+                hot_until = now + HOT_HOLD
+            hot = has_job and now < hot_until
+            if hot:
+                self.stats["hot_seconds"] += dt
+                allowance = min(allowance + self.rate * dt, self.rate * BURST_SECONDS) - own_delta
+            else:
+                allowance = self.rate * BURST_SECONDS
+            if self.paused:
+                self.stats["paused_seconds"] += dt
+            self.set_paused(hot and allowance < 0)
+            last_in, last_own, last = received, own, now
+
+    def start(self) -> "Governor":
+        self.thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Continue the group if it is stopped, and never signal it again (one lock hold: no tick between)."""
+        with self.lock:
+            if self.paused and not self.stop_event.is_set():
+                try:
+                    os.killpg(self.pgid, signal.SIGCONT)
+                except OSError:
+                    pass
+                self.paused = False
+            self.stop_event.set()
+        self.thread.join(timeout=30)
+
+    def report(self) -> dict:
+        return {"rate": self.rate, **{k: round(v, 1) if isinstance(v, float) else v for k, v in self.stats.items()}}
+
+
+def remove_downloads(paths: list[str]) -> None:
+    """Remove the mktemp directories of r2-cache.sh downloads a killed prefetch left behind."""
+    for path in paths:
+        folder = os.path.dirname(path)
+        if re.fullmatch(r"tmp\.[A-Za-z0-9]{6,}", os.path.basename(folder)) and os.path.basename(path) == "archive":
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "") -> dict:
+    """cmux's R2 prefetch for STORE, under the Governor; JOB (running at the start, or '') gives the longer timeout."""
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT", "CURL_HOME")}
+    timeout = BUSY_PREFETCH_TIMEOUT if job else PREFETCH_TIMEOUT
+    shutil.rmtree(mirror.parent / "curl-busy", ignore_errors=True)  # the old fixed-rate .curlrc
     env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
     env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
-    # r2-cache.sh stages each archive under TMPDIR; kept under .prefetch, a killed download's partial
-    # archive is wiped by the next run instead of waiting for macOS temp cleanup.
+    # For cmux's Python temp files. r2-cache.sh's `mktemp -d` ignores TMPDIR on macOS (it uses the
+    # per-user temp directory), so its archives are found through curl's -o instead (DownloadBytes).
     env["TMPDIR"] = os.fspath(mirror.parent / "tmp")
     env["PATH"] = f"{TOOL_PATH}:{env.get('PATH', '/usr/bin:/bin')}"
     # Its own process group, so a timeout also stops the downloads r2-cache.sh started.
     child = subprocess.Popen([cmux_python(), os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
                               os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
+    downloads = DownloadBytes(child.pid)
+    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads).start()
 
     def stop_child() -> None:
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        # Only while the leader is unreaped (the Governor stopped first), so the group is still ours.
+        governor.stop()
+        if child.returncode is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        remove_downloads(list(dict(downloads.sizes)))
 
     # launchd's bootout (an OTA update, an uninstall) signals only this job's own process group, so
     # without this the download would outlive us with no timeout and no lock.
@@ -577,24 +904,48 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, throttled: boo
         stop_child()
         sys.exit(128 + signum)
 
+    # Read both pipes to EOF without reaping the leader: the Governor must stop before its pid can be reused.
+    output: dict[str, str] = {}
+    readers = [threading.Thread(target=lambda name=name, pipe=pipe: output.__setitem__(name, pipe.read()), daemon=True)
+               for name, pipe in (("stdout", child.stdout), ("stderr", child.stderr))]
     previous = {signum: signal.signal(signum, on_signal) for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    timed_out = False
     try:
-        stdout, stderr = child.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        stop_child()
-        child.communicate()
-        return {"fetched": "false", "reason": f"timed out after {timeout} s"}
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
+        for reader in readers:
+            reader.join(max(0.0, deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
+            timed_out = True
+            stop_child()
+            for reader in readers:
+                reader.join(30)
+        governor.stop()
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            stop_child()
+            child.wait()
     finally:
+        governor.stop()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-    out = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
-    lines = [line for line in out.stdout.splitlines() if line.startswith("{")]
-    if out.returncode != 0 or not lines:
-        return {"fetched": "false", "reason": f"exit {out.returncode}: {(out.stderr or out.stdout).strip()[-200:]}"}
+        for pipe, reader in zip((child.stdout, child.stderr), readers):
+            if not reader.is_alive():  # a live reader holds the pipe's lock (a descendant that left the group)
+                pipe.close()
+    paced = {"paced": governor.report()}
+    if timed_out:
+        return {"fetched": "false", "reason": f"timed out after {timeout} s", **paced}
+    stdout, stderr = output.get("stdout", ""), output.get("stderr", "")
+    lines = [line for line in stdout.splitlines() if line.startswith("{")]
+    if child.returncode != 0 or not lines:
+        return {"fetched": "false", "reason": f"exit {child.returncode}: {(stderr or stdout).strip()[-200:]}", **paced}
     try:
-        return json.loads(lines[-1])
+        result = json.loads(lines[-1])
     except ValueError:
-        return {"fetched": "false", "reason": "unreadable result"}
+        return {"fetched": "false", "reason": "unreadable result", **paced}
+    return {**result, **paced} if isinstance(result, dict) else {"fetched": "false", "reason": "unreadable result"}
 
 
 def run(apply: bool, state: Path = STATE) -> dict:
@@ -635,6 +986,9 @@ def run(apply: bool, state: Path = STATE) -> dict:
                     "lan": "configured" if lan_config() else "off"}
         shutil.rmtree(work / "tmp", ignore_errors=True)
         (work / "tmp").mkdir()
+        for store in roots:  # a killed run's LAN staging (spool and partial extraction); the lock makes it ours
+            for stale in (store / "seeds").glob(".lan-*"):
+                shutil.rmtree(stale, ignore_errors=True)
         try:
             scripts = scripts_for(work, mirror, head)
         except (OSError, subprocess.SubprocessError) as error:
@@ -653,13 +1007,14 @@ def run(apply: bool, state: Path = STATE) -> dict:
             why = busy()
             lan = None
             if lan_settings:
+                # The transfer runs at line rate; only the extraction's disk writes are paced beside a job.
                 lan = lan_fetch(store, mirror, head, lan_settings, rate=LAN_BUSY_RATE if why else None)
                 if why:
-                    lan["paced"] = f"{LAN_BUSY_RATE}B/s, busy"
+                    lan["paced"] = f"{LAN_BUSY_RATE}B/s extraction, busy"
                 why = busy()  # the LAN step may have taken a while
-            result = prefetch(scripts, store, head, mirror, throttled=bool(why))
+            result = prefetch(scripts, store, head, mirror, job=why)
             if why:
-                result["throttled"] = f"{BUSY_RATE}B/s, busy: {why}"
+                result["busy"] = why
             if lan is not None:
                 result["lan"] = lan
             results[os.fspath(store)] = result

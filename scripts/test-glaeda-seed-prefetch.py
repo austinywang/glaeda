@@ -83,19 +83,22 @@ class SeedPrefetchTest(PrefetchBase):
         self.assertEqual(result["state"], "skip")
         self.assertFalse((self.state / ".prefetch").exists())
 
-    def test_a_busy_mini_fetches_at_the_busy_rate(self):
+    def test_a_busy_mini_fetches_under_the_governor_and_never_at_a_fixed_rate(self):
         self.record(self.state)
         sp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
         os.environ["FAKE_DISTANCE"] = "1"
-        result = sp.run(True, self.state)
-        self.assertEqual(result["state"], "applied")
-        self.assertIn("busy", result["results"][os.fspath(self.state)]["throttled"])
-        sp.running_commands = lambda: None  # unknown counts as busy
-        sp.run(True, self.state)
+        (self.state / ".prefetch/curl-busy").mkdir(parents=True)  # an older version's fixed-rate .curlrc
+        (self.state / ".prefetch/curl-busy/.curlrc").write_text("limit-rate = 3M\n")
+        os.environ["CURL_HOME"] = os.fspath(self.state / ".prefetch/curl-busy")
+        result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        self.assertIn("Runner.Worker", result["busy"])
+        self.assertEqual(result["paced"]["rate"], sp.BUSY_RATE)
         sp.running_commands = lambda: ["zsh"]
-        sp.run(True, self.state)
-        self.assertEqual([line.rsplit(" curlrc=", 1)[1] for line in self.call_lines()],
-                         [f"limit-rate={sp.BUSY_RATE}", f"limit-rate={sp.BUSY_RATE}", ""])
+        result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        self.assertNotIn("busy", result)
+        self.assertEqual(result["paced"]["paused_seconds"], 0)
+        self.assertEqual([line.rsplit(" curlrc=", 1)[1] for line in self.call_lines()], ["", ""])
+        self.assertFalse((self.state / ".prefetch/curl-busy").exists())
 
     def keep_seed(self, store: Path, commit: str) -> None:
         width = os.sysconf("SC_NPROCESSORS_ONLN")
@@ -273,6 +276,133 @@ class SeedPrefetchTest(PrefetchBase):
             self.fail("the download outlived the killed run")
 
 
+class GovernorTest(unittest.TestCase):
+    """The R2 download is paused only while a job's own traffic is heavy, and only when ahead of BUSY_RATE."""
+
+    def setUp(self) -> None:
+        self.saved = (sp.HOT_HOLD, sp.JOB_CHECK_SECONDS, sp.WINDOW)
+        sp.HOT_HOLD, sp.JOB_CHECK_SECONDS, sp.WINDOW = 0.3, 0.0, 0.2
+        self.proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.received = 0
+        self.own = 0
+        self.job = "Runner.Worker"
+
+    def tearDown(self) -> None:
+        sp.HOT_HOLD, sp.JOB_CHECK_SECONDS, sp.WINDOW = self.saved
+        self.proc.kill()
+        self.proc.wait()
+
+    def stopped(self) -> bool:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(self.proc.pid)], capture_output=True, text=True)
+        return out.stdout.strip().startswith("T")
+
+    def governor(self, rate: int = 1000) -> "sp.Governor":
+        return sp.Governor(self.proc.pid, rate, lambda: self.job,
+                           read_interface=lambda: self.received, read_own=lambda: self.own, tick=0.05)
+
+    def run_for(self, seconds: float, job_bps: int, own_bps: int) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            time.sleep(0.02)
+            self.own += int(own_bps * 0.02)
+            self.received += int((job_bps + own_bps * sp.WIRE_OVERHEAD) * 0.02)
+
+    def test_a_download_beside_a_job_that_is_not_downloading_runs_free(self):
+        governor = self.governor().start()
+        try:
+            self.run_for(0.6, job_bps=10_000, own_bps=50_000_000)
+            self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
+        self.assertEqual(governor.stats["paused_seconds"], 0)
+        self.assertEqual(governor.stats["hot_seconds"], 0)
+
+    def test_a_job_downloading_holds_the_download_to_the_busy_rate_then_frees_it(self):
+        governor = self.governor().start()
+        try:
+            self.run_for(0.6, job_bps=sp.FOREIGN_BUSY_BPS * 8, own_bps=50_000_000)
+            self.assertTrue(self.stopped())
+            self.run_for(1.0, job_bps=0, own_bps=0)  # the job starts compiling
+            self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
+        self.assertGreater(governor.stats["paused_seconds"], 0)
+        self.assertGreaterEqual(governor.stats["peak_job_bps"], sp.FOREIGN_BUSY_BPS * 6)
+        self.assertFalse(self.stopped())
+
+    def test_header_overhead_on_a_fast_download_is_not_the_jobs_traffic(self):
+        governor = self.governor().start()
+        try:
+            end = time.monotonic() + 0.6
+            while time.monotonic() < end:  # 1% more header than WIRE_OVERHEAD assumes, at 100 MB/s
+                time.sleep(0.02)
+                self.own += 2_000_000
+                self.received += int(2_000_000 * (sp.WIRE_OVERHEAD + 0.01))
+            self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
+        self.assertEqual(governor.stats["hot_seconds"], 0)
+
+    def test_no_job_means_no_pause_whatever_the_traffic(self):
+        self.job = ""
+        governor = self.governor().start()
+        try:
+            self.run_for(0.6, job_bps=sp.FOREIGN_BUSY_BPS * 10, own_bps=50_000_000)
+            self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
+
+    def test_unreadable_counters_count_a_job_as_downloading(self):
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job",
+                               read_interface=lambda: None, read_own=lambda: self.own, tick=0.05)
+        governor.start()
+        try:
+            self.run_for(0.4, job_bps=0, own_bps=50_000_000)
+            self.assertTrue(self.stopped())
+        finally:
+            governor.stop()
+        self.assertFalse(self.stopped())  # stopping the governor always resumes the download
+        governor.set_paused(True)  # and it never signals the group again
+        self.assertFalse(self.stopped())
+
+    def test_download_bytes_follows_the_curls_in_the_group_by_their_output_file(self):
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        archive = base / "tmp.X" / "archive"
+        archive.parent.mkdir()
+        archive.write_bytes(b"x" * 100)
+        pgid = self.proc.pid
+        lines = [f"curl --fail --silent -o {archive} https://ci-cache.cmux.com/v1/k.tar.zst", "bash r2-cache.sh restore"]
+        saved = sp.running_group_commands
+        sp.running_group_commands = lambda group: lines if group == pgid else []
+        try:
+            counter = sp.DownloadBytes(pgid)
+            self.assertEqual(counter(), 100)
+            archive.write_bytes(b"x" * 350)
+            self.assertEqual(counter(), 350)
+            archive.unlink()  # unpacked and removed: nothing more, nothing less
+            self.assertEqual(counter(), 350)
+        finally:
+            sp.running_group_commands = saved
+        self.assertIn(f"sleep 60", " ".join(sp.running_group_commands(pgid)))
+
+    def test_interface_bytes_reads_only_physical_links(self):
+        out = subprocess.CompletedProcess([], 0, (
+            "Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll\n"
+            "lo0        16384 <Link#1>                      5 0 999999 5 0 999999 0\n"
+            "en0        1500  <Link#7>    d0:11:e5:34:ce:ba 2 0 1000 3 0 50 0\n"
+            "en0        1500  172.20.20/22 172.20.21.194    2 - 1000 3 - 50 -\n"
+            "en5        1500  <Link#8>    ce:0c:b3:4b:f3:b0 0 0 20 0 0 0 0\n"
+            "utun3      1280  <Link#20>                     9 0 777777 9 0 777 0\n"
+            "en9        1500  <Link#21>                     1 0 300 1 0 3 0\n"), "")
+        saved = subprocess.run
+        subprocess.run = lambda *a, **k: out
+        try:
+            self.assertEqual(sp.interface_bytes(), 1320)
+        finally:
+            subprocess.run = saved
+
+
 # Stands in for /usr/bin/ssh to the seeder. Logs its argv, then acts as FAKE_SSH_MODE says: "serve" runs the
 # real glaeda-seed-serve as the forced command would, over FAKE_SEEDER_STATE.
 FAKE_SSH = """import json, os, sys, tarfile, io, time
@@ -292,6 +422,27 @@ def tar_of(entries):
             info = tarfile.TarInfo(name); info.size = len(data); tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 keys = request.split()[2:]
+once = os.environ.get("FAKE_ONCE")
+if mode in ("busy-once", "cut-once"):
+    first = once and not os.path.exists(once)
+    if first:
+        open(once, "w").write("")
+    if first and mode == "busy-once":
+        header("busy"); sys.exit(4)
+    if first and mode == "cut-once":  # the seeder's serve timeout kills the stream part way
+        header(f"hit {keys[0]} tar")
+        os.write(1, tar_of([(keys[0] + "/cmux-seed-input-mtimes.json", b"{}"), (keys[0] + "/big", b"x" * 200000)])[:70000])
+        sys.exit(255)
+    mode = "serve"
+if mode == "busy":
+    header("busy"); sys.exit(4)
+if mode == "zstd-corrupt":  # a whole zstd stream with one byte flipped in its content
+    import subprocess
+    body = subprocess.run([os.environ["FAKE_ZSTD"], "-q", "-c"], input=tar_of([
+        (keys[0] + "/cmux-seed-input-mtimes.json", b"{}"), (keys[0] + "/big", os.urandom(200000))]),
+        capture_output=True, check=True).stdout
+    body = body[:len(body) // 2] + bytes([body[len(body) // 2] ^ 0xFF]) + body[len(body) // 2 + 1:]
+    header(f"hit {keys[0]} zstd"); os.write(1, body); sys.exit(0)
 if mode == "serve":
     race = os.environ.get("FAKE_RACE_TARGET")
     if race:  # a job stashes the same seed while the stream runs
@@ -377,16 +528,20 @@ class LanSeedTest(PrefetchBase):
         fake.write_text(f"#!{sys.executable}\n" + FAKE_SSH)
         fake.chmod(0o755)
         self.ssh_log = base / "ssh-log"
-        self.saved_lan = (sp.LAN_CONFIG, sp.SSH, sp.zstd_tool, sp.LAN_MIN_FREE_BYTES, sp.LAN_MAX_BYTES)
+        self.saved_lan = (sp.LAN_CONFIG, sp.SSH, sp.zstd_tool, sp.LAN_MIN_FREE_BYTES, sp.LAN_MAX_BYTES,
+                          sp.LAN_BUSY_BACKOFF, sp.LAN_RETRY_BACKOFF)
         sp.LAN_CONFIG, sp.SSH = conf / "config.json", os.fspath(fake)
         sp.zstd_tool = lambda: None
         sp.LAN_MIN_FREE_BYTES = 0
+        sp.LAN_BUSY_BACKOFF = sp.LAN_RETRY_BACKOFF = (0.0, 0.0)
+        os.environ["FAKE_ONCE"] = os.fspath(base / "once")
         os.environ.update({"FAKE_SSH_LOG": os.fspath(self.ssh_log), "FAKE_SERVE": os.fspath(ROOT / "scripts/glaeda-seed-serve"),
                            "FAKE_SEEDER_STATE": os.fspath(self.seeder), "FAKE_SERVE_RUN": os.fspath(base / "serve-run"),
                            "FAKE_RECEIPT": os.fspath(receipt)})
 
     def tearDown(self) -> None:
-        sp.LAN_CONFIG, sp.SSH, sp.zstd_tool, sp.LAN_MIN_FREE_BYTES, sp.LAN_MAX_BYTES = self.saved_lan
+        (sp.LAN_CONFIG, sp.SSH, sp.zstd_tool, sp.LAN_MIN_FREE_BYTES, sp.LAN_MAX_BYTES,
+         sp.LAN_BUSY_BACKOFF, sp.LAN_RETRY_BACKOFF) = self.saved_lan
         super().tearDown()
 
     def record(self, store: Path) -> None:
@@ -562,7 +717,96 @@ class LanSeedTest(PrefetchBase):
         finally:
             sp.LAN_BUSY_RATE = saved
         self.assertIn("paced", result["lan"])
-        self.assertIn("throttled", result)
+        self.assertIn("busy", result)
+
+    def test_a_busy_seeder_is_asked_again_and_serves(self):
+        self.record(self.state)
+        head = self.commit()
+        self.seeder_keeps(head)
+        os.environ["FAKE_SSH_MODE"] = "busy-once"
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["key"], lan["attempts"]), ("true", self.key(head), 2), lan)
+        self.assertTrue(sp.seed_complete(self.state / "seeds" / self.key(head)))
+        self.assert_clean()
+
+    def test_a_seeder_busy_every_time_gives_up_after_the_attempts(self):
+        self.record(self.state)
+        self.commit()
+        os.environ["FAKE_SSH_MODE"] = "busy"
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["reason"], lan["attempts"]), ("false", "seeder: busy", sp.LAN_ATTEMPTS))
+        self.assertEqual(len(self.ssh_log.read_text().splitlines()), sp.LAN_ATTEMPTS)
+        self.assert_clean()
+
+    def test_a_busy_seeder_is_waited_for_only_within_the_budget(self):
+        self.record(self.state)
+        self.commit()
+        os.environ["FAKE_SSH_MODE"] = "busy"
+        saved = sp.LAN_BUSY_BUDGET
+        sp.LAN_BUSY_BUDGET = 0.0
+        try:
+            lan = self.lan()
+        finally:
+            sp.LAN_BUSY_BUDGET = saved
+        self.assertEqual((lan["reason"], lan["attempts"]), ("seeder: busy", 1))
+
+    def test_a_reaped_process_is_never_signalled(self):
+        run = sp.Pipeline()
+        done = run.spawn(["true"])
+        run.reap()
+        alive = run.spawn(["sleep", "30"])
+        signalled = []
+        saved = os.killpg
+        os.killpg = lambda pgid, signum: signalled.append(pgid)
+        try:
+            run.stop()
+        finally:
+            os.killpg = saved
+            alive.kill()
+            alive.wait()
+        self.assertEqual(signalled, [alive.pid])
+        self.assertNotIn(done.pid, signalled)
+
+    def test_a_killed_runs_lan_staging_is_swept_for_every_root(self):
+        self.record(self.state)
+        self.record(self.state / "cmux-ci-2")
+        head = self.commit()
+        width = os.sysconf("SC_NPROCESSORS_ONLN")
+        for store in (self.state, self.state / "cmux-ci-2"):  # kept: nothing to ask the seeder for
+            seed = store / "seeds" / f"{PREFIX}j{width}-{head}"
+            seed.mkdir(parents=True)
+            (seed / sp.MANIFEST).write_text("{}")
+            (store / "seeds/.lan-4242/x").mkdir(parents=True)
+            (store / "seeds/.lan-4242/stream").write_bytes(b"z" * 1000)
+        sp.run(True, self.state)
+        self.assertEqual(list(self.state.glob("**/.lan-*")), [])
+
+    def test_a_stream_cut_part_way_is_fetched_again_and_nothing_partial_lands(self):
+        self.record(self.state)
+        head = self.commit()
+        self.seeder_keeps(head)
+        os.environ["FAKE_SSH_MODE"] = "cut-once"
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["attempts"]), ("true", 2), lan)
+        seed = self.state / "seeds" / self.key(head)
+        self.assertTrue((seed / "Build/Products/app").is_file())
+        self.assertFalse((seed / "big").exists())  # nothing from the cut stream
+        self.assert_clean()
+
+    def test_a_zstd_stream_that_fails_its_checksum_is_never_extracted(self):
+        zstd = shutil.which("zstd") or next((c for c in sp.ZSTD_CANDIDATES if os.access(c, os.X_OK)), None)
+        if not zstd:
+            self.skipTest("no zstd")
+        sp.zstd_tool = lambda: zstd
+        os.environ["FAKE_ZSTD"] = zstd
+        self.record(self.state)
+        self.commit()
+        os.environ["FAKE_SSH_MODE"] = "zstd-corrupt"
+        lan = self.lan()
+        self.assertEqual(lan["fetched"], "false")
+        self.assertIn("checksum", lan["reason"])
+        self.assertEqual(lan["attempts"], sp.LAN_ATTEMPTS)
+        self.assertEqual(sorted(p.name for p in (self.state / "seeds").iterdir()), [])
 
     def test_padding_tar_leaves_unread_is_drained(self):
         self.record(self.state)
