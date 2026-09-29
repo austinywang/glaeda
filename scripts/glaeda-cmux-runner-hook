@@ -188,10 +188,16 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # revision without the take-gui step would run its tests without the token, so this class ships after that
 # step (cmux#15012). test-e2e's `test` job is gui-step too (cmux#15037): it runs only when the build's take-gui
 # could not get the token, so taking it again at job start would wait for it a second time.
+# Units are cores: a std mini's 5 units share its 14 cores, 2.8 cores a unit. Job telemetry on 14 minis,
+# 2026-09-25 21:43Z to 09-29 10:07Z (glaeda-cmux-jobs.jsonl, cores.job): simulator jobs (ios-simulator,
+# screenshots) use p75 0.15 cores, p99 0.38, so they cost 1 unit; the simulator token, not units, keeps one per
+# mini. isolated stays 2: besides runner jobs it is the class guests default to and the one a co-resident dev
+# build admits under (cmuxterm-hq build-fleet/cmd/worker/coresident.go, about 7 cores and 15 GiB), and cmux-tui
+# `test` runs at p75 5.11 cores. The other costs match that telemetry (compile p75 4.44, light 2.15, gui 0.21).
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
-    "isolated": (2, ()), "simulator": (2, ("simulator",)), "light": (1, ()), "seed": (2, ())}
+    "isolated": (2, ()), "simulator": (1, ("simulator",)), "light": (1, ()), "seed": (2, ())}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
 # never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
 # "-sim" or "simulator" uses the one CoreSimulator service, "-light" is small, anything else is isolated.
@@ -2447,7 +2453,7 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return name in yielding or probe(path)
 
         root = scope is not None and scope.root
-        # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units, glaeda-ios-sim)
+        # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units: glaeda-ios-sim's isolated builds)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
         free = 0
         for slot in range(total):

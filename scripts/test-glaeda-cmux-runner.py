@@ -1333,7 +1333,7 @@ class HookTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"holding 2/12 units for {job} (isolated", result.stdout)
             sim = self.job("ios-simulator", "i3", 12)
-            self.assertIn("2/12 units+simulator for ios-simulator (simulator", sim.stdout)
+            self.assertIn("1/12 units+simulator for ios-simulator (simulator", sim.stdout)
             waited = time.monotonic()
             second = self.job("screenshots", "i4", 12, None, "--gui-wait", "2")
             self.assertEqual(second.returncode, 1, "one simulator job per mini")
@@ -3472,6 +3472,9 @@ class GateTest(unittest.TestCase):
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
         script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
         self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
+        self.assertEqual(max(hook.CLASS_COST[hook.JOB_CLASSES[job]][0] for job in
+                             ("mobile-core-package", "ios-simulator-build", "ios-simulator", "screenshots")), 2,
+                         "--fit-units 2 is the costliest class glaeda-ios-sim brings")
         argv = ["listen", "--runner-dir", os.fspath(self.runner), "--fit-units", "2", "--parse-only"]
         self.assertEqual(subprocess.run([sys.executable, os.fspath(HOOK), *argv], capture_output=True).returncode, 0)
         side = hook.RunnerScope(4, 2, 2, False)

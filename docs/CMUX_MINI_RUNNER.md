@@ -554,7 +554,7 @@ the pools, register them at org scope into a runner group and allow that reposit
 At org scope the hook admits any repository of the org (`--allowed-owner`) under the same event, fork
 and disk rules. Job ids in the hook's table are cmux's (`--home-repo`, default `manaflow-ai/cmux`); a
 guest repository's job never takes a canonical root or the persistent-DerivedData token, whatever its
-id. It costs 2 units (isolated), or 1 unit when its id ends in `-light`, or 2 units plus the one
+id. It costs 2 units (isolated), or 1 unit when its id ends in `-light`, or 1 unit plus the one
 simulator token when its id ends in `-sim` or `simulator`. A repository the hook cannot identify is a
 guest. cmux jobs wait for room with no time limit (its rescue workflow moves one that waits too long); a
 guest has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Guests share
@@ -689,7 +689,8 @@ Hook classes:
 
 - `mobile-core-package` and `ios-simulator-build` are `isolated` (2 units, own DerivedData or SwiftPM
   `.build`, no canonical root).
-- `ios-simulator` and `screenshots` are `simulator` (2 units plus the per-mini `simulator` token: they
+- `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.15 cores per job,
+  plus the per-mini `simulator` token: they
   reuse, erase and boot named devices in the user's one CoreSimulator service). A job refused only for
   that token waits for it at job start, as any capacity wait does.
 - `validate` (ios-streamed-validate) stays on Blacksmith. It binds fixed ports, restarts a local Postgres

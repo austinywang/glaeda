@@ -491,7 +491,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
             + ("" if ctx.capacity_units else " --no-waiters"))
     if ctx.capacity_units and IOS_SIM_JOB_LABEL in ctx.labels:
-        # the iOS picker sends 2-unit jobs (isolated builds, the simulator) to this label: listening with one
+        # the iOS picker sends 2-unit isolated builds (mobile-core-package, ios-simulator-build) to this label: listening with one
         # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7)
         gate += " --fit-units 2"
     listen = (
