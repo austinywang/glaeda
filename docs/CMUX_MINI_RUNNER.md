@@ -259,7 +259,14 @@ What `--apply` does:
      on HOME's volume, starts freeing at floor + 4 GiB, up to floor + 20 GiB (never past half
      the disk), whatever its `--low` and `--target`: otherwise a 460 GiB mini between the default
      low (about 115 GiB) and a 150 GiB floor would stay held with nothing freed. A hold past
-     30 min logs once that space must be freed by hand.
+     30 min logs once that space must be freed by hand. It no longer waits for CI to finish
+     (`defer_during_ci`, default false in `~/.config/glaeda/disk-policy.json`): a busy mini frees
+     space while jobs run, holding only what a job uses. cmux CI's hot tier (parked PR builds,
+     seeds, kept builds) ages in host CI jobs since last use rather than hours: under pressure an
+     item goes after `pressure_jobs` (80) jobs, or past its family window with `min_jobs` (6); the
+     idle sweep after `sweep_jobs` (190), or 24 h idle with 80 jobs since. From 11,393 job starts
+     on 13 minis (2026-09-26..29) a PR's next job on the same host came p50 6, p90 76, p95 189 jobs
+     later (0.4, 5.2, 15.5 h), so an item idle only because the fleet is idle stays.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as

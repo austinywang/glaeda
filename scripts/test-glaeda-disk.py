@@ -1454,11 +1454,13 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
                 mock.patch.object(gd, "simulator_runtimes", return_value=[]):
             with mock.patch.object(gd, "host_busy", return_value="a CI job is running (x)"), \
-                    contextlib.redirect_stdout(io.StringIO()) as out:
+                    mock.patch.dict(gd.POLICY, defer_during_ci=True), contextlib.redirect_stdout(io.StringIO()) as out:
                 gd.main(args)
             self.assertIn("host busy", out.getvalue())
-            self.assertTrue((self.root / "old").exists())
-            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue((self.root / "old").exists(), "defer_during_ci keeps the old hold")
+            # a busy host sweeps too by default: only what a job uses is held
+            with mock.patch.object(gd, "host_busy", return_value="a CI job is running (x)"), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 gd.main(args)
             self.assertFalse((self.root / "old").exists())
             self.assertTrue((self.root / "day").exists())
@@ -1705,6 +1707,74 @@ class DedupeTest(unittest.TestCase):
         r = gd.dedupe([self.root / "a", self.root / "b"], self.state)
         self.assertEqual((r["files"], r["cloned_bytes"]), (0, 0))
 
+
+class ActivityClockTest(unittest.TestCase):
+    """The hot tier ages in host CI jobs since last use, not hours; thresholds come from disk-policy.json."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.fam = gd.Family("cmux-pr-builds", self.dir, True, "x")
+        self.now = time.time()
+
+    def starts(self, *hours_ago: float) -> list[float]:
+        return sorted(self.now - h * 3600 for h in hours_ago)
+
+    def due(self, mode: str, idle: float, starts: list[float] | None, window: float = 1.0) -> bool:
+        with mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "job_starts", return_value=starts), \
+                mock.patch.object(gd, "running_job_hours", return_value=0.0):
+            return gd.item_due(self.fam, idle, window)[0]
+
+    def test_running_job_hours_reads_the_oldest_runner_worker(self) -> None:
+        out = (" 1-02:03:04 /Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+               "   05:06 /Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient\n 99:00:00 /bin/zsh\n")
+        with mock.patch.object(gd, "_RUNNING_JOB_HOURS", None), \
+                mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, out, "")):
+            self.assertAlmostEqual(gd.running_job_hours(), 26 + 3 / 60 + 4 / 3600, places=4)
+        with mock.patch.object(gd, "_RUNNING_JOB_HOURS", None), mock.patch.object(gd.subprocess, "run", side_effect=OSError):
+            self.assertEqual(gd.running_job_hours(), 24.0)
+
+    def test_an_item_a_running_job_may_hold_is_never_due(self) -> None:
+        busy = self.starts(*[i / 100 for i in range(100)])
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=busy), \
+                mock.patch.object(gd, "running_job_hours", return_value=2.0):
+            self.assertFalse(gd.item_due(self.fam, 1.5, 1.0)[0])  # used after the oldest running job began
+            self.assertTrue(gd.item_due(self.fam, 2.5, 1.0)[0])  # older than every running job
+
+    def test_a_quiet_fleet_keeps_its_cache(self) -> None:
+        # idle 30 h, but only 2 jobs ran since: not stale, nothing had a chance to use it
+        self.assertFalse(self.due("pressure", 30, self.starts(1, 2)))
+        self.assertFalse(self.due("sweep", 30, self.starts(1, 2)))
+
+    def test_many_jobs_past_it_make_it_a_candidate(self) -> None:
+        busy = self.starts(*[i / 100 for i in range(100)])  # 100 jobs in the last hour
+        self.assertTrue(self.due("pressure", 1.5, busy))    # past pressure_jobs (80)
+        self.assertFalse(self.due("sweep", 1.5, busy))      # the sweep waits for sweep_jobs (190)
+        self.assertTrue(self.due("sweep", 30, busy[:90] + self.starts(29)))  # soft 24 h: idle a day, 80+ jobs
+
+    def test_window_needs_some_activity(self) -> None:
+        self.assertTrue(self.due("pressure", 2, self.starts(*[0.1] * 6)))  # past its window, min_jobs since
+        self.assertFalse(self.due("pressure", 2, self.starts(0.1, 0.2)))
+
+    def test_no_job_log_or_no_mode_keeps_wall_clock(self) -> None:
+        self.assertTrue(self.due("pressure", 2, None))
+        self.assertTrue(self.due(None, 2, self.starts(0.1)))
+        other = gd.Family("tmp", self.dir, True, "x")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):
+            self.assertEqual(gd.item_due(other, 2, 1.0), (True, None))
+
+    def test_job_log_and_policy_file(self) -> None:
+        log = self.dir / "jobs.jsonl"
+        log.write_text('{"event":"started","at":5}\n{"event":"completed","at":6}\nnot json\n{"event":"started","at":3}\n')
+        self.assertEqual(gd.job_starts(log), [3.0, 5.0])
+        self.assertIsNone(gd.job_starts(self.dir / "missing"))
+        policy = self.dir / "disk-policy.json"
+        policy.write_text('{"pressure_jobs": 40, "defer_during_ci": true, "min_jobs": "x", "sweep_jobs": -1}')
+        got = gd.disk_policy(policy)
+        self.assertEqual((got["pressure_jobs"], got["defer_during_ci"], got["min_jobs"], got["sweep_jobs"]),
+                         (40, True, gd.POLICY_DEFAULTS["min_jobs"], gd.POLICY_DEFAULTS["sweep_jobs"]))
+        policy.write_text("[")
+        self.assertEqual(gd.disk_policy(policy), gd.POLICY_DEFAULTS)
 
 if __name__ == "__main__":
     unittest.main()

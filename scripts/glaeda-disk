@@ -43,9 +43,12 @@ never searched (HOME_NEVER).
 Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
 Every deletion is appended to a JSONL receipt.
 
-The idle sweep (--idle) reclaims whatever the free space, but only on an idle host: no GitHub Actions
-job, no build process, no dev-build worker job, no active reservation and the fleet host lock free,
-re-checked before every deletion. Its windows follow reuse (IDLE_SWEEP_HOURS and friends). It also
+The idle sweep (--idle) reclaims whatever the free space. A busy host sweeps too: deletes skip only what a
+job uses (open, named by a command, a root's current seed or checkout), not the whole pass. The old hold
+(no sweep while a GitHub Actions job, build, dev-build worker job, reservation or held host lock) and the
+pressure pass's defer-while-CI-runs come back with "defer_during_ci": true in ~/.config/glaeda/disk-policy.json.
+Its windows follow reuse (IDLE_SWEEP_HOURS and friends). cmux CI's hot tier ages in host CI jobs since its
+last use, not hours (item_due: pressure_jobs, min_jobs, sweep_jobs, soft_idle_hours in disk-policy.json). It also
 reports Xcode copies no pin names and simulator runtimes, and deletes a runtime only when no device
 uses it, it is not its platform's newest, it went unused for RUNTIME_IDLE_DAYS and no simulator is
 booted (simctl runtime delete restarts CoreSimulatorService). Xcode copies are never deleted.
@@ -82,6 +85,7 @@ build output or copies. Nested or unverifiable checkouts stay protected.
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
 import fcntl
 import json
@@ -290,6 +294,133 @@ def idle_families(fams: list[Family]) -> list[Family]:
     """The families as the idle sweep judges them: the hot tier gets its reuse windows."""
     windows = {"cmux-pr-builds": IDLE_PR_BUILD_HOURS, "cmux-seeds": IDLE_SEED_HOURS}
     return [replace(f, max_idle_hours=windows[f.id]) if f.id in windows else f for f in fams]
+
+
+# Activity, not wall clock (Leo, 2026-09-29): a cache idle for 5 h because the whole fleet was idle is not
+# stale, nothing had a chance to use it. So the hot tier (FLEET_FAMILY_IDS) ages in host CI jobs: how many
+# jobs started on this host (the runner hook's job log) since the item was last used. Measured on 13 minis,
+# 2026-09-26..29, 11,393 job starts: a job of the same PR (or push ref) came back to the same host after
+# p50 6, p75 23, p90 76, p95 189, p99 431 other jobs (0.4 / 1.4 / 5.2 / 15.5 / 46 h), so wall clock says
+# little (p90 5 h, p99 46 h) while the job count separates reuse from cruft. Under pressure an item goes
+# once pressure_jobs (~p90) jobs passed it, or once it is past its family's window with at least min_jobs
+# (~p50) jobs since. The idle sweep (no pressure) takes one past sweep_jobs (~p95), or one idle
+# soft_idle_hours with pressure_jobs since: the soft 24 h rule, never an age cap on a quiet fleet. A host
+# without a job log keeps the wall-clock windows. Every threshold is a key of DISK_POLICY.
+DISK_POLICY = HOME / ".config/glaeda/disk-policy.json"
+POLICY_DEFAULTS: dict[str, Any] = {
+    "pressure_jobs": 80,
+    "min_jobs": 6,
+    "sweep_jobs": 190,
+    "soft_idle_hours": 24.0,
+    # A busy host cleans too: deletes skip only what a job uses (open, named by a command, its root's
+    # current seed or checkout), never the whole pass. true restores the old defer-while-CI-runs rule.
+    "defer_during_ci": False,
+}
+ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
+
+
+def disk_policy(path: Path | None = None) -> dict[str, Any]:
+    """POLICY_DEFAULTS overlaid with DISK_POLICY; an unreadable file or a wrongly typed key keeps the default."""
+    policy = dict(POLICY_DEFAULTS)
+    try:
+        doc = json.loads((DISK_POLICY if path is None else path).read_text())
+    except (OSError, ValueError):
+        return policy
+    if isinstance(doc, dict):
+        for key, default in POLICY_DEFAULTS.items():
+            value = doc.get(key)
+            if isinstance(default, bool):
+                if isinstance(value, bool):
+                    policy[key] = value
+            elif isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                policy[key] = type(default)(value)
+    return policy
+
+
+POLICY = disk_policy()
+_JOB_STARTS: list[float] | None = None
+_JOB_STARTS_READ = False
+
+
+def job_starts(log: Path | None = None) -> list[float] | None:
+    """Sorted start times of this host's CI jobs (glaeda-cmux-jobs.jsonl "started" lines), or None without a log."""
+    global _JOB_STARTS, _JOB_STARTS_READ
+    if log is None and _JOB_STARTS_READ:
+        return _JOB_STARTS
+    path = log or HOME / "Library/Logs/glaeda-cmux-jobs.jsonl"
+    starts: list[float] | None
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            starts = []
+            for line in f:
+                if '"started"' not in line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                except ValueError:
+                    continue
+                at = doc.get("at") if isinstance(doc, dict) else None
+                if doc.get("event") == "started" and isinstance(at, (int, float)) and not isinstance(at, bool):
+                    starts.append(float(at))
+            starts.sort()
+    except OSError:
+        starts = None
+    if log is None:
+        _JOB_STARTS, _JOB_STARTS_READ = starts, True
+    return starts
+
+
+def jobs_since_use(fam: "Family", idle_hours: float, now: float | None = None) -> int | None:
+    """Host CI jobs started since a hot-tier item's last use, or None (not hot tier, or no job log)."""
+    if fam.id not in FLEET_FAMILY_IDS:
+        return None
+    starts = job_starts()
+    if starts is None:
+        return None
+    last_use = (time.time() if now is None else now) - idle_hours * 3600
+    return len(starts) - bisect.bisect_right(starts, last_use)
+
+
+_RUNNING_JOB_HOURS: float | None = None
+
+
+def running_job_hours() -> float:
+    """Age in hours of the oldest running CI job (Runner.Worker), 0 when none; ps failing counts as a day."""
+    global _RUNNING_JOB_HOURS
+    if _RUNNING_JOB_HOURS is None:
+        try:
+            out = subprocess.run(["ps", "-axww", "-o", "etime=,command="], capture_output=True, text=True,
+                                 timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = None
+        oldest = 0.0 if out is not None else 24.0
+        for line in (out or "").splitlines():
+            etime, _, cmd = line.strip().partition(" ")
+            if CI_WORKER.search(cmd):
+                days, _, clock = etime.rpartition("-")
+                parts = [int(x) for x in clock.split(":") if x.isdigit()]
+                secs = sum(v * 60 ** i for i, v in enumerate(reversed(parts))) + int(days or 0) * 86400
+                oldest = max(oldest, secs / 3600)
+        _RUNNING_JOB_HOURS = oldest
+    return _RUNNING_JOB_HOURS
+
+
+def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int | None]:
+    """Whether an item is old enough to delete, and the job count that decided it (None: wall clock).
+
+    A hot-tier item used since the oldest running CI job started is never due: that job may hold it
+    (a `cp -cR` clone leaves the source's times alone, and a step between commands names no path),
+    which the old defer-while-CI-runs rule covered. Its own run counts toward jobs_since, so without
+    this a job could age the seed it started from past pressure_jobs."""
+    jobs = jobs_since_use(fam, idle_hours)
+    if jobs is None or ACTIVITY_MODE is None:
+        return idle_hours >= window, jobs
+    if idle_hours <= running_job_hours():
+        return False, jobs
+    if ACTIVITY_MODE == "sweep":
+        return (jobs >= POLICY["sweep_jobs"]
+                or (idle_hours >= POLICY["soft_idle_hours"] and jobs >= POLICY["pressure_jobs"])), jobs
+    return jobs >= POLICY["pressure_jobs"] or (idle_hours >= window and jobs >= POLICY["min_jobs"]), jobs
 
 
 def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
@@ -752,6 +883,7 @@ class Item:
     idle_hours: float
     verdict: str  # reclaimable | recent | in-use | git-checkout | unchecked | report-only | kept
     reasons: list[str] = field(default_factory=list)
+    jobs_since: int | None = None  # host CI jobs started since its last use (activity_due), when counted
 
 
 def du_bytes(path: Path) -> int:
@@ -1898,7 +2030,8 @@ def job_busy(fam: Family, path: Path) -> bool:
 def value(item: "Item", fam: Family) -> float:
     """Deletion order under pressure: space freed per minute of rebuild, favouring what has sat idle
     longest (a tree untouched for days is less likely to be read again)."""
-    return item.bytes * (1 + item.idle_hours / 24) / max(fam.rebuild_minutes, 0.1)
+    jobs = 0 if item.jobs_since is None else item.jobs_since / max(POLICY["pressure_jobs"], 1)
+    return item.bytes * (1 + item.idle_hours / 24 + jobs) / max(fam.rebuild_minutes, 0.1)
 
 
 def holds_socket(path: Path, levels: int = 2, budget: int = 3000) -> bool:
@@ -2094,7 +2227,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
         window = item_window(fam, path, idle_hours, archived)
         keep = keep_verdict(fam, path)
-        deletable_age = fam.reclaimable and idle >= window
+        due, jobs = item_due(fam, idle, window)
+        if jobs is not None:
+            reasons_jobs = f"{jobs} host jobs since its last use"
+        deletable_age = fam.reclaimable and due
         if deletable_age and holds_socket(path):
             reasons.append("holds a socket")
         if deletable_age and job_busy(fam, path):
@@ -2107,20 +2243,22 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         elif reasons:
             verdict = "in-use"
         elif (not derived_data(fam, path) and (g := family_git_state(fam, path)) != "none"
-              and not (g == "git" and fam.git_disposable and idle >= window
+              and not (g == "git" and fam.git_disposable and due
                        and not (loss := family_git_loss(fam, path)))):
             verdict = "git-checkout" if g == "git" else "unchecked"
             if g == "unchecked":
                 reasons.append("too deep or large to rule out a git checkout")
-            elif fam.git_disposable and idle >= window:
+            elif fam.git_disposable and due:
                 reasons.append(loss)
-        elif idle < window:
+        elif not due:
             verdict = "recent"
         else:
             verdict = "reclaimable"
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
-        items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons))
+        if jobs is not None and verdict in ("recent", "reclaimable"):
+            reasons.append(reasons_jobs)
+        items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs))
     items.sort(key=lambda i: i.bytes, reverse=True)
     return items
 
@@ -2384,8 +2522,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
-        elif (time.time() - newest_mtime(p, access=families[i.family].discover)) / 3600 \
-                < item_window(families[i.family], p, idle_hours, archived):
+        elif not item_due(families[i.family],
+                          (time.time() - newest_mtime(p, access=families[i.family].discover)) / 3600,
+                          item_window(families[i.family], p, idle_hours, archived))[0]:
             outcome = "changed:modified"
         elif keep_verdict(families[i.family], p):
             outcome = "changed:kept"
@@ -2640,17 +2779,20 @@ def main(argv: list[str] | None = None) -> int:
         if not idle_due():
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             return 0
+    global ACTIVITY_MODE
+    ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     busy = host_busy() if sweep else ""
     if sweep:
         print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")
-        if busy and a.apply:
+        # a busy host sweeps too (POLICY defer_during_ci false): only items a job uses are held
+        if busy and a.apply and POLICY["defer_during_ci"]:
             return 0
         a.pressure = False  # the sweep reports and acts on every filesystem, without targets
         fams = idle_families(fams)
     if a.pressure:
         # only families on a filesystem under pressure are surveyed or touched
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
-        if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
+        if a.apply and POLICY["defer_during_ci"] and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
             return 0
     if a.apply:
@@ -2710,11 +2852,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
-        halt = host_busy if sweep else None
+        halt = host_busy if sweep and POLICY["defer_during_ci"] else None
         apply(items, {f.id: f for f in fams}, a.receipt,
               {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
         if sweep:
-            apply_runtimes(tooling, a.receipt, halt)
+            # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
+            apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
     return 0
