@@ -185,7 +185,7 @@ FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
 SEED_SOURCE = "seed-source.json"
 SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
 KEPT_BUILD_IDLE_HOURS = 48.0
-PARKED_IDLE_HOURS = 1.0  # glaeda-idle-warm keeps a live root's build within minutes of main
+PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance, not wall clock
 
 
 def fleet_stores(ci: Path | None = None) -> list[Path]:
@@ -202,9 +202,9 @@ FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build")
 def fleet_families(ci: Path | None = None) -> list[Family]:
     fams = []
     for store in fleet_stores(ci):
-        # A parked pull request build (owned_build_state.py, usable for PR_SLOT_HOURS) has no disk floor of
+        # A parked pull request build (owned_build_state.py, usable by reuse distance) has no disk floor of
         # its own: two per root grew a mini's use by ~38 GiB within hours of landing (cmux14, 2026-09-27).
-        # One parked over PARKED_IDLE_HOURS ago goes first: a re-push soon after its park is the one it helps.
+        # Job activity, not wall-clock age, decides when a parked build is stale.
         fams.append(Family("cmux-pr-builds", store / "pr-builds", True,
                            "the pull request's next push compiles from main's kept build",
                            include=("pr-",), build_output=True, max_idle_hours=PARKED_IDLE_HOURS,
@@ -275,14 +275,14 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
 
 
 # The idle sweep (--idle): windows from how often each family is read again, not from free space.
-# cmux restores a parked PR build only within PR_SLOT_HOURS (owned_build_state.py, 6 h) of its park, so an
-# older one is never read again. A job touches the seed it starts from, so a seed's mtime is its last use.
+# cmux restores parked PR builds by host-job reuse distance, so a quiet fleet does not age them out. A job
+# touches the seed it starts from, so a seed's mtime is its last use.
 # A busy root lands about four new ~9 GiB seeds an hour; one no job picked for a day (beyond the root's
 # newest SEED_KEEP, which stay) sits far behind every new base, and a fetch brings it back in 25 to 280 s.
 # A day, not less: cmux keeps up to 48 per root on a roomy disk so a PR on an older base starts close. DerivedData, caches and scratch get KEPT_BUILD_IDLE_HOURS, the
 # window a root's own kept build already has: two days covers a quiet day or a weekend's first job.
 IDLE_SWEEP_HOURS = KEPT_BUILD_IDLE_HOURS
-IDLE_PR_BUILD_HOURS = 6.0
+IDLE_PR_BUILD_HOURS = float("inf")
 IDLE_SEED_HOURS = 24.0
 IDLE_SWEEP_EVERY_S = 3600  # the 15-minute agent sweeps at most hourly: an apply re-measures every candidate
 IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.last"
@@ -413,6 +413,8 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
     which the old defer-while-CI-runs rule covered. Its own run counts toward jobs_since, so without
     this a job could age the seed it started from past pressure_jobs."""
     jobs = jobs_since_use(fam, idle_hours)
+    if jobs is None and fam.id == "cmux-pr-builds":
+        return False, None
     if jobs is None or ACTIVITY_MODE is None:
         return idle_hours >= window, jobs
     if idle_hours <= running_job_hours():
@@ -2714,6 +2716,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--floor-gib", type=float, default=0.0,
                     help="a runner disk floor to honour besides the ones read from runner hooks (runner_floor_gib): "
                          "the runner hook passes its own --min-free-gib when it evicts before refusing a job")
+    ap.add_argument("--need", type=float, default=None,
+                    help="make room for this many GiB before a job; derives floor+4 and floor+20 thresholds")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -2733,6 +2737,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root-override", action="append", default=[], metavar="ID=PATH",
                     help=argparse.SUPPRESS)  # tests
     a = ap.parse_args(argv)
+
+    if a.need is not None:
+        if not math.isfinite(a.need) or a.need <= 0:
+            ap.error("--need must be a positive GiB value")
+        a.floor_gib = max(a.floor_gib, a.need)
+        a.low = f"{a.need + RUNNER_FLOOR_LOW_GIB:g}"
+        a.target = f"{a.need + RUNNER_FLOOR_TARGET_GIB:g}"
 
     fams = default_families()
     for ov in a.root_override:

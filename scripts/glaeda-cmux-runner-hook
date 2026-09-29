@@ -365,7 +365,7 @@ def warm_root_order(order: list[int], keys: tuple[str, ...], state_dir: str = ""
 # untrusted and bounded, like the stamps above.
 WARM_MODEL = "warm-distance-model.json"
 WARM_PR_BUILDS = "pr-builds"
-WARM_PR_BUILD_HOURS = 6  # cmux owned_build_state.py PR_SLOT_HOURS: an older slot is never unparked
+WARM_PR_BUILD_MAX_JOBS = int(os.environ.get("CMUX_PR_SLOT_MAX_JOBS") or 80)
 WARM_MIRROR = os.path.join(".prefetch", "cmux.git")
 WARM_ROUTE_ENV = "GLAEDA_WARM_ROUTE"
 WARM_GIT_TIMEOUT_S = 2.0
@@ -446,14 +446,36 @@ def root_stamp(k: int, state_dir: str = "", number: int | None = None) -> dict[s
         # admission's `check` swaps a parked build in over another pull request's build, and adopts from it
         # where the root keeps main (cmux owned_build_state.py holds_last_main): either way the job starts there.
         slot = store / WARM_PR_BUILDS / f"pr-{number}"
-        try:
-            fresh = time.time() - slot.stat().st_mtime <= WARM_PR_BUILD_HOURS * 3600
-        except OSError:
-            fresh = False
+        fresh = parked_slot_within_reuse_distance(slot)
         parked = root_stamp_at(slot) if fresh else None
         if parked is not None and parked.get("pr") == number:
             return parked
     return kept
+
+
+def parked_slot_within_reuse_distance(slot: Path) -> bool:
+    """Use host job reuse distance for parked builds; without telemetry, the slot count is the bound."""
+    try:
+        parked_at = slot.stat().st_mtime
+    except OSError:
+        return False
+    log = JOB_LOG
+    try:
+        jobs = 0
+        with log.open(encoding="utf-8", errors="replace") as file:
+            for line in file:
+                if '"started"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("event") == "started" and isinstance(event.get("at"), (int, float)) \
+                        and event["at"] >= parked_at:
+                    jobs += 1
+        return jobs < WARM_PR_BUILD_MAX_JOBS
+    except OSError:
+        return True
 
 
 def root_stamp_at(store: Path) -> dict[str, Any] | None:
@@ -631,10 +653,10 @@ GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary h
 GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
 GATE_LOAD_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_RESUME") or 1.5)
 SATURATED = "the mini is saturated"
-# A load hold longer than this is not a compile (their p99 is about 33 min): something outside CI (a leaked process,
+# A load hold longer than this is not a compile (measured compile p99 is about 18 min): something outside CI (a leaked process,
 # Spotlight, a software update) is loading the mini. The gate then listens anyway, logs it, and only pauses for
 # load again once the load has fallen below the resume mark, so one stuck process cannot keep a mini dark.
-GATE_LOAD_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_MAX_HOLD_S") or 45 * 60)
+GATE_LOAD_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_MAX_HOLD_S") or 30 * 60)
 GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
 GATE_WAITER_EVERY_S = 30.0
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back

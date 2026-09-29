@@ -718,7 +718,7 @@ class GlaedaDiskTest(unittest.TestCase):
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in items}
         self.assertEqual(got, {
             "seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
-            "pr-builds/pr-1": "recent", "pr-builds/pr-2": "reclaimable",
+            "pr-builds/pr-1": "recent", "pr-builds/pr-2": "recent",
             "derived-data": "recent", ".derived-data.discard-7": "reclaimable",
             "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "kept",
             "cmux-ci-2/seeds/q-z": "reclaimable", "cmux-ci-2/seeds/.q-w.incoming-3": "reclaimable"})
@@ -1386,7 +1386,7 @@ class GlaedaDiskTest(unittest.TestCase):
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in gd.survey(fams, gd.IDLE_SWEEP_HOURS, 0)}
         self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "recent",
                                "seeds/p-d": "reclaimable", "pr-builds/pr-1": "recent",
-                               "pr-builds/pr-2": "reclaimable", "derived-data": "recent"})
+                               "pr-builds/pr-2": "recent", "derived-data": "recent"})
         # DerivedData and caches wait the full window
         make(self.root / "dd/old", age_hours=50)
         make(self.root / "dd/day", age_hours=30)
@@ -1756,8 +1756,8 @@ class ActivityClockTest(unittest.TestCase):
         self.assertTrue(self.due("pressure", 2, self.starts(*[0.1] * 6)))  # past its window, min_jobs since
         self.assertFalse(self.due("pressure", 2, self.starts(0.1, 0.2)))
 
-    def test_no_job_log_or_no_mode_keeps_wall_clock(self) -> None:
-        self.assertTrue(self.due("pressure", 2, None))
+    def test_no_job_log_keeps_parked_builds_until_a_reuse_observation(self) -> None:
+        self.assertFalse(self.due("pressure", 2, None))
         self.assertTrue(self.due(None, 2, self.starts(0.1)))
         other = gd.Family("tmp", self.dir, True, "x")
         with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):

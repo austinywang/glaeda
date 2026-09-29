@@ -1310,9 +1310,16 @@ class HookTest(unittest.TestCase):
         (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base}))
         self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 7)
         # An expired slot is never unparked either.
+        activity = self.dir / "Library/Logs/glaeda-cmux-jobs.jsonl"
+        activity.parent.mkdir(parents=True, exist_ok=True)
+        activity.write_text("".join(json.dumps({"event": "started", "at": time.time()}) + "\n" for _ in range(
+            hook.WARM_PR_BUILD_MAX_JOBS)))
+        old_job_log = hook.JOB_LOG
+        hook.JOB_LOG = activity
+        self.addCleanup(setattr, hook, "JOB_LOG", old_job_log)
         (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base,
                                                                 "pr": 6}))
-        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 7)
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 6)
         os.utime(ci / "cmux-ci-2" / "pr-builds" / "pr-7", (1, 1))
         self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 6)
 
