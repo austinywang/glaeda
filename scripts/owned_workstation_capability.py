@@ -7,19 +7,27 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import subprocess
 import sys
+import time
 from typing import Any
 
 
 SCHEMA = "glaeda-owned-workstation-capability/v1"
 MAX_SNAPSHOT_BYTES = 4096
 MAX_TTL_SECONDS = 1800
+MAX_PROJECTS = 8
+MAX_OBSERVATION_BYTES = 32 * 1024
 SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 OID_RE = re.compile(r"[0-9a-f]{40}\Z")
 NODE_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,63}\Z")
+PROJECT_RE = re.compile(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
 class SnapshotError(RuntimeError):
@@ -79,6 +87,183 @@ def workspace_receipt(repository_root: Path) -> dict[str, Any]:
     return value
 
 
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if process.poll() is None:
+            process.kill()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def bounded_process_stdout(
+    argv: list[str],
+    *,
+    timeout: float,
+    max_stdout_bytes: int,
+    env: dict[str, str],
+) -> tuple[int, bytes]:
+    # Every failure below raises SnapshotError with a constant message. argv
+    # carries the checkout path, and OSError and TimeoutExpired both render it
+    # into str(error), which main() prints to stderr as JSON.
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise SnapshotError("Bounded observation could not be started") from error
+    if process.stdout is None:
+        terminate_process_group(process)
+        raise SnapshotError("Bounded observer stdout is unavailable")
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if not selector.select(remaining):
+                raise subprocess.TimeoutExpired(argv, timeout)
+            chunk = process.stdout.read1(
+                min(8192, max_stdout_bytes + 1 - len(output))
+            )
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > max_stdout_bytes:
+                raise SnapshotError("Repo-query project observation exceeded output limit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return process.wait(timeout=remaining), bytes(output)
+    except subprocess.TimeoutExpired:
+        # Not re-raised: TimeoutExpired stringifies its argv, which holds the
+        # checkout path. Keep the message constant.
+        terminate_process_group(process)
+        raise SnapshotError("Bounded observation timed out") from None
+    except BaseException:
+        # Anything else, including a selector OSError or KeyboardInterrupt,
+        # must still kill and reap the child rather than orphan it on the
+        # checkout.
+        terminate_process_group(process)
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+
+
+def canonical_repository(repository: str) -> str:
+    if not REPOSITORY_RE.fullmatch(repository):
+        raise SnapshotError("Repo-query capability repository is invalid")
+    return repository.casefold()
+
+
+def repo_query_project_observation(observer: Path, checkout: Path) -> dict[str, Any]:
+    try:
+        resolved_observer = observer.resolve(strict=True)
+        resolved_checkout = checkout.resolve(strict=True)
+    except OSError as error:
+        raise SnapshotError("Repo-query project observation input is unavailable") from error
+    if not resolved_observer.is_file() or not resolved_checkout.is_dir():
+        raise SnapshotError("Repo-query project observation input is invalid")
+    returncode, stdout = bounded_process_stdout(
+        [
+            str(resolved_observer),
+            "--checkout",
+            str(resolved_checkout),
+            "--output",
+            "json",
+        ],
+        timeout=15,
+        max_stdout_bytes=MAX_OBSERVATION_BYTES,
+        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+    )
+    if returncode != 0:
+        raise SnapshotError("Repo-query project observation failed")
+    try:
+        report = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SnapshotError("Repo-query project observation was not bounded JSON") from error
+    return repo_query_project_from_report(report)
+
+
+def repo_query_project_from_report(report: object) -> dict[str, Any]:
+    document = exact_object(report, "project observation")
+    if (
+        document.get("document_type") != "glaeda-project-observation"
+        or document.get("schema_version") != 1
+        or document.get("authority") != "observation_only"
+    ):
+        raise SnapshotError("Repo-query project observation contract changed")
+    observation = exact_object(document.get("observation"), "project observation payload")
+    repository = observation.get("primary_project")
+    if (
+        observation.get("schema_version") != 2
+        or observation.get("identity_generation") != "glaeda_v2"
+        or observation.get("source_ambiguous") is not False
+        or observation.get("owner_matches_parent") is not True
+        or not isinstance(repository, str)
+        or not PROJECT_RE.fullmatch(repository)
+    ):
+        raise SnapshotError("Repo-query project identity is not canonical")
+    return {
+        "heatClass": "resident_cold",
+        "repository": canonical_repository(repository.removeprefix("github.com/")),
+        "source": {
+            "commitOid": oid(observation.get("commit"), "project source commit"),
+            "treeOid": oid(observation.get("tree"), "project source tree"),
+        },
+        "sourceObjectClass": "exact_commit_and_tree_present",
+        "verificationProfiles": ["repo-query/v1"],
+    }
+
+
+def normalize_repo_query_project(value: object) -> dict[str, Any]:
+    project = exact_object(value, "repo-query capability project")
+    if set(project) != {
+        "heatClass",
+        "repository",
+        "source",
+        "sourceObjectClass",
+        "verificationProfiles",
+    }:
+        raise SnapshotError("Repo-query capability project fields changed")
+    repository = project.get("repository")
+    source = exact_object(project.get("source"), "repo-query capability source")
+    if (
+        project.get("heatClass") != "resident_cold"
+        or not isinstance(repository, str)
+        or not REPOSITORY_RE.fullmatch(repository)
+        or set(source) != {"commitOid", "treeOid"}
+        or project.get("sourceObjectClass") != "exact_commit_and_tree_present"
+        or project.get("verificationProfiles") != ["repo-query/v1"]
+    ):
+        raise SnapshotError("Repo-query capability project is invalid")
+    return {
+        "heatClass": "resident_cold",
+        "repository": canonical_repository(repository),
+        "source": {
+            "commitOid": oid(source.get("commitOid"), "project source commit"),
+            "treeOid": oid(source.get("treeOid"), "project source tree"),
+        },
+        "sourceObjectClass": "exact_commit_and_tree_present",
+        "verificationProfiles": ["repo-query/v1"],
+    }
+
+
 def build_snapshot(
     receipt: dict[str, Any],
     *,
@@ -89,6 +274,7 @@ def build_snapshot(
     glaeda_runtime_sha256: str,
     python: dict[str, str],
     profile_generation: str,
+    repo_query_projects: list[dict[str, Any]] | None = None,
     verification_profile_generations: dict[str, str] | None = None,
     observed_at: dt.datetime,
     ttl_seconds: int,
@@ -106,6 +292,9 @@ def build_snapshot(
     if not SHA256_RE.fullmatch(profile_generation):
         raise SnapshotError("Profile generation is invalid")
     verification_profile_generations = verification_profile_generations or {}
+    repo_query_projects = [
+        normalize_repo_query_project(project) for project in (repo_query_projects or [])
+    ]
     profile_classes = {
         "verify-focused/v1": "verify_focused",
         "verify-required/v1": "verify_required",
@@ -158,6 +347,22 @@ def build_snapshot(
     expires = (observed_at + dt.timedelta(seconds=ttl_seconds)).isoformat(
         timespec="milliseconds"
     ).replace("+00:00", "Z")
+    projects = [{
+        "heatClass": "resident_hot" if hot else "resident_cold",
+        "repository": "teamleaderleo/glaeda",
+        "source": {"commitOid": commit_oid, "treeOid": tree_oid},
+        "sourceObjectClass": "exact_commit_and_tree_present",
+        "verificationProfiles": sorted(
+            set(verification_profiles) | set(verification_profile_generations)
+        ),
+    }, *repo_query_projects]
+    if len(projects) > MAX_PROJECTS:
+        raise SnapshotError("Owned-workstation capability has too many projects")
+    repository_keys = [str(project.get("repository")).casefold() for project in projects]
+    if len(repository_keys) != len(set(repository_keys)):
+        raise SnapshotError("Owned-workstation capability has duplicate projects")
+    projects.sort(key=lambda project: str(project.get("repository")).casefold())
+
     snapshot = {
         "admission": {
             "activeWorkloadsClass": "unobserved",
@@ -192,15 +397,7 @@ def build_snapshot(
             }
             for profile_id, generation in sorted(verification_profile_generations.items())
         ]],
-        "projects": [{
-            "heatClass": "resident_hot" if hot else "resident_cold",
-            "repository": "teamleaderleo/glaeda",
-            "source": {"commitOid": commit_oid, "treeOid": tree_oid},
-            "sourceObjectClass": "exact_commit_and_tree_present",
-            "verificationProfiles": sorted(
-                set(verification_profiles) | set(verification_profile_generations)
-            ),
-        }],
+        "projects": projects,
         "schema": SCHEMA,
     }
     if len(canonical_json(snapshot)) > MAX_SNAPSHOT_BYTES:
@@ -237,6 +434,8 @@ def parser() -> argparse.ArgumentParser:
     runtime.add_argument("--glaeda-runtime-sha256")
     value.add_argument("--python-interpreter", required=True)
     value.add_argument("--profile-generation", required=True)
+    value.add_argument("--project-observer")
+    value.add_argument("--repo-query-checkout", action="append", default=[])
     value.add_argument("--verify-focused-generation")
     value.add_argument("--verify-required-generation")
     value.add_argument("--ttl-seconds", type=int, default=180)
@@ -254,6 +453,14 @@ def main() -> int:
             if not runtime.is_file():
                 raise SnapshotError("Glaeda runtime must resolve to a regular file")
             runtime_sha256 = sha256_file(runtime)
+        if bool(args.project_observer) != bool(args.repo_query_checkout):
+            raise SnapshotError(
+                "Additional repo-query checkouts require one exact project observer"
+            )
+        repo_query_projects = [
+            repo_query_project_observation(Path(args.project_observer), Path(checkout))
+            for checkout in args.repo_query_checkout
+        ]
         snapshot = build_snapshot(
             workspace_receipt(root),
             node_id=args.node_id,
@@ -263,6 +470,7 @@ def main() -> int:
             glaeda_runtime_sha256=runtime_sha256,
             python=python_evidence(Path(args.python_interpreter)),
             profile_generation=args.profile_generation,
+            repo_query_projects=repo_query_projects,
             verification_profile_generations={
                 profile_id: generation
                 for profile_id, generation in (
