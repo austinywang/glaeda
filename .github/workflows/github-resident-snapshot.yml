@@ -1,0 +1,43 @@
+name: Resident snapshot contract
+
+on:
+  pull_request:
+    paths:
+      - "scripts/github_resident_snapshot.py"
+      - "scripts/test-github-resident-snapshot.py"
+      - "config/github-resident-snapshot-trust.json"
+      - "docs/GITHUB_RESIDENT_SNAPSHOTS.md"
+      - ".github/workflows/github-resident-snapshot.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/github_resident_snapshot.py"
+      - "scripts/test-github-resident-snapshot.py"
+      - "config/github-resident-snapshot-trust.json"
+      - "docs/GITHUB_RESIDENT_SNAPSHOTS.md"
+      - ".github/workflows/github-resident-snapshot.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: resident-snapshot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Validate bounded GitHub resident snapshot contract
+        run: |
+          python3 -m py_compile \
+            scripts/github_resident_snapshot.py \
+            scripts/test-github-resident-snapshot.py
+          python3 scripts/test-github-resident-snapshot.py -v

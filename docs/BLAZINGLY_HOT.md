@@ -1006,3 +1006,7 @@ fallback path
 The end state is simple to describe even if the internals are exacting:
 
 > **Keep the useful world hot, materialize only what changed, and let trust decide what may survive.**
+
+## GitHub advisory resident snapshots
+
+Issue #970's GitHub-facing projection is specified in `docs/GITHUB_RESIDENT_SNAPSHOTS.md`. It exposes only bounded signed capability, heat, coarse load, reusable-state status, and request-state evidence for reviewed nodes/repositories. Treat `available`, `resident_hot`, reusable-state heat, and request state as performance/routing hints; local Glaeda admission, source/profile validation, ownership, and reuse checks remain the execution authority.

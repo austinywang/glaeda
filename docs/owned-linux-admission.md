@@ -158,3 +158,11 @@ caller/source/profile/capability and the executor must perform its fresh reserva
 physical launch check. A race after this observation can still refuse at that boundary. The
 observer does not schedule retries or publish a terminal result. Operator hold maps to pending for
 the consumer; it remains a refusal in the physical reducer and launch path.
+
+### GitHub advisory projection
+
+`glaeda-owned-admission-observation/v1` may feed the signed GitHub resident snapshot described in
+`docs/GITHUB_RESIDENT_SNAPSHOTS.md`. The projection reduces host evidence to bounded
+availability/pressure/capacity classes plus an active-work count. A remote `available` value grants
+zero admission or execution authority; the node runs this local observer again before any physical
+execution.
