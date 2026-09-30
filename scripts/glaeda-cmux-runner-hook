@@ -644,6 +644,12 @@ PREFIX = "glaeda-cmux-runner-hook"
 GATE = "glaeda-cmux-runner-gate"
 GATE_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_POLL_S") or 2.0)
 GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary hold never stops a listener
+# A job that ends under the disk floor: the listener asks for the next job as soon as its Runner.Worker exits and got
+# one 2 s later (cmux9s, 2026-09-30 09:13:25 -> 09:13:27), inside one GATE_POLL_S, so every job it took was refused
+# (four in 34 s on one runner, 33 in a day on that mini). While a job runs under the floor the gate watches its
+# worker every GATE_WATCH_S (kill 0, no ps) and then polls every GATE_WATCH_S for up to GATE_FAST_S.
+GATE_WATCH_S = 0.1
+GATE_FAST_S = 5.0
 # A mini whose 1-minute load reaches GATE_LOAD_PAUSE per core stops its idle listeners; they listen again once it
 # falls below GATE_LOAD_RESUME per core. Load, not ps CPU, because a compile's short-lived swift-frontend processes
 # saturate a mini while ps's decaying %cpu shows 6 of 14 cores used. Measured over 229 cmux jobs on the PR minis
@@ -2789,6 +2795,8 @@ class Gate:
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
         # the eviction under way: the detached glaeda-disk, when it started and the free GiB before it
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
+        self.watching: tuple[int, ...] = ()  # the job's Runner.Worker pids while it runs under the disk floor
+        self.fast_until = 0.0  # poll every GATE_WATCH_S until then: that worker just exited
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -2919,8 +2927,8 @@ class Gate:
         A hold resumes only at GATE_DISK_RESUME_GIB above the floor, so a mini at the edge does not flap. glaeda-disk
         --pressure frees space well past it; a hold past GATE_DISK_NOTE_S logs once that it could not, so an
         operator frees space by hand."""
-        # the margin and the hold timer apply only while the listener is actually held off for disk, so a
-        # listening runner that dips once is stopped only on two readings under the floor itself
+        # the margin and the hold timer apply only while the listener is actually held off for disk; a listening
+        # runner is stopped on its first idle reading under the floor itself (under_floor, step)
         holding = self.child is None and (self.held or "").startswith("disk:")
         if not holding:
             self.disk_since, self.disk_noted = None, False
@@ -2940,6 +2948,35 @@ class Gate:
                      "freed enough; check with glaeda-disk --top 25")
             self.disk_noted = True
         return f"disk: {why}"
+
+    def under_floor(self) -> str | None:
+        """"disk: ..." while free disk is under this runner's --min-free-gib itself, the number job-started refuses
+        every job at (disk_refusal), else None. A plain statvfs: no margin, timer or eviction (low_disk owns those),
+        so it is cheap enough for every poll, a job's included."""
+        floor = runner_scope(self.runner_dir).min_free_gib
+        if floor <= 0:
+            return None
+        why = disk_refusal(os.path.dirname(self.host_lock), floor)
+        return f"disk: {why}" if why else None
+
+    def nap(self) -> None:
+        """Sleep until the next step. Normally GATE_POLL_S. While a job runs under the disk floor (watching), wake
+        as soon as its Runner.Worker exits instead, then poll every GATE_WATCH_S for GATE_FAST_S, so the gate stops
+        the idle listener before it takes the next job, which job-started would refuse (GATE_WATCH_S)."""
+        if self.terminating:
+            time.sleep(0.5)
+            return
+        now = time.monotonic()
+        if self.child is not None and self.stop_deadline is None and now < self.fast_until:
+            time.sleep(GATE_WATCH_S)
+            return
+        deadline = now + GATE_POLL_S
+        while self.watching and not self.terminating and time.monotonic() < deadline:
+            if not all(pid_alive(pid) for pid in self.watching):
+                self.watching, self.fast_until = (), time.monotonic() + GATE_FAST_S
+                return
+            time.sleep(GATE_WATCH_S)
+        time.sleep(max(0.0, deadline - time.monotonic()))
 
     def evict_in_background(self, path: str, floor: float) -> None:
         """Start a detached glaeda-disk --pressure run for the floor (disk_argv) unless one is under way or one
@@ -3013,11 +3050,14 @@ class Gate:
     def worker(self) -> bool:
         """A Runner.Worker under this runner's tree. A failed look counts as busy."""
         try:
-            pids, table = self.tree()
+            return bool(self.worker_pids())
         except Exception:  # noqa: BLE001
             return True
+
+    def worker_pids(self) -> list[int]:
+        pids, table = self.tree()
         worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
-        return any(worker in table[pid][1] for pid in pids)
+        return [pid for pid in pids if worker in table[pid][1]]
 
     def taking(self) -> str | None:
         """The runner request the listener has acknowledged and not finished (listener_request). An unreadable
@@ -3111,11 +3151,19 @@ class Gate:
             if self.busy():
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
+                self.watching = ()
+                if self.under_floor():  # this job may end under the floor: wake when its worker exits (nap)
+                    with contextlib.suppress(Exception):  # a failed look only means the plain poll
+                        self.watching = tuple(self.worker_pids())
                 return None
-            why = self.claimed()
+            # Under the floor, job-started refuses whatever the listener takes next, so the first idle reading
+            # stops it: no GATE_CONFIRM, and ahead of any other hold (a full or saturated mini would otherwise
+            # debounce it). Every other hold still needs GATE_CONFIRM idle polls.
+            floor = self.under_floor()
+            why = floor or self.claimed()
             self.streak = self.streak + 1 if why else 0
-            if why and self.streak >= GATE_CONFIRM:
-                why = self.confirmed()
+            if why and (floor or self.streak >= GATE_CONFIRM):
+                why = floor or self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
                     self.stop(why)
             return None
@@ -3183,7 +3231,7 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
             code = None
         if code is not None:
             return code
-        time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
+        gate.nap()
 
 
 def refuse(reason: str) -> int:

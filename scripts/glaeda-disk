@@ -57,8 +57,10 @@ On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet
 tier, evicted LRU under pressure: parked pull request builds idle over an hour, seeds other than each
 root's newest two current ones, and a root's kept build once the root has been idle two days. On the
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
-reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN. The
-Chromium / cmux-browser trees and their caches are never deleted (NEVER_DELETE).
+reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
+SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
+whatever its age once free space is below the emergency floor. The Chromium / cmux-browser trees and
+their caches are never deleted (NEVER_DELETE).
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
@@ -220,7 +222,85 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            include=("derived-data", ".derived-data.discard-"), build_output=True,
                            min_idle_hours=KEPT_BUILD_IDLE_HOURS,
                            owner="cmux owned_build_state.py (keep)", rebuild_minutes=10))
+    if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
+        fams.append(spm_scratch_family(fleet_stores(ci)[0]))
     return fams
+
+
+# cmux CI's SwiftPM scratch (cmux scripts/ci/owned_spm_scratch.py): swift-package-tests links each package's .build
+# to STORE/spm-scratch/<fingerprint>/<package> so a job rebuilds only what its change touched. A job holds
+# <fingerprint>.lock shared (a holder process) until the runner ends it; `link` touches the lock, so its time is the
+# directory's last use. Its owner bounds it only at a link (24 GiB LRU), so nothing evicted it under pressure:
+# cmux9s held 31 GiB of it, none held by a job, while glaeda-disk --pressure found 0.0 GiB reclaimable and every
+# runner's job-started hook refused at 21.9 GiB free under its 30 GiB floor (2026-09-30). A directory goes only
+# under owned_spm_scratch's own protocol (remove_spm_scratch); its .trash-* leftovers always go.
+SPM_SCRATCH = "cmux-spm-scratch"
+SPM_TRASH = ".trash-"  # owned_spm_scratch.TRASH: a directory renamed aside for deletion, never reused
+SPM_REBUILD_MINUTES = 3.0  # one swift-package-tests job rebuilds the packages its change selects
+
+
+def spm_scratch_family(store: Path) -> Family:
+    return Family(SPM_SCRATCH, store / "spm-scratch", True,
+                  "the next swift-package-tests job rebuilds the packages it selects", build_output=True,
+                  owner="cmux owned_spm_scratch.py", rebuild_minutes=SPM_REBUILD_MINUTES)
+
+
+def spm_lock(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def spm_scratch_held(path: Path) -> bool:
+    """Whether a job holds this scratch directory: owned_spm_scratch's holder keeps a shared flock on
+    <fingerprint>.lock for the whole job. Probed exclusive and released at once, as owned_spm_scratch's own drop()
+    does: its link takes the lock blocking, so it waits out the probe; its prune skips the directory for that moment.
+    No lock file means no job ever linked it. An unreadable lock counts as held."""
+    if path.name.startswith(SPM_TRASH):
+        return False
+    try:
+        fd = os.open(spm_lock(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)  # closing drops the probe's lock
+    return False
+
+
+def remove_spm_scratch(path: Path) -> bool:
+    """owned_spm_scratch.drop(): under an exclusive lock on <fingerprint>.lock, rename the directory aside to
+    .trash-<name>-<pid> (which owned_spm_scratch also sweeps, should this delete be killed) and drop its .size, then
+    delete it outside the lock. False, touching nothing, while a job holds it."""
+    if path.is_symlink():
+        raise OSError("refusing symlink")
+    if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
+        raise OSError("refusing a mount point")
+    if path.name.startswith(SPM_TRASH):
+        shutil.rmtree(path, onerror=_chmod_retry)
+        return True
+    with open(spm_lock(path), "a") as handle:  # created as owned_spm_scratch creates it
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        aside = path.with_name(f"{SPM_TRASH}{path.name}-{os.getpid()}")
+        os.rename(path, aside)
+        path.with_name(path.name + ".size").unlink(missing_ok=True)
+    shutil.rmtree(aside, onerror=_chmod_retry)
+    return True
+
+
+# Filesystems whose free space is below the emergency floor (emergency_bytes) in this pressure run or report. There
+# the SwiftPM scratch no job holds goes whatever its age: it rebuilds in minutes, and the runner floor is near.
+EMERGENCY_DEVS: frozenset[int] = frozenset()
+
+
+def emergency_devs(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0) -> frozenset[int]:
+    return frozenset(fs.dev for fs in fss.values() if fs.free < emergency_bytes(fs, emergency, floor_gib))
 
 
 # The trusted seeder's serve log (glaeda-seed-serve): the seed archive on cmux-lawrence's SSD fills itself from
@@ -268,9 +348,17 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
 
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
     """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
-    root still stay, by keep_verdict), everything else waits out its family's window."""
+    root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
+    (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds). Everything else waits out its family's
+    window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
+    if fam.id == SPM_SCRATCH:
+        if path.name.startswith(SPM_TRASH):
+            return 0.0
+        with contextlib.suppress(OSError):
+            if fam.root.stat().st_dev in EMERGENCY_DEVS:
+                return 0.0
     return idle_window(fam, idle_hours)
 
 
@@ -957,6 +1045,16 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool =
             except OSError:
                 pass
         frontier = nxt
+    return newest
+
+
+def item_mtime(fam: Family, path: Path) -> float:
+    """An item's last use as survey and apply judge it: its newest mtime near the top, and for SwiftPM scratch
+    also its lock, which owned_spm_scratch touches whenever a job links the directory."""
+    newest = newest_mtime(path, 2 if fam.reclaimable else 1, 3000 if fam.reclaimable else 300, access=fam.discover)
+    if fam.id == SPM_SCRATCH:
+        with contextlib.suppress(OSError):
+            newest = max(newest, spm_lock(path).stat().st_mtime)
     return newest
 
 
@@ -2035,6 +2133,8 @@ def job_busy(fam: Family, path: Path) -> bool:
     # none was ever evicted (cmux15, 2026-09-28). A job using one is seen by its command line and cwd.
     if fam.id in FLEET_FAMILY_IDS:
         return False
+    if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
+        return False
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
@@ -2211,8 +2311,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     known.update(measured)
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
-    idles = [(now - newest_mtime(path, 2 if fam.reclaimable else 1,
-                                 3000 if fam.reclaimable else 300, access=fam.discover)) / 3600
+    idles = [(now - item_mtime(fam, path)) / 3600
              if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
     try:
         cwds, cmds = evidence.result()
@@ -2234,6 +2333,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
             reasons.append("claude session active")
+        if fam.id == SPM_SCRATCH and spm_scratch_held(path):
+            reasons.append("a job holds its lock (owned_spm_scratch.py)")
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
         window = item_window(fam, path, idle_hours, archived)
@@ -2529,10 +2630,11 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if families[i.family].discover and not fresh_layout:
             outcome = "changed:layout"
         elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
-                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
+                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
+                or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
             outcome = "changed:in-use"
         elif not item_due(families[i.family],
-                          (time.time() - newest_mtime(p, access=families[i.family].discover)) / 3600,
+                          (time.time() - item_mtime(families[i.family], p)) / 3600,
                           item_window(families[i.family], p, idle_hours, archived))[0]:
             outcome = "changed:modified"
         elif keep_verdict(families[i.family], p):
@@ -2550,10 +2652,14 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                 stale_hash = (p.parent.parent / "update-hashes" / p.name
                               if fresh_layout == "rustup-toolchain" else None)
-                remove(p, after_rename=None if stale_hash is None
-                       else lambda h=stale_hash: h.unlink(missing_ok=True))
-                outcome = "reclaimed"
-                released += i.bytes
+                if i.family == SPM_SCRATCH:
+                    gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
+                else:
+                    remove(p, after_rename=None if stale_hash is None
+                           else lambda h=stale_hash: h.unlink(missing_ok=True))
+                    gone = True
+                outcome = "reclaimed" if gone else "changed:in-use"
+                released += i.bytes if gone else 0
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
@@ -2797,8 +2903,10 @@ def main(argv: list[str] | None = None) -> int:
         if not idle_due():
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             return 0
-    global ACTIVITY_MODE
+    global ACTIVITY_MODE, EMERGENCY_DEVS
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
+    # the idle sweep judges by reuse windows alone; a pressure run or a report sees the emergency floor
+    EMERGENCY_DEVS = frozenset() if sweep else emergency_devs(fss, a.emergency, floor_gib)
     busy = host_busy() if sweep else ""
     if sweep:
         print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")

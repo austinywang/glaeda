@@ -3112,6 +3112,71 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.low_disk())
             self.assertIsNone(gate.disk_since)
 
+    def test_the_first_idle_reading_under_the_disk_floor_stops_the_listener(self) -> None:
+        """cmux9s, 2026-09-30: a job ended under the 30 GiB floor, the listener took the next one 2 s later, and
+        job-started refused it; the gate had waited for a second idle poll, behind a capacity hold."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
+        free = {"gib": 50.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        full = "all 5 capacity units on this mini are taken"
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage):
+            gate, stops = self.gate([full] * 3)
+            gate.step()
+            self.assertEqual(stops, [], "any other hold still waits for GATE_CONFIRM idle polls")
+            gate.step()
+            self.assertEqual(stops, ["held"])
+
+            free["gib"] = 21.9
+            gate, stops = self.gate([full] * 3, busy=[True])
+            gate.worker_pids = lambda: [4242]
+            gate.step()
+            self.assertEqual(stops, [], "a runner with a job is never stopped")
+            self.assertEqual(gate.watching, (4242,), "under the floor the gate watches the job's worker")
+            gate.step()  # the worker exited
+            self.assertEqual(stops, ["disk: 21.9 GiB free, 30 GiB required"], "at once, ahead of the capacity hold")
+
+            free["gib"] = 31.0
+            gate, stops = self.gate([None], busy=[True])
+            gate.worker_pids = lambda: [4242]
+            gate.step()
+            self.assertEqual(gate.watching, (), "above the floor a job is polled as usual")
+            gate.step()
+            self.assertEqual(stops, [], "and a runner above its floor keeps listening")
+
+    def test_a_job_under_the_disk_floor_wakes_the_gate_when_its_worker_exits(self) -> None:
+        import threading
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(worker.wait)
+        self.addCleanup(worker.kill)
+        gate.watching = (worker.pid,)
+        # the listener reaps its worker as it exits; here the test does, as the parent
+        reaper = threading.Timer(0.3, lambda: (worker.kill(), worker.wait()))
+        reaper.start()
+        self.addCleanup(reaper.cancel)
+        with mock.patch.object(hook, "GATE_POLL_S", 30.0):
+            started = time.monotonic()
+            gate.nap()
+            self.assertLess(time.monotonic() - started, 5.0, "woken by the worker's exit, not after GATE_POLL_S")
+            self.assertEqual(gate.watching, ())
+            self.assertGreater(gate.fast_until, time.monotonic())
+            started = time.monotonic()
+            gate.nap()
+            self.assertLess(time.monotonic() - started, 1.0, "then it polls every GATE_WATCH_S")
+            gate.stop_deadline = time.monotonic() + 60
+            with mock.patch.object(hook.time, "sleep") as sleep:
+                gate.nap()
+            sleep.assert_called_once()
+            self.assertGreater(sleep.call_args[0][0], 29.0, "a stop under way needs no fast polls")
+        with mock.patch.object(hook, "GATE_POLL_S", 0.2):
+            gate.stop_deadline, gate.fast_until = None, 0.0
+            started = time.monotonic()
+            gate.nap()
+            self.assertGreaterEqual(time.monotonic() - started, 0.19, "nothing watched: the plain poll")
+
     def test_the_gate_evicts_in_the_background_before_it_listens_again(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)

@@ -266,9 +266,19 @@ What `--apply` does:
      item goes after `pressure_jobs` (80) jobs, or past its family window with `min_jobs` (6); the
      idle sweep after `sweep_jobs` (190), or 24 h idle with 80 jobs since. From 11,393 job starts
      on 13 minis (2026-09-26..29) a PR's next job on the same host came p50 6, p90 76, p95 189 jobs
-     later (0.4, 5.2, 15.5 h), so an item idle only because the fleet is idle stays.
+     later (0.4, 5.2, 15.5 h), so an item idle only because the fleet is idle stays. cmux CI's
+     SwiftPM scratch (`ci/spm-scratch/<fingerprint>`, `owned_spm_scratch.py`) is its own family:
+     a directory a job holds by its `<fingerprint>.lock` flock stays, the rest ages like any cache
+     and goes whatever its age below the emergency floor, deleted only under that lock (cmux9s,
+     2026-09-30: 31 GiB of it unheld while glaeda-disk found 0.0 GiB to free and every job was
+     refused at 21.9 GiB free).
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
-     signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
+     signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Under the disk
+     floor the first idle poll is enough, ahead of any other hold, and while a job runs
+     under the floor the gate watches its `Runner.Worker` every 0.1 s and polls every 0.1 s
+     for 5 s after it exits: the listener asks for its next job as soon as the Worker
+     exits and got one 2 s later, inside one 2 s poll, so every job it took was refused
+     (cmux9s, 2026-09-30: four in 34 s on one runner).
      - The listener's graceful exit ends its session, and GitHub shows the runner as
        offline.
      - With no listener running (`run-helper.sh` between listeners), the gate sends

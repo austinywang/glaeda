@@ -735,6 +735,85 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((ci / "seeds/p-a").exists())
         self.assertFalse((ci / "cmux-ci-2/derived-data").exists())
 
+    def test_spm_scratch_goes_under_its_own_lock(self) -> None:
+        """cmux9s, 2026-09-30: 31 GiB of SwiftPM scratch no job held, 0.0 GiB reclaimable, every job refused."""
+        ci = self.root / "ci"
+        make(ci / "seeds/p-a", age_hours=1)
+        scratch = ci / "spm-scratch"
+        for name, age in (("held", 1), ("free", 1), ("old", 50), (".trash-gone-7", 0.1)):
+            make(scratch / name, age_hours=age)
+        for name, age in (("held", 0.5), ("free", 0.5), ("old", 50)):
+            lock = scratch / f"{name}.lock"
+            lock.touch()
+            t = time.time() - age * 3600
+            os.utime(lock, (t, t))
+        (scratch / "free.size").write_text("1048576")
+        make(ci / "cmux-ci-2/spm-scratch/other", age_hours=50)  # only root 1's store holds scratch (cmux mini_store)
+        # a job's holder: owned_spm_scratch.py hold keeps a shared flock for the whole job
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\n"
+                                   "f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_SH)\n"
+                                   "print('held', flush=True); time.sleep(60)\n", os.fspath(scratch / "held.lock")],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        self.assertTrue(gd.spm_scratch_held(scratch / "held"))
+        self.assertFalse(gd.spm_scratch_held(scratch / "free"))
+        self.assertFalse(gd.spm_scratch_held(scratch / "old"))
+
+        fams = [f for f in gd.fleet_families(ci) if f.id == gd.SPM_SCRATCH]
+        self.assertEqual([f.root for f in fams], [scratch])
+        self.assertFalse(gd.job_busy(fams[0], scratch / "free"), "its lock, not a slot marker search, decides")
+
+        def verdicts(emergency: bool) -> dict[str, str]:
+            devs = frozenset({scratch.stat().st_dev}) if emergency else frozenset()
+            with mock.patch.object(gd, "EMERGENCY_DEVS", devs):
+                items = gd.survey(fams, 6, 0)
+            return {Path(i.path).name: i.verdict for i in items}
+
+        # under pressure a used scratch ages like any cache; a leftover of a killed delete always goes
+        self.assertEqual(verdicts(False), {"held": "in-use", "free": "recent", "old": "reclaimable",
+                                           ".trash-gone-7": "reclaimable"})
+        # below the emergency floor, whatever no job holds goes: it rebuilds in minutes, the runner floor is near
+        got = verdicts(True)
+        self.assertEqual(got, {"held": "in-use", "free": "reclaimable", "old": "reclaimable",
+                               ".trash-gone-7": "reclaimable"})
+        with mock.patch.object(gd, "EMERGENCY_DEVS", frozenset({scratch.stat().st_dev})):
+            items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            # a job links "old" between the survey and the delete: apply re-checks the lock and keeps it
+            late = open(scratch / "old.lock", "a")
+            fcntl.flock(late, fcntl.LOCK_SH)
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+            late.close()
+        self.assertFalse((scratch / "free").exists())
+        self.assertFalse((scratch / "free.size").exists())
+        self.assertFalse((scratch / ".trash-gone-7").exists())
+        self.assertTrue((scratch / "old").exists(), "held at delete time")
+        self.assertTrue((scratch / "held").exists())
+        self.assertEqual(sorted(p.name for p in scratch.iterdir()),
+                         ["free.lock", "held", "held.lock", "old", "old.lock"], "no .trash-* left behind")
+        outcomes = {Path(r["path"]).name: r["outcome"]
+                    for r in map(json.loads, (self.root / "r.jsonl").read_text().splitlines())}
+        self.assertEqual(outcomes, {"free": "reclaimed", ".trash-gone-7": "reclaimed", "old": "changed:in-use"})
+        # the delete itself takes the lock: a holder that arrives after every re-check still keeps its directory
+        make(scratch / "raced", age_hours=50)
+        late = open(scratch / "raced.lock", "a")
+        fcntl.flock(late, fcntl.LOCK_SH)
+        self.assertFalse(gd.remove_spm_scratch(scratch / "raced"))
+        late.close()
+        self.assertTrue(gd.remove_spm_scratch(scratch / "raced"))
+        self.assertFalse((scratch / "raced").exists())
+
+    def test_the_emergency_floor_names_its_filesystems(self) -> None:
+        total = 460 * gd.GIB  # emergency 10%:30-60 is 46 GiB; a 30 GiB runner floor lifts it to 50 on HOME's volume
+        home = gd.HOME.stat().st_dev
+        fss = {1: gd.Fs(1, "/a", 40 * gd.GIB, total, 115 * gd.GIB, 161 * gd.GIB),
+               2: gd.Fs(2, "/b", 90 * gd.GIB, total, 115 * gd.GIB, 161 * gd.GIB),
+               home: gd.Fs(home, "/", 48 * gd.GIB, total, 115 * gd.GIB, 161 * gd.GIB)}
+        self.assertEqual(gd.emergency_devs(fss, "10%:30-60"), {1})
+        self.assertEqual(gd.emergency_devs(fss, "10%:30-60", floor_gib=30), {1, home})
+
     def test_a_seed_the_archive_holds_goes_without_waiting(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
