@@ -49,7 +49,9 @@ An admitted job also gets a detached host sampler (unless --no-telemetry): it re
 this job, by the other runner slots' jobs and by everything outside them, and the top outside processes, and
 writes one "completed" JSON line per job to ~/Library/Logs/glaeda-cmux-jobs.jsonl (glaeda-cmux-job/v1,
 "contended" or "clear"); job-started also writes a "started" line at admission and a "refused" line when it
-refuses. glaeda-fleet-status reads the completed lines (source "jobs").
+refuses. After a warmup, a sustained low-CPU job may release surplus capacity units (and a compile-gui root)
+through its holder; each release is logged as a "capacity_release" line. The existing load gate remains the
+safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0.
 
@@ -2137,12 +2139,14 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                     taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         got = 0
+        unit_fds: list[int] = []
         for slot in range(total):
             if got == units:
                 break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
             if fd is not None:
                 fds.append(fd)
+                unit_fds.append(fd)
                 got += 1
         if got < units:
             if taken_out is not None:
@@ -2152,10 +2156,12 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
             fds.remove(split)
-        held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split))
+        held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split),
+                          release_fds=unit_fds)
         fds = [] if split is None else [split]  # the holder has them now, or hold closed them
         if held and split is not None:
-            held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root))
+            held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root),
+                             release_fds=[split])
             fds = []
             if not held:
                 release_holder(holder_file(state_dir))
@@ -2180,7 +2186,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
 
 
 def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] = (),
-         pid_file: Path | None = None) -> tuple[bool, str]:
+         pid_file: Path | None = None, release_fds: list[int] | None = None) -> tuple[bool, str]:
     """Hand the locked fds to a detached holder that keeps them until job-completed or watch_pid exits.
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
@@ -2189,6 +2195,8 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
         state_dir.mkdir(parents=True, exist_ok=True)
         pid_file = pid_file or holder_file(state_dir)
         pid_file.unlink(missing_ok=True)  # a stale file from a crashed holder must not look like success
+        release_file = pid_file.with_name(pid_file.name + ".release")
+        release_file.unlink(missing_ok=True)
     except OSError as error:
         close_all(fds)
         return False, f"cannot prepare the lock holder ({type(error).__name__})"
@@ -2223,6 +2231,21 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
                         break  # job-completed released it
                 except OSError:
                     break
+                if release_fds:
+                    try:
+                        request = json.loads(release_file.read_text())
+                        if request.get("release_all"):
+                            close_all(release_fds)
+                            release_fds.clear()
+                        else:
+                            keep = max(1, min(len(release_fds), int(request.get("keep_units", len(release_fds)))))
+                            if keep < len(release_fds):
+                                close_all(release_fds[keep:])
+                                del release_fds[keep:]
+                        if not release_fds or request.get("release_all"):
+                            release_file.unlink(missing_ok=True)
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        pass
                 time.sleep(HOLDER_POLL_S)
         finally:
             for leftover in ("releasing", "pid_file"):  # still ours: released, or the job died first
@@ -2265,6 +2288,9 @@ def release_host_lock(state_dir: Path) -> str:
     roots_file(state_dir).unlink(missing_ok=True)
     gui_file(state_dir).unlink(missing_ok=True)
     main = holder_file(state_dir)
+    main.with_name(main.name + ".release").unlink(missing_ok=True)
+    for release in state_dir.glob(f"{main.stem}-root-*.pid.release"):
+        release.unlink(missing_ok=True)
     extra = [release_holder(path) for path in sorted(state_dir.glob(f"{main.stem}-root-*.pid"))]
     gui = [release_holder(path) for path in state_dir.glob(f"{main.stem}-gui.pid")]
     note = release_holder(main)
@@ -3264,6 +3290,11 @@ JOB_SCHEMA = "glaeda-cmux-job/v1"
 SAMPLER_FILE = "job-sampler"
 SAMPLE_S = 10.0
 THERMAL_EVERY = 6  # pmset -g therm every Nth sample
+DYNAMIC_WARMUP_S = float(os.environ.get("GLAEDA_DYNAMIC_WARMUP_S") or 120.0)
+DYNAMIC_LOW_S = float(os.environ.get("GLAEDA_DYNAMIC_LOW_S") or 60.0)
+DYNAMIC_TARGET_BUSY_PCT = 80.0
+DYNAMIC_LOW_JOB_SHARE = 0.60
+MEMORY_PRESSURE_KEY = "kern.memorystatus_vm_pressure_level"
 PS = "/bin/ps"
 SYSCTL = "/usr/sbin/sysctl"
 PMSET = "/usr/bin/pmset"
@@ -3418,6 +3449,50 @@ def thermal_limited() -> bool | None:
         return True
     warned = [l for l in out.splitlines() if "warning level" in l.lower() and not l.strip().startswith("Note: No")]
     return bool(warned)
+
+
+def memory_pressure_level() -> int | None:
+    """Darwin VM pressure: 1 normal, 2 elevated, 4 critical; unknown off Darwin."""
+    try:
+        out = subprocess.run([SYSCTL, "-n", MEMORY_PRESSURE_KEY], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def dynamic_release_decision(elapsed: float, low_since: float | None, units: int, total: int,
+                             job_cores: float | None, host_busy: float | None, blocked: int,
+                             memory: int | None, thermal: bool | None) -> tuple[int, str] | None:
+    """Pure safety decision: release one unit only after warmup and sustained low, safe headroom."""
+    if units <= 1 or total <= 1 or elapsed < DYNAMIC_WARMUP_S or low_since is None:
+        return None
+    if elapsed - low_since < DYNAMIC_LOW_S or job_cores is None:
+        return None
+    if job_cores > max(0.5, units * DYNAMIC_LOW_JOB_SHARE):
+        return None
+    if host_busy is not None and host_busy >= DYNAMIC_TARGET_BUSY_PCT:
+        return None
+    if blocked > 0 or (memory is not None and memory >= 2) or thermal:
+        return None
+    return units - 1, "sustained low job CPU with host headroom"
+
+
+def request_dynamic_release(state_dir: Path, keep_units: int, details: dict[str, Any]) -> None:
+    """Ask the admission holder to close surplus unit fds; the holder remains authoritative for locks."""
+    path = holder_file(state_dir).with_name(holder_file(state_dir).name + ".release")
+    tmp = path.with_name(path.name + f".{os.getpid()}")
+    tmp.write_text(json.dumps({"keep_units": keep_units, **details}, separators=(",", ":")))
+    os.replace(tmp, path)
+    if details.get("release_root"):
+        for root_pid in state_dir.glob(f"{holder_file(state_dir).stem}-root-*.pid"):
+            root_path = root_pid.with_name(root_pid.name + ".release")
+            root_tmp = root_path.with_name(root_path.name + f".{os.getpid()}")
+            root_tmp.write_text(json.dumps({"release_all": True}, separators=(",", ":")))
+            os.replace(root_tmp, root_path)
 
 
 class JobSamples:
@@ -3622,9 +3697,14 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         me = str(os.getpid())
         pid_file.write_text(me + "\n")
         started = time.time()
+        started_mono = time.monotonic()
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
+        dynamic_units = int(meta.get("units") or 0)
+        dynamic_total = int(meta.get("units_total") or dynamic_units)
+        dynamic_warmup = DYNAMIC_WARMUP_S + (300.0 if meta.get("class") == "compile-gui" else 0.0)
+        low_since: float | None = None
         # what the job holds, read only while its Runner.Worker lives: job-completed removes .roots and .gui
         # after finish_sampler's short wait, and once the worker is gone the next job on this runner rewrites them
         holdings = (list(meta.get("roots") or []), bool(meta.get("gui")))
@@ -3633,7 +3713,34 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             try:
                 rows = ps_rows()
                 skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
-                samples.add(load_average(), classify(rows, watch_pid, skip), interval, run_queue(), *host_io())
+                queue = run_queue()
+                disk_busy = host_io()
+                split = classify(rows, watch_pid, skip)
+                samples.add(load_average(), split, interval, queue, *disk_busy)
+                if dynamic_units > 1 and dynamic_total > 1:
+                    now = time.monotonic()
+                    job_cores = split[0]
+                    host_busy = disk_busy[1]
+                    blocked = queue[1] if queue is not None else 0
+                    memory = memory_pressure_level()
+                    thermal = samples.thermal is True
+                    quiet = (now - started_mono >= dynamic_warmup
+                             and job_cores <= max(0.5, dynamic_units * DYNAMIC_LOW_JOB_SHARE)
+                             and (host_busy is None or host_busy < DYNAMIC_TARGET_BUSY_PCT)
+                             and blocked == 0 and (memory is None or memory < 2) and not thermal)
+                    low_since = now if quiet and low_since is None else (low_since if quiet else None)
+                    decision = dynamic_release_decision(now - started_mono, low_since, dynamic_units, dynamic_total,
+                                                        job_cores, host_busy, blocked, memory, thermal)
+                    if decision:
+                        keep, release_reason = decision
+                        request_dynamic_release(state_dir, keep, {"reason": release_reason,
+                                                                 "release_root": meta.get("class") == "compile-gui"})
+                        job_event("capacity_release", meta, log, units_before=dynamic_units,
+                                  units_after=keep, job_cores=round(job_cores, 2),
+                                  host_cpu_busy_pct=host_busy, memory_pressure=memory,
+                                  blocked=blocked, reason=release_reason)
+                        dynamic_units = keep
+                        low_since = None
                 if tick % THERMAL_EVERY == 0:
                     limited = thermal_limited()
                     if limited is not None:

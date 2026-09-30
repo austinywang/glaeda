@@ -5341,6 +5341,14 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(set(by_outside), {"zig (cmux)", "mds_stores (root)"})
         self.assertFalse(any("/" in key for key in by_outside), "no paths leave the host")
 
+    def test_dynamic_release_needs_sustained_quiet_headroom(self) -> None:
+        decide = self.hook.dynamic_release_decision
+        self.assertIsNone(decide(100, 20, 2, 5, 0.8, 55, 0, 1, False))
+        self.assertEqual(decide(200, 120, 2, 5, 0.8, 55, 0, 1, False)[0], 1)
+        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 85, 0, 1, False))
+        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 1, 1, False))
+        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 0, 2, False))
+
     def test_summary_flags_outside_cpu_not_its_own_load(self) -> None:
         samples = self.hook.JobSamples({"job": "macos-compile-admission"}, 14, 1000.0)
         for _ in range(6):
