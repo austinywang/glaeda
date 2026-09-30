@@ -1872,7 +1872,9 @@ def _lock_processes(path: str, ours: set[int]) -> tuple[list[int], str]:
     # This hook's own processes are never fleet builds: another runner's job-started inside its admission,
     # a holder between its fork and its pid file, or a listener gate probing.
     try:
-        listing = subprocess.run(["/bin/ps", "-o", "pid=,wchan:32=,command=", "-p", ",".join(map(str, pids))],
+        # Apple ps accepts keyword=header, but not the BSD/Linux field-width spelling (wchan:32=).
+        # Its native wchan column is wide enough to retain the Darwin flock wait prefix (lockf:).
+        listing = subprocess.run(["/bin/ps", "-o", "pid=,wchan=,command=", "-p", ",".join(map(str, pids))],
                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
                                  check=False).stdout
     except (OSError, subprocess.TimeoutExpired):

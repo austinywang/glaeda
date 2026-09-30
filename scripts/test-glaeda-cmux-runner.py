@@ -2791,9 +2791,10 @@ class GateTest(unittest.TestCase):
 101  hrtimer_nanosleep worker-current
 102  pipe_read          /bin/cat /Users/Shared/cmux-build-fleet/host.lock
 201  locks_lock_inode_wait /usr/local/bin/with-host-lock host.lock
+202  lockf:             /usr/local/bin/with-host-lock host.lock (Darwin flock waiter)
 301  hrtimer_nanosleep /usr/local/bin/with-host-lock host.lock (exclusive holder)
 """
-        self.assertEqual(hook._blocked_lock_pids(process_table, {102, 201, 301}), {201})
+        self.assertEqual(hook._blocked_lock_pids(process_table, {102, 201, 202, 301}), {201, 202})
 
     def test_a_free_host_or_our_shared_jobs_leave_the_listener_on(self) -> None:
         self.assertIsNone(self.held())
