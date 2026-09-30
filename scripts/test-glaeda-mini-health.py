@@ -46,6 +46,8 @@ class FakeMini(health.Mini):
                        ("com.teamleaderleo.glaeda.cmux-runner.1", True, True, "(never exited)")]
         self.recycler = lambda: "testmanagerd: stopped pid 10"
         self.did: list[str] = []
+        self.leaks: list[tuple[int, str]] = []
+        self.disk: dict = {}
 
     def console(self):
         return self.console_state
@@ -92,6 +94,17 @@ class FakeMini(health.Mini):
 
     def sleep(self, seconds):
         pass
+
+    def leaked_test_apps(self):
+        return self.leaks
+
+    def kill_leaked_test_apps(self):
+        self.did.append("kill leaked apps")
+        self.leaks = []
+        return ["killed pid 99"]
+
+    def disk_summary(self):
+        return self.disk
 
 
 class Base(unittest.TestCase):
@@ -148,6 +161,29 @@ class Detection(Base):
         self.assertEqual(self.ids(report), ["testmanagerd_wedged"])
         self.assertEqual(self.mini.did, [])
         self.assertFalse(self.report.exists())
+
+
+class DiskAndLeaks(Base):
+    def test_unmeasured_space_is_a_health_finding(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": 5 * 1024**3,
+                                                                   "top_level": [{"path": "/Users/Shared", "bytes": 8 * 1024**3}]}]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_unmeasured"])
+        self.assertIn("5.0 GiB", report["findings"][0]["evidence"])
+        self.assertIn("/Users/Shared", report["findings"][0]["evidence"])
+
+    def test_malformed_disk_accounting_is_ignored(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": "unknown"},
+                                                                       {"unmeasured": None}]}
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_orphaned_apps_are_healed_by_the_backstop(self) -> None:
+        self.mini.leaks = [(99, "/tmp/cmux DEV.app")]
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.did, ["kill leaked apps"])
+        self.assertEqual(report["healed"][0]["code"], "leaked_test_apps")
+        self.assertIn("killed pid 99", report["healed"][0]["action"])
 
 
 class Testmanagerd(Base):

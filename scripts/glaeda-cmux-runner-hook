@@ -11,8 +11,9 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
   * the event is not one of ADMITTED_EVENTS (so issue_comment, check_run, check_suite,
     pull_request_target and anything new are refused; --allow-event adds more)
   * the event is pull_request_target
-  * the event carries a pull_request whose head repository is a fork, is missing, or differs
-    from the base repository (covers pull_request, pull_request_review, and friends)
+  * the event carries a pull_request whose head repository is an unapproved fork, is missing, or differs
+    from the base repository (covers pull_request, pull_request_review, and friends); teamleaderleo/cmux is the
+    one approved fork
   * the event name starts with pull_request but the payload has no pull_request object
   * a workflow_run was triggered from a different head repository
   * the repository is not in the allowlist baked in at install time
@@ -48,7 +49,9 @@ An admitted job also gets a detached host sampler (unless --no-telemetry): it re
 this job, by the other runner slots' jobs and by everything outside them, and the top outside processes, and
 writes one "completed" JSON line per job to ~/Library/Logs/glaeda-cmux-jobs.jsonl (glaeda-cmux-job/v1,
 "contended" or "clear"); job-started also writes a "started" line at admission and a "refused" line when it
-refuses. glaeda-fleet-status reads the completed lines (source "jobs").
+refuses. After a warmup, a sustained low-CPU job may release surplus capacity units (and a compile-gui root)
+through its holder; each release is logged as a "capacity_release" line. The existing load gate remains the
+safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0.
 
@@ -64,7 +67,7 @@ fits names the step classes this mini could admit right now. Each prints one JSO
 
 runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the fleet has the host (an exclusive
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
-taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
+taken, or the mini is saturated (sampled host CPU at least GATE_CPU_PAUSE or elevated memory pressure), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
 down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
 (console_refusal). Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
@@ -637,6 +640,8 @@ GIT = shutil.which("git") or "/usr/bin/git"
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
+# The only fork trusted to run on the PR minis. Keep this a single narrow allowlist; add team accounts deliberately.
+ALLOWED_FORK_REPOS = frozenset({"teamleaderleo/cmux"})
 PREFIX = "glaeda-cmux-runner-hook"
 # listen: the runner LaunchAgent runs run.sh under this gate. While the fleet holds or wants the host
 # (an exclusive host lock, a process waiting for it, or a reservation), an idle runner stops listening,
@@ -644,18 +649,15 @@ PREFIX = "glaeda-cmux-runner-hook"
 GATE = "glaeda-cmux-runner-gate"
 GATE_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_POLL_S") or 2.0)
 GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary hold never stops a listener
-# A job that ends under the disk floor: the listener asks for the next job as soon as its Runner.Worker exits and got
-# one 2 s later (cmux9s, 2026-09-30 09:13:25 -> 09:13:27), inside one GATE_POLL_S, so every job it took was refused
-# (four in 34 s on one runner, 33 in a day on that mini). While a job runs under the floor the gate watches its
-# worker every GATE_WATCH_S (kill 0, no ps) and then polls every GATE_WATCH_S for up to GATE_FAST_S.
-GATE_WATCH_S = 0.1
-GATE_FAST_S = 5.0
-# A mini whose 1-minute load reaches GATE_LOAD_PAUSE per core stops its idle listeners; they listen again once it
-# falls below GATE_LOAD_RESUME per core. Load, not ps CPU, because a compile's short-lived swift-frontend processes
-# saturate a mini while ps's decaying %cpu shows 6 of 14 cores used. Measured over 229 cmux jobs on the PR minis
-# (glaeda-cmux-jobs.jsonl, 2026-09-25 07:54-10:37Z): claude-wrapper, which itself uses 0.1 core, took 46-95 s at a
-# mean load under 25 on 14 cores and 120-527 s at 36-100 (5 of 6 runs; its lane times out at 10 min), and every
-# job window with a mean load of 40 or more had a compile admission on that mini.
+# The old 1-minute load gate overcounted runnable threads on these 14-core minis: it held 578 runner-hours on
+# 09-28 while median host CPU was only 34-59%. Gate on sampled iostat CPU busy instead, with hysteresis, and hold
+# for elevated/critical Darwin VM pressure even when CPU is quiet. An unreadable sample fails open; job admission's
+# unit locks and the existing load-independent safety checks remain in force.
+GATE_CPU_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_PAUSE") or 80.0)
+GATE_CPU_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_RESUME") or 70.0)
+GATE_CPU_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_EVERY_S") or 10.0)
+GATE_MEMORY_PRESSURE_HOLD = 2
+# Kept for the pure mini_saturated helper and old operator tooling; the listener gate no longer uses load average.
 GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
 GATE_LOAD_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_RESUME") or 1.5)
 SATURATED = "the mini is saturated"
@@ -725,10 +727,15 @@ def decide(event_name: str | None, event: Any, repository: str | None,
         base = (pr.get("base") or {}).get("repo") if isinstance(pr.get("base"), dict) else None
         if not isinstance(head, dict):
             return False, "pull request head repository is missing (deleted fork?)"
-        if head.get("fork") is True:
-            return False, f"fork pull request from {head.get('full_name')}"
         head_name, base_name = _repo_name(head), _repo_name(base)
-        if head_name is None or base_name is None or head_name != base_name:
+        allowed_fork = (
+            head.get("fork") is True
+            and head_name in ALLOWED_FORK_REPOS
+            and base_name == repo
+        )
+        if head.get("fork") is True and not allowed_fork:
+            return False, f"fork pull request from {head.get('full_name')}"
+        if head_name is None or base_name is None or (head_name != base_name and not allowed_fork):
             return False, f"cross-repository pull request ({head_name} into {base_name})"
 
     if event_name == "workflow_run":
@@ -1045,6 +1052,11 @@ TESTMANAGERD = "/usr/libexec/testmanagerd"
 TESTMANAGERD_TERM_S = 3.0
 TESTMANAGERD_KILL_S = 5.0
 TESTMANAGERD_STUCK = "testmanagerd: stuck"
+# Finished CI XCTest apps can outlive the Runner.Worker after their _temp tree is removed.
+# Only this exact derived-data app family is eligible; arbitrary user apps are never touched.
+LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
+LEAKED_TEST_TEMP = re.compile(r"^(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+)(?:/|$)")
+LEAKED_APP_TERM_S = 1.0
 # A process that may be talking to testmanagerd: an XCTest runner, or xcodebuild testing. A false match only
 # keeps the daemon, so these err wide.
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
@@ -1744,7 +1756,7 @@ def preemptible_pid(host_lock: str, ours: set[int]) -> int | None:
     if not family:
         return None
     pid = yielding_pid(host_lock)
-    others = set(lock_waiters(host_lock, ours))
+    others = set(lock_open_pids(host_lock, ours))
     return pid if pid in others and others <= family else None
 
 
@@ -1846,30 +1858,67 @@ def lock_file(path: Path, mode: int) -> int | None:
     return fd
 
 
-def lock_waiters(path: str, ours: set[int]) -> list[int]:
-    """Processes with the host lock open that are not this runner fleet's holders: with-host-lock
-    blocked in LOCK_EX (the fleet build worker, a reload). Empty when lsof cannot tell."""
+def _blocked_lock_pids(listing: str, pids: set[int]) -> set[int]:
+    """Return candidate pids whose kernel wait channel says they are blocked on a file lock.
+
+    lsof reports every process with a descriptor open, including the worker's idle lock keeper and
+    an exclusive holder. The wait channel is the observation that distinguishes a blocked LOCK_EX
+    call from those processes. Keep this parser pure so the lock protocol is covered with a fake
+    process table in tests.
+    """
+    blocked: set[int] = set()
+    for line in listing.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 3 or not fields[0].isdigit():
+            continue
+        pid, wchan = int(fields[0]), fields[1].lower()
+        if pid in pids and any(token in wchan for token in ("lock", "flock", "fcntl")):
+            blocked.add(pid)
+    return blocked
+
+
+def _lock_processes(path: str, ours: set[int]) -> tuple[list[int], str]:
+    """Return fleet processes with the lock open and their ps observation."""
     try:
         out = subprocess.run([LSOF, "-t", "--", path], stdin=subprocess.DEVNULL, capture_output=True,
                              text=True, timeout=5, check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        return [], ""
     pids = [int(p) for p in out.split() if p.isdigit() and int(p) not in ours]
     if not pids:
-        return []
+        return [], ""
     # This hook's own processes are never fleet builds: another runner's job-started inside its admission,
     # a holder between its fork and its pid file, or a listener gate probing.
     try:
-        listing = subprocess.run(["/bin/ps", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
+        # Apple ps accepts keyword=header, but not the BSD/Linux field-width spelling (wchan:32=).
+        # Its native wchan column is wide enough to retain the Darwin flock wait prefix (lockf:).
+        listing = subprocess.run(["/bin/ps", "-o", "pid=,wchan=,command=", "-p", ",".join(map(str, pids))],
                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
                                  check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return []  # cannot tell a fleet build from our own admission: no waiter, as when lsof cannot tell
+        return [], ""  # cannot tell a fleet build from our own admission: no waiter, as when lsof cannot tell
     # The idle catch-up holds it shared, like a job, and gives way to any job: not a fleet build either.
     fleet = {int(line.split(None, 1)[0]) for line in listing.splitlines()
              if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()
-             and not is_idle_warm(line.split(None, 1)[1] if len(line.split(None, 1)) > 1 else "")}
-    return [pid for pid in pids if pid in fleet]  # a pid gone since lsof is not waiting either
+             and not is_idle_warm(line.split(None, 3)[-1] if len(line.split(None, 3)) > 2 else "")}
+    return [pid for pid in pids if pid in fleet], listing  # a pid gone since lsof is not waiting either
+
+
+def lock_open_pids(path: str, ours: set[int]) -> list[int]:
+    """Processes with the host lock open, for the yielding marker's ownership check."""
+    return _lock_processes(path, ours)[0]
+
+
+def lock_waiters(path: str, ours: set[int]) -> list[int]:
+    """Processes actually blocked in LOCK_EX (the fleet build worker, a reload).
+
+    lsof lists any process with the host lock open, so it is only the candidate source. The ps
+    wait channel is required to show a lock wait; an idle worker keeper such as /bin/cat and an
+    exclusive holder therefore do not count. Empty when either observation cannot be made.
+    """
+    pids, listing = _lock_processes(path, ours)
+    blocked = _blocked_lock_pids(listing, set(pids))
+    return [pid for pid in pids if pid in blocked]
 
 
 def holder_pids(state_dir: Path) -> set[int]:
@@ -2098,12 +2147,14 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                     taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         got = 0
+        unit_fds: list[int] = []
         for slot in range(total):
             if got == units:
                 break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
             if fd is not None:
                 fds.append(fd)
+                unit_fds.append(fd)
                 got += 1
         if got < units:
             if taken_out is not None:
@@ -2113,10 +2164,12 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
             fds.remove(split)
-        held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split))
+        held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split),
+                          release_fds=unit_fds)
         fds = [] if split is None else [split]  # the holder has them now, or hold closed them
         if held and split is not None:
-            held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root))
+            held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root),
+                             release_fds=[split])
             fds = []
             if not held:
                 release_holder(holder_file(state_dir))
@@ -2141,7 +2194,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
 
 
 def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] = (),
-         pid_file: Path | None = None) -> tuple[bool, str]:
+         pid_file: Path | None = None, release_fds: list[int] | None = None) -> tuple[bool, str]:
     """Hand the locked fds to a detached holder that keeps them until job-completed or watch_pid exits.
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
@@ -2150,6 +2203,8 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
         state_dir.mkdir(parents=True, exist_ok=True)
         pid_file = pid_file or holder_file(state_dir)
         pid_file.unlink(missing_ok=True)  # a stale file from a crashed holder must not look like success
+        release_file = pid_file.with_name(pid_file.name + ".release")
+        release_file.unlink(missing_ok=True)
     except OSError as error:
         close_all(fds)
         return False, f"cannot prepare the lock holder ({type(error).__name__})"
@@ -2184,6 +2239,21 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
                         break  # job-completed released it
                 except OSError:
                     break
+                if release_fds:
+                    try:
+                        request = json.loads(release_file.read_text())
+                        if request.get("release_all"):
+                            close_all(release_fds)
+                            release_fds.clear()
+                        else:
+                            keep = max(1, min(len(release_fds), int(request.get("keep_units", len(release_fds)))))
+                            if keep < len(release_fds):
+                                close_all(release_fds[keep:])
+                                del release_fds[keep:]
+                        if not release_fds or request.get("release_all"):
+                            release_file.unlink(missing_ok=True)
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        pass
                 time.sleep(HOLDER_POLL_S)
         finally:
             for leftover in ("releasing", "pid_file"):  # still ours: released, or the job died first
@@ -2226,6 +2296,9 @@ def release_host_lock(state_dir: Path) -> str:
     roots_file(state_dir).unlink(missing_ok=True)
     gui_file(state_dir).unlink(missing_ok=True)
     main = holder_file(state_dir)
+    main.with_name(main.name + ".release").unlink(missing_ok=True)
+    for release in state_dir.glob(f"{main.stem}-root-*.pid.release"):
+        release.unlink(missing_ok=True)
     extra = [release_holder(path) for path in sorted(state_dir.glob(f"{main.stem}-root-*.pid"))]
     gui = [release_holder(path) for path in state_dir.glob(f"{main.stem}-gui.pid")]
     note = release_holder(main)
@@ -2621,6 +2694,30 @@ def mini_saturated(paused: bool, load: float | None = None, cores: int | None = 
             f"listening resumes below {GATE_LOAD_RESUME:g})")
 
 
+def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure: int | None = None) -> str | None:
+    """Why the listener should pause from measured host pressure, or None when it has headroom.
+
+    CPU busy is iostat's one-second sample; memory pressure 2 (elevated) or 4 (critical) is a separate
+    admission brake. Missing samples fail open so a broken probe never strands a runner.
+    """
+    memory_hot = memory_pressure is not None and memory_pressure >= GATE_MEMORY_PRESSURE_HOLD
+    if cpu_busy is None and not memory_hot:
+        return None
+    if paused:
+        cpu_hot = cpu_busy is not None and cpu_busy >= GATE_CPU_RESUME
+    else:
+        cpu_hot = cpu_busy is not None and cpu_busy >= GATE_CPU_PAUSE
+    if not cpu_hot and not memory_hot:
+        return None
+    reasons = []
+    if cpu_hot:
+        limit = GATE_CPU_RESUME if paused else GATE_CPU_PAUSE
+        reasons.append(f"CPU busy at least {limit:g}%")
+    if memory_hot:
+        reasons.append(f"memory pressure level {memory_pressure}")
+    return f"{SATURATED} ({' and '.join(reasons)}; listening resumes below {GATE_CPU_RESUME:g}% CPU and normal memory pressure)"
+
+
 def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
     shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
@@ -2786,8 +2883,12 @@ class Gate:
         self.source = source_identity()
         self.thermal: int | None = None  # the level while the gate holds for heat, else None
         self.thermal_at = -GATE_THERMAL_EVERY_S
-        self.load_since: float | None = None  # when the current load hold began
-        self.load_waived = False  # a hold ran past GATE_LOAD_MAX_HOLD_S; ignored until the load falls
+        self.load_since: float | None = None  # when the current CPU/memory hold began (legacy field name)
+        self.load_waived = False  # a pressure hold ran past GATE_LOAD_MAX_HOLD_S; ignored until pressure falls
+        self.cpu_busy: float | None = None
+        self.cpu_at = -GATE_CPU_EVERY_S
+        self.memory_pressure: int | None = None
+        self.memory_at = -GATE_CPU_EVERY_S
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
         self.console_at = -GATE_CONSOLE_EVERY_S
         self.disk_since: float | None = None  # when the current disk hold began
@@ -2795,8 +2896,6 @@ class Gate:
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
         # the eviction under way: the detached glaeda-disk, when it started and the free GiB before it
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
-        self.watching: tuple[int, ...] = ()  # the job's Runner.Worker pids while it runs under the disk floor
-        self.fast_until = 0.0  # poll every GATE_WATCH_S until then: that worker just exited
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -2865,13 +2964,19 @@ class Gate:
         return why
 
     def saturated(self) -> str | None:
-        """mini_saturated with this gate's hysteresis and hold limit. Checked before mini_full, so a mini both
-        full and saturated holds for load and resumes only below GATE_LOAD_RESUME."""
-        why = mini_saturated(paused=self.load_since is not None or self.load_waived)
+        """Use sampled host CPU and VM pressure with hysteresis; unreadable probes never hold a listener."""
         now = time.monotonic()
+        if now - self.cpu_at >= GATE_CPU_EVERY_S:
+            _, self.cpu_busy = host_io()
+            self.cpu_at = now
+        if now - self.memory_at >= GATE_CPU_EVERY_S:
+            self.memory_pressure = memory_pressure_level()
+            self.memory_at = now
+        why = host_saturated(paused=self.load_since is not None or self.load_waived,
+                             cpu_busy=self.cpu_busy, memory_pressure=self.memory_pressure)
         if why is None:
             if self.load_waived:
-                gate_log("the load fell below the resume mark; load holds apply again")
+                gate_log("host pressure fell below the resume mark; pressure holds apply again")
             self.load_since, self.load_waived = None, False
             return None
         if self.load_waived:
@@ -2880,7 +2985,7 @@ class Gate:
             self.load_since = now
         elif now - self.load_since >= GATE_LOAD_MAX_HOLD_S:
             gate_log(f"{SATURATED} for over {GATE_LOAD_MAX_HOLD_S / 60:g} min, longer than any compile: listening "
-                     "anyway until the load falls (look for a process outside CI jobs)")
+                     "anyway until host pressure falls (look for a process outside CI jobs)")
             self.load_since, self.load_waived = None, True
             return None
         return why
@@ -2927,8 +3032,8 @@ class Gate:
         A hold resumes only at GATE_DISK_RESUME_GIB above the floor, so a mini at the edge does not flap. glaeda-disk
         --pressure frees space well past it; a hold past GATE_DISK_NOTE_S logs once that it could not, so an
         operator frees space by hand."""
-        # the margin and the hold timer apply only while the listener is actually held off for disk; a listening
-        # runner is stopped on its first idle reading under the floor itself (under_floor, step)
+        # the margin and the hold timer apply only while the listener is actually held off for disk, so a
+        # listening runner that dips once is stopped only on two readings under the floor itself
         holding = self.child is None and (self.held or "").startswith("disk:")
         if not holding:
             self.disk_since, self.disk_noted = None, False
@@ -2948,35 +3053,6 @@ class Gate:
                      "freed enough; check with glaeda-disk --top 25")
             self.disk_noted = True
         return f"disk: {why}"
-
-    def under_floor(self) -> str | None:
-        """"disk: ..." while free disk is under this runner's --min-free-gib itself, the number job-started refuses
-        every job at (disk_refusal), else None. A plain statvfs: no margin, timer or eviction (low_disk owns those),
-        so it is cheap enough for every poll, a job's included."""
-        floor = runner_scope(self.runner_dir).min_free_gib
-        if floor <= 0:
-            return None
-        why = disk_refusal(os.path.dirname(self.host_lock), floor)
-        return f"disk: {why}" if why else None
-
-    def nap(self) -> None:
-        """Sleep until the next step. Normally GATE_POLL_S. While a job runs under the disk floor (watching), wake
-        as soon as its Runner.Worker exits instead, then poll every GATE_WATCH_S for GATE_FAST_S, so the gate stops
-        the idle listener before it takes the next job, which job-started would refuse (GATE_WATCH_S)."""
-        if self.terminating:
-            time.sleep(0.5)
-            return
-        now = time.monotonic()
-        if self.child is not None and self.stop_deadline is None and now < self.fast_until:
-            time.sleep(GATE_WATCH_S)
-            return
-        deadline = now + GATE_POLL_S
-        while self.watching and not self.terminating and time.monotonic() < deadline:
-            if not all(pid_alive(pid) for pid in self.watching):
-                self.watching, self.fast_until = (), time.monotonic() + GATE_FAST_S
-                return
-            time.sleep(GATE_WATCH_S)
-        time.sleep(max(0.0, deadline - time.monotonic()))
 
     def evict_in_background(self, path: str, floor: float) -> None:
         """Start a detached glaeda-disk --pressure run for the floor (disk_argv) unless one is under way or one
@@ -3050,14 +3126,11 @@ class Gate:
     def worker(self) -> bool:
         """A Runner.Worker under this runner's tree. A failed look counts as busy."""
         try:
-            return bool(self.worker_pids())
+            pids, table = self.tree()
         except Exception:  # noqa: BLE001
             return True
-
-    def worker_pids(self) -> list[int]:
-        pids, table = self.tree()
         worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
-        return [pid for pid in pids if worker in table[pid][1]]
+        return any(worker in table[pid][1] for pid in pids)
 
     def taking(self) -> str | None:
         """The runner request the listener has acknowledged and not finished (listener_request). An unreadable
@@ -3151,19 +3224,11 @@ class Gate:
             if self.busy():
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
-                self.watching = ()
-                if self.under_floor():  # this job may end under the floor: wake when its worker exits (nap)
-                    with contextlib.suppress(Exception):  # a failed look only means the plain poll
-                        self.watching = tuple(self.worker_pids())
                 return None
-            # Under the floor, job-started refuses whatever the listener takes next, so the first idle reading
-            # stops it: no GATE_CONFIRM, and ahead of any other hold (a full or saturated mini would otherwise
-            # debounce it). Every other hold still needs GATE_CONFIRM idle polls.
-            floor = self.under_floor()
-            why = floor or self.claimed()
+            why = self.claimed()
             self.streak = self.streak + 1 if why else 0
-            if why and (floor or self.streak >= GATE_CONFIRM):
-                why = floor or self.confirmed()
+            if why and self.streak >= GATE_CONFIRM:
+                why = self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
                     self.stop(why)
             return None
@@ -3231,7 +3296,7 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
             code = None
         if code is not None:
             return code
-        gate.nap()
+        time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
 
 
 def refuse(reason: str) -> int:
@@ -3267,6 +3332,11 @@ JOB_SCHEMA = "glaeda-cmux-job/v1"
 SAMPLER_FILE = "job-sampler"
 SAMPLE_S = 10.0
 THERMAL_EVERY = 6  # pmset -g therm every Nth sample
+DYNAMIC_WARMUP_S = float(os.environ.get("GLAEDA_DYNAMIC_WARMUP_S") or 120.0)
+DYNAMIC_LOW_S = float(os.environ.get("GLAEDA_DYNAMIC_LOW_S") or 60.0)
+DYNAMIC_TARGET_BUSY_PCT = 80.0
+DYNAMIC_LOW_JOB_SHARE = 0.60
+MEMORY_PRESSURE_KEY = "kern.memorystatus_vm_pressure_level"
 PS = "/bin/ps"
 SYSCTL = "/usr/sbin/sysctl"
 PMSET = "/usr/bin/pmset"
@@ -3421,6 +3491,50 @@ def thermal_limited() -> bool | None:
         return True
     warned = [l for l in out.splitlines() if "warning level" in l.lower() and not l.strip().startswith("Note: No")]
     return bool(warned)
+
+
+def memory_pressure_level() -> int | None:
+    """Darwin VM pressure: 1 normal, 2 elevated, 4 critical; unknown off Darwin."""
+    try:
+        out = subprocess.run([SYSCTL, "-n", MEMORY_PRESSURE_KEY], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def dynamic_release_decision(elapsed: float, low_since: float | None, units: int, total: int,
+                             job_cores: float | None, host_busy: float | None, blocked: int,
+                             memory: int | None, thermal: bool | None) -> tuple[int, str] | None:
+    """Pure safety decision: release one unit only after warmup and sustained low, safe headroom."""
+    if units <= 1 or total <= 1 or elapsed < DYNAMIC_WARMUP_S or low_since is None:
+        return None
+    if elapsed - low_since < DYNAMIC_LOW_S or job_cores is None:
+        return None
+    if job_cores > max(0.5, units * DYNAMIC_LOW_JOB_SHARE):
+        return None
+    if host_busy is not None and host_busy >= DYNAMIC_TARGET_BUSY_PCT:
+        return None
+    if blocked > 0 or (memory is not None and memory >= 2) or thermal:
+        return None
+    return units - 1, "sustained low job CPU with host headroom"
+
+
+def request_dynamic_release(state_dir: Path, keep_units: int, details: dict[str, Any]) -> None:
+    """Ask the admission holder to close surplus unit fds; the holder remains authoritative for locks."""
+    path = holder_file(state_dir).with_name(holder_file(state_dir).name + ".release")
+    tmp = path.with_name(path.name + f".{os.getpid()}")
+    tmp.write_text(json.dumps({"keep_units": keep_units, **details}, separators=(",", ":")))
+    os.replace(tmp, path)
+    if details.get("release_root"):
+        for root_pid in state_dir.glob(f"{holder_file(state_dir).stem}-root-*.pid"):
+            root_path = root_pid.with_name(root_pid.name + ".release")
+            root_tmp = root_path.with_name(root_path.name + f".{os.getpid()}")
+            root_tmp.write_text(json.dumps({"release_all": True}, separators=(",", ":")))
+            os.replace(root_tmp, root_path)
 
 
 class JobSamples:
@@ -3625,9 +3739,14 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         me = str(os.getpid())
         pid_file.write_text(me + "\n")
         started = time.time()
+        started_mono = time.monotonic()
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
+        dynamic_units = int(meta.get("units") or 0)
+        dynamic_total = int(meta.get("units_total") or dynamic_units)
+        dynamic_warmup = DYNAMIC_WARMUP_S + (300.0 if meta.get("class") == "compile-gui" else 0.0)
+        low_since: float | None = None
         # what the job holds, read only while its Runner.Worker lives: job-completed removes .roots and .gui
         # after finish_sampler's short wait, and once the worker is gone the next job on this runner rewrites them
         holdings = (list(meta.get("roots") or []), bool(meta.get("gui")))
@@ -3636,7 +3755,34 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             try:
                 rows = ps_rows()
                 skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
-                samples.add(load_average(), classify(rows, watch_pid, skip), interval, run_queue(), *host_io())
+                queue = run_queue()
+                disk_busy = host_io()
+                split = classify(rows, watch_pid, skip)
+                samples.add(load_average(), split, interval, queue, *disk_busy)
+                if dynamic_units > 1 and dynamic_total > 1:
+                    now = time.monotonic()
+                    job_cores = split[0]
+                    host_busy = disk_busy[1]
+                    blocked = queue[1] if queue is not None else 0
+                    memory = memory_pressure_level()
+                    thermal = samples.thermal is True
+                    quiet = (now - started_mono >= dynamic_warmup
+                             and job_cores <= max(0.5, dynamic_units * DYNAMIC_LOW_JOB_SHARE)
+                             and (host_busy is None or host_busy < DYNAMIC_TARGET_BUSY_PCT)
+                             and blocked == 0 and (memory is None or memory < 2) and not thermal)
+                    low_since = now if quiet and low_since is None else (low_since if quiet else None)
+                    decision = dynamic_release_decision(now - started_mono, low_since, dynamic_units, dynamic_total,
+                                                        job_cores, host_busy, blocked, memory, thermal)
+                    if decision:
+                        keep, release_reason = decision
+                        request_dynamic_release(state_dir, keep, {"reason": release_reason,
+                                                                 "release_root": meta.get("class") == "compile-gui"})
+                        job_event("capacity_release", meta, log, units_before=dynamic_units,
+                                  units_after=keep, job_cores=round(job_cores, 2),
+                                  host_cpu_busy_pct=host_busy, memory_pressure=memory,
+                                  blocked=blocked, reason=release_reason)
+                        dynamic_units = keep
+                        low_since = None
                 if tick % THERMAL_EVERY == 0:
                     limited = thermal_limited()
                     if limited is not None:
@@ -3699,6 +3845,80 @@ def finish_sampler(state_dir: Path, wait_s: float = 5.0) -> str:
     while pid_alive(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
     return "job telemetry recorded" if not pid_alive(pid) else f"job telemetry sampler {pid} still writing"
+
+
+def leaked_test_app_pids(table: dict[int, tuple[int, str]], ignored_workers: set[int] | None = None) -> list[tuple[int, str]]:
+    """Find exact CI test apps whose process tree and temp tree have no live job owner."""
+    result: list[tuple[int, str]] = []
+    ignored_workers = ignored_workers or set()
+    for pid, (ppid, command) in table.items():
+        match = LEAKED_TEST_APP.search(command)
+        if not match or pid == os.getpid():
+            continue
+        temp = LEAKED_TEST_TEMP.match(match.group(1))
+        if temp:
+            # XCTest may reparent through testmanagerd or launchd. A live job process that still names the
+            # same per-run temp tree is ownership evidence even when the app's parent is pid 1, but only
+            # alongside that runner's live Runner.Worker. A stale command line alone is not ownership.
+            prefix = temp.group(1) + "/"
+            runner_prefix = temp.group(1).split("/_work/", 1)[0]
+            worker = any(other not in ignored_workers and runner_prefix in cmd
+                         and re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", cmd)
+                         for other, (_ppid, cmd) in table.items())
+            if worker and any(other != pid and prefix in cmd and not LEAKED_TEST_APP.search(cmd)
+                              for other, (_ppid, cmd) in table.items()):
+                continue
+        owner = pid
+        owned = False
+        for _ in range(256):
+            if owner <= 1 or owner not in table:
+                break
+            if owner not in ignored_workers and re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", table[owner][1]):
+                owned = True
+                break
+            owner = table[owner][0]
+        if not owned:
+            result.append((pid, match.group(1)))
+    return result
+
+
+def cleanup_leaked_test_apps(ignored_workers: set[int] | None = None) -> list[str]:
+    """Kill orphaned cmux DEV test apps and return bounded receipt lines."""
+    try:
+        found = leaked_test_app_pids(processes(), ignored_workers)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    killed: list[str] = []
+    for pid, path in found:
+        # Re-observe the exact pid and command immediately before each signal. A pid can be reused
+        # between the survey and the kill, and a replacement must never inherit the old verdict.
+        try:
+            current = processes()
+            if (pid, path) not in leaked_test_app_pids(current, ignored_workers):
+                continue
+        except (OSError, subprocess.SubprocessError):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            continue
+        deadline = time.monotonic() + LEAKED_APP_TERM_S
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if pid_alive(pid):
+            try:
+                current = processes()
+                if (pid, path) not in leaked_test_app_pids(current, ignored_workers):
+                    continue
+            except (OSError, subprocess.SubprocessError):
+                continue
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        if not pid_alive(pid):
+            killed.append(f"killed pid {pid} {path}")
+    return killed
 
 
 def find_disk(explicit: str | None) -> str | None:
@@ -4003,6 +4223,10 @@ def main(argv: list[str] | None = None) -> int:
         if telemetry:
             print(f"{PREFIX}: {finish_sampler(args.state_dir)}", flush=True)
         print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
+    if args.phase == "job-completed":
+        current_worker = runner_worker_pid()
+        for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
+            print(f"{PREFIX}: {note}", flush=True)
     if not args.no_disk:
         print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)
     return 0

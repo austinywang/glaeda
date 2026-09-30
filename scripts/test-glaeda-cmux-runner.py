@@ -51,9 +51,10 @@ def load(name: str, path: Path):
 cr = load("glaeda_cmux_runner", ROOT / "scripts" / "glaeda-cmux-runner")
 cr.DARWIN_REQUIRED = False
 cr.ONLINE_WAIT_S = 0
-# The load gate reads this machine's real load, which on a busy test host would hold every gate under test. Pin
-# it out of reach here and in the hooks the tests start; the load test patches the thresholds itself.
+# The pressure gate reads this machine's real iostat/sysctl values. Pin CPU pressure out of reach here and in the
+# hooks the tests start; pressure tests patch the thresholds and samples themselves.
 os.environ["GLAEDA_RUNNER_GATE_LOAD_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_LOAD_RESUME"] = "1000000"
+os.environ["GLAEDA_RUNNER_GATE_CPU_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_CPU_RESUME"] = "1000000"
 # Likewise the console check reads this Mac's real session, which a locked test host would turn into refusals: no
 # ioreg here or in the hooks the tests start (unreadable changes nothing); console tests point it at a fake.
 os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
@@ -203,6 +204,7 @@ def event(tmp: Path, name: str, payload: dict) -> Path:
 
 CMUX = {"full_name": "manaflow-ai/cmux", "fork": False}
 FORK = {"full_name": "someone/cmux", "fork": True}
+TEAMLEADER_FORK = {"full_name": "teamleaderleo/cmux", "fork": True}
 SAMPLE_EVENTS = {
     # name: (GITHUB_EVENT_NAME, payload, admitted)
     "same-repo-pr": ("pull_request", {"repository": CMUX, "pull_request": {
@@ -212,6 +214,11 @@ SAMPLE_EVENTS = {
     "merge-group": ("merge_group", {"repository": CMUX, "merge_group": {"head_ref": "gh-readonly-queue/main/x"}}, True),
     "fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": FORK}, "base": {"repo": CMUX}}}, False),
+    "teamleaderleo-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
+        "head": {"repo": TEAMLEADER_FORK}, "base": {"repo": CMUX}}}, True),
+    "teamleaderleo-fork-wrong-base": ("pull_request", {"repository": CMUX, "pull_request": {
+        "head": {"repo": TEAMLEADER_FORK},
+        "base": {"repo": {"full_name": "manaflow-ai/other", "fork": False}}}}, False),
     "cross-repo-pr-not-flagged-fork": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": {"full_name": "other/cmux", "fork": False}}, "base": {"repo": CMUX}}}, False),
     "deleted-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
@@ -2719,6 +2726,28 @@ ACQUIRE_FAILED = ("[2026-09-28 13:53:13Z ERR  Runner] Caught exception from acqu
                   "System.Net.Http.HttpRequestException: 503\n   at GitHub.Runner.Listener.Runner.RunAsync()\n")
 
 
+class LeakedAppTest(unittest.TestCase):
+    def test_orphaned_test_app_is_selected_but_live_job_app_is_protected(self) -> None:
+        app = "/Users/cmux/actions-runner-glaeda/_work/_temp/cmux-derived-data-tests-123-1-shard-2/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
+        table = {
+            10: (1, app),
+            20: (30, app),
+            30: (1, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient"),
+        }
+        self.assertEqual([pid for pid, _ in hook.leaked_test_app_pids(table)], [10])
+        self.assertEqual([pid for pid, _ in hook.leaked_test_app_pids(table, {30})], [10, 20])
+
+    def test_reparented_app_is_protected_by_live_temp_tree_owner(self) -> None:
+        root = "/Users/cmux/actions-runner-glaeda/_work/_temp/cmux-derived-data-tests-123-1-shard-2"
+        app = root + "/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
+        table = {
+            10: (1, app),
+            40: (1, "/usr/bin/xcodebuild -derivedDataPath " + root + "/Build test-without-building"),
+            50: (1, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient"),
+        }
+        self.assertEqual(hook.leaked_test_app_pids(table), [])
+
+
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -2776,6 +2805,26 @@ class GateTest(unittest.TestCase):
         proc.stdout.readline()
         return proc
 
+    def blocked_opener(self, name: str) -> subprocess.Popen:
+        """A process blocked acquiring LOCK_EX after opening the host lock."""
+        script = self.tmp / name
+        script.write_text(f"import fcntl, time\nf = open({os.fspath(self.lock)!r})\nprint('open', flush=True)\n"
+                          "fcntl.flock(f, fcntl.LOCK_EX)\ntime.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, os.fspath(script)], stdout=subprocess.PIPE)
+        self.addCleanup(proc.kill)
+        proc.stdout.readline()
+        return proc
+
+    def test_lock_waiter_parser_counts_only_a_blocked_exclusive_lock(self) -> None:
+        process_table = """\
+101  hrtimer_nanosleep worker-current
+102  pipe_read          /bin/cat /Users/Shared/cmux-build-fleet/host.lock
+201  locks_lock_inode_wait /usr/local/bin/with-host-lock host.lock
+202  lockf:             /usr/local/bin/with-host-lock host.lock (Darwin flock waiter)
+301  hrtimer_nanosleep /usr/local/bin/with-host-lock host.lock (exclusive holder)
+"""
+        self.assertEqual(hook._blocked_lock_pids(process_table, {102, 201, 202, 301}), {201, 202})
+
     def test_a_free_host_or_our_shared_jobs_leave_the_listener_on(self) -> None:
         self.assertIsNone(self.held())
         self.hold(fcntl.LOCK_SH)  # a PR job's holder
@@ -2794,7 +2843,7 @@ class GateTest(unittest.TestCase):
         self.opener("fill-recipe.py")  # a child of this process with the lock open: the yielding build's own
         hook._gate_yield_verdict.clear()
         self.assertIsNone(self.held())
-        worker = self.opener("with-host-lock.py")
+        worker = self.blocked_opener("with-host-lock.py")
         worker_pid = worker.pid
         with mock.patch.object(hook, "yielding_family", return_value={os.getpid()}):
             hook._gate_yield_verdict.clear()  # another fleet build on the lock: the marker yields nothing
@@ -2813,7 +2862,8 @@ class GateTest(unittest.TestCase):
             self.assertEqual(self.held(), "host reserved by leo")
 
     def test_real_lsof_sees_a_fleet_waiter_but_not_this_hook_in_flight(self) -> None:
-        fleet = self.opener("with-host-lock.py")
+        self.hold(fcntl.LOCK_SH)  # keep the build's LOCK_EX blocked while lsof and ps observe it
+        fleet = self.blocked_opener("with-host-lock.py")
         ours = self.opener("glaeda-cmux-runner-hook-job-started.py")  # another runner's admission
         self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), {fleet.pid})
         real = subprocess.run
@@ -2887,7 +2937,8 @@ class GateTest(unittest.TestCase):
 
     def test_a_saturated_mini_claims_the_host_with_hysteresis(self) -> None:
         pause, resume = 2.0, 1.5
-        for name, value in (("GATE_LOAD_PAUSE", pause), ("GATE_LOAD_RESUME", resume)):
+        for name, value in (("GATE_LOAD_PAUSE", pause), ("GATE_LOAD_RESUME", resume),
+                            ("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0)):
             patcher = mock.patch.object(hook, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -2901,25 +2952,34 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.os, "getloadavg", side_effect=OSError):
             self.assertIsNone(hook.mini_saturated(False), "an unreadable load never saturates")
 
-        load = [pause * 14]
-        patcher = mock.patch.object(hook.os, "getloadavg", side_effect=lambda: (load[0], 0.0, 0.0))
+        busy = [hook.GATE_CPU_PAUSE]
+        patcher = mock.patch.object(hook, "host_io", side_effect=lambda: (0.0, busy[0]))
         patcher.start()
         self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(hook.os, "cpu_count", return_value=14)
+        patcher = mock.patch.object(hook, "memory_pressure_level", return_value=1)
         patcher.start()
         self.addCleanup(patcher.stop)
-        # Full and saturated: the load reason wins, so the resume mark applies.
+        # Full and saturated: the CPU reason wins, so the resume mark applies.
         self.runner_hook(2)
         gate = self.full_gate(self.units(2))
         self.assertTrue(gate.claimed().startswith(hook.SATURATED))
         self.assertTrue(gate.confirmed().startswith(hook.SATURATED))
-        load[0] = (pause + resume) / 2 * 14
+        busy[0] = (hook.GATE_CPU_PAUSE + hook.GATE_CPU_RESUME) / 2
         self.assertTrue(gate.claimed().startswith(hook.SATURATED), "between the marks a held gate stays held")
-        load[0] = resume * 14 - 1
+        busy[0] = hook.GATE_CPU_RESUME - 1
         self.assertEqual(gate.claimed(), "all 2 capacity units on this mini are taken", "then the full reason")
         self.hold(fcntl.LOCK_EX)
-        load[0] = pause * 14
+        busy[0] = hook.GATE_CPU_PAUSE
         self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
+
+    def test_host_pressure_gate_uses_cpu_and_memory_not_load_average(self) -> None:
+        with mock.patch.object(hook, "GATE_CPU_PAUSE", 80.0), mock.patch.object(hook, "GATE_CPU_RESUME", 70.0):
+            self.assertIsNone(hook.host_saturated(False, cpu_busy=59.0, memory_pressure=1))
+            self.assertTrue(hook.host_saturated(False, cpu_busy=80.0, memory_pressure=1).startswith(hook.SATURATED))
+            self.assertTrue(hook.host_saturated(False, cpu_busy=20.0, memory_pressure=2).startswith(hook.SATURATED))
+            self.assertIsNotNone(hook.host_saturated(True, cpu_busy=70.0, memory_pressure=1))
+            self.assertIsNone(hook.host_saturated(True, cpu_busy=69.9, memory_pressure=1))
+            self.assertIsNone(hook.host_saturated(False, cpu_busy=None, memory_pressure=None))
 
     def test_gate_lines_carry_a_utc_stamp_readers_still_match(self) -> None:
         out = io.StringIO()
@@ -2932,15 +2992,16 @@ class GateTest(unittest.TestCase):
         # glaeda-cmux-runner reads the held state by substring, so the stamp keeps it working
         self.assertIn(cr.GATE_HELD, line)
 
-    def test_a_load_hold_ends_after_the_limit_until_the_load_falls(self) -> None:
-        for name, value in (("GATE_LOAD_PAUSE", 2.0), ("GATE_LOAD_RESUME", 1.5), ("GATE_LOAD_MAX_HOLD_S", 60.0)):
+    def test_a_cpu_hold_ends_after_the_limit_until_pressure_falls(self) -> None:
+        for name, value in (("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0),
+                            ("GATE_LOAD_MAX_HOLD_S", 60.0)):
             patcher = mock.patch.object(hook, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        load, clock = [40.0], [1000.0]
+        busy, clock = [80.0], [1000.0]
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
-        with mock.patch.object(hook.os, "getloadavg", side_effect=lambda: (load[0], 0.0, 0.0)), \
-                mock.patch.object(hook.os, "cpu_count", return_value=14), \
+        with mock.patch.object(hook, "host_io", side_effect=lambda: (0.0, busy[0])), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1), \
                 mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]), \
                 mock.patch.object(hook, "gate_log") as log:
             self.assertIsNotNone(gate.claimed())
@@ -2951,9 +3012,9 @@ class GateTest(unittest.TestCase):
             self.assertIn("longer than any compile", log.call_args[0][0])
             clock[0] += 600
             self.assertIsNone(gate.claimed(), "still waived while the load stays up")
-            load[0] = 10.0
+            busy[0] = 60.0
             self.assertIsNone(gate.claimed())
-            load[0] = 40.0
+            busy[0] = 80.0
             self.assertIsNotNone(gate.claimed(), "a fresh overload holds again")
             # A fleet claim in between restarts the clock: the limit times a load pause, not the fleet's.
             clock[0] += 50
@@ -2965,14 +3026,14 @@ class GateTest(unittest.TestCase):
             self.assertIsNotNone(gate.claimed())
 
     def test_a_saturated_mini_stops_an_idle_listener_through_step(self) -> None:
-        for name, value in (("GATE_LOAD_PAUSE", 2.0), ("GATE_LOAD_RESUME", 1.5)):
+        for name, value in (("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0)):
             patcher = mock.patch.object(hook, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        load = [40.0]
+        busy = [80.0]
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
-        with mock.patch.object(hook.os, "getloadavg", side_effect=lambda: (load[0], 0.0, 0.0)), \
-                mock.patch.object(hook.os, "cpu_count", return_value=14), \
+        with mock.patch.object(hook, "host_io", side_effect=lambda: (0.0, busy[0])), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1), \
                 mock.patch.object(gate, "start") as start, mock.patch.object(gate, "stop") as stop, \
                 mock.patch.object(gate, "busy", return_value=False), mock.patch.object(gate, "reload"):
             gate.child = mock.Mock(poll=mock.Mock(return_value=None))
@@ -2981,11 +3042,11 @@ class GateTest(unittest.TestCase):
             stop.assert_called_once()
             self.assertTrue(stop.call_args[0][0].startswith(hook.SATURATED))
             gate.child, gate.held = None, stop.call_args[0][0]
-            load[0] = 25.0  # below pause, above resume: stays off
+            busy[0] = 75.0  # below pause, above resume: stays off
             for _ in range(3):
                 gate.step()
             start.assert_not_called()
-            load[0] = 20.0
+            busy[0] = 60.0
             for _ in range(hook.GATE_CONFIRM):
                 gate.step()
             start.assert_called_once()
@@ -4028,7 +4089,7 @@ class RunnerTest(unittest.TestCase):
             tree.pop(".local/state/glaeda/cmux-runner/receipt.json")
         self.assertEqual(before, after)
 
-    def test_installed_wrapper_hooks_refuse_fork_prs(self) -> None:
+    def test_installed_wrapper_hooks_allow_only_teamleaderleo_fork_prs(self) -> None:
         self.invoke("--apply")
         hooks = self.home / "actions-runner-glaeda/glaeda-hooks"
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
@@ -5378,6 +5439,14 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(by_runner, {"actions-runner-glaeda-2": 3.005})
         self.assertEqual(set(by_outside), {"zig (cmux)", "mds_stores (root)"})
         self.assertFalse(any("/" in key for key in by_outside), "no paths leave the host")
+
+    def test_dynamic_release_needs_sustained_quiet_headroom(self) -> None:
+        decide = self.hook.dynamic_release_decision
+        self.assertIsNone(decide(100, 20, 2, 5, 0.8, 55, 0, 1, False))
+        self.assertEqual(decide(200, 120, 2, 5, 0.8, 55, 0, 1, False)[0], 1)
+        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 85, 0, 1, False))
+        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 1, 1, False))
+        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 0, 2, False))
 
     def test_summary_flags_outside_cpu_not_its_own_load(self) -> None:
         samples = self.hook.JobSamples({"job": "macos-compile-admission"}, 14, 1000.0)

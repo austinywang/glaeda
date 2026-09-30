@@ -54,8 +54,8 @@ uses it, it is not its platform's newest, it went unused for RUNTIME_IDLE_DAYS a
 booted (simctl runtime delete restarts CoreSimulatorService). Xcode copies are never deleted.
 
 On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
-tier, evicted LRU under pressure: parked pull request builds idle over an hour, seeds other than each
-root's newest two current ones, and a root's kept build once the root has been idle two days. On the
+tier, evicted LRU under pressure: parked pull request builds unused for 30 minutes, seeds other than each
+root's newest one under pressure (two during idle sweeps), and a root's kept build once the root has been idle two days. On the
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
 reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
 SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
@@ -108,6 +108,9 @@ from pathlib import Path
 HOME = Path.home()
 SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
 DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+MEASURE_LOCK = HOME / ".cache/glaeda-disk/measure.lock"
+ACCOUNTING = HOME / ".cache/glaeda-disk/accounting.json"
+HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.json"
 EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (the runner hooks and the LaunchAgent)
 # Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
 # re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
@@ -153,6 +156,7 @@ class Family:
     discover: bool = False
     # candidates are the build outputs inside the checkouts under root (checkout_builds), not root's children
     checkout_builds: bool = False
+    retired_only: bool = False  # reclaim only with fresh evidence the declared service is unloaded
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -198,7 +202,7 @@ def fleet_stores(ci: Path | None = None) -> list[Path]:
                         if p.name[len("cmux-ci-"):].isdigit() and p.is_dir() and not p.is_symlink())]
 
 
-FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build")
+FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data")
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:
@@ -401,6 +405,7 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "emergency": "10%:30-60",
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
+    "pressure_idle_hours": 0.5,
     "pressure_jobs": 80,
     "min_jobs": 6,
     "sweep_jobs": 190,
@@ -510,16 +515,19 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
     which the old defer-while-CI-runs rule covered. Its own run counts toward jobs_since, so without
     this a job could age the seed it started from past pressure_jobs."""
     jobs = jobs_since_use(fam, idle_hours)
+    if ACTIVITY_MODE == "pressure" and fam.id in FLEET_FAMILY_IDS:
+        # Pressure spends disposable hot state until the free target, even on a quiet host.
+        # A running job may touch a source between commands; cwd, command-line, socket and job-unit
+        # checks preserve that veto. Do not use the job's age as a blanket six-hour retention window.
+        return idle_hours >= POLICY["pressure_idle_hours"], jobs
     if jobs is None and fam.id == "cmux-pr-builds":
         return False, None
     if jobs is None or ACTIVITY_MODE is None:
         return idle_hours >= window, jobs
     if idle_hours <= running_job_hours():
         return False, jobs
-    if ACTIVITY_MODE == "sweep":
-        return (jobs >= POLICY["sweep_jobs"]
-                or (idle_hours >= POLICY["soft_idle_hours"] and jobs >= POLICY["pressure_jobs"])), jobs
-    return jobs >= POLICY["pressure_jobs"] or (idle_hours >= window and jobs >= POLICY["min_jobs"]), jobs
+    return (jobs >= POLICY["sweep_jobs"]
+            or (idle_hours >= POLICY["soft_idle_hours"] and jobs >= POLICY["pressure_jobs"])), jobs
 
 
 def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
@@ -750,8 +758,9 @@ def seed_verdict(path: Path) -> str:
                 current.append((c.stat(follow_symlinks=False).st_mtime, c.name))
             except OSError:
                 continue
-    newest = {name for _, name in sorted(current, reverse=True)[:SEED_KEEP]}
-    return f"one of its root's newest {SEED_KEEP} current seeds" if path.name in newest else ""
+    keep = 1 if ACTIVITY_MODE == "pressure" else SEED_KEEP
+    newest = {name for _, name in sorted(current, reverse=True)[:keep]}
+    return f"one of its root's newest {keep} current seeds" if path.name in newest else ""
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -944,8 +953,8 @@ def default_families() -> list[Family]:
     # The dev-build worker's shared cache (the cmuxterm-hq controller's worker, live only on the dev-build worker
     # host since cmuxterm-hq#661): visible with its owner, never deleted here. When the worker is unloaded the
     # report says so, since other tools may still read parts of it (2026-09-24).
-    fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), False,
-                       "report only: the dev-build worker's shared cache",
+    fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), True,
+                       "the retired dev-build worker rebuilds its cache", retired_only=True,
                        owner="cmux dev-build worker (hq controller)",
                        owner_job="system/ai.manaflow.cmux-build-worker"))
     bazel_user = ""
@@ -955,6 +964,12 @@ def default_families() -> list[Family]:
         fams.append(bazel_family(Path(f"/private/var/tmp/_bazel_{bazel_user}")))
     if DARWIN:  # the owned cmux minis
         fams += fleet_families()
+        for runner in HOME.glob("actions-runner*"):
+            temp = runner / "_work/_temp"
+            if (runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir() and temp.is_dir():
+                fams.append(Family("ci-derived-data", temp, True, "the CI test job rebuilds it",
+                                   include=("cmux-derived-data-tests-",), build_output=True,
+                                   owner="cmux CI test jobs", rebuild_minutes=6))
         # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
         fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
                            "report only: its owner evicts LRU to a 24 GiB budget",
@@ -1001,9 +1016,9 @@ def du_children(root: Path) -> dict[str, int]:
     out = subprocess.run(["du", "-xk", "-d", "1", str(root)], capture_output=True, text=True)
     sizes: dict[str, int] = {}
     for line in out.stdout.splitlines():
-        size, _, path = line.partition("\t")
-        if path and path != str(root) and size.isdigit():
-            sizes[str(root / Path(path).name)] = int(size) * 1024
+        fields = line.split(None, 1)
+        if len(fields) == 2 and fields[1] != str(root) and fields[0].isdigit():
+            sizes[str(root / Path(fields[1]).name)] = int(fields[0]) * 1024
     return sizes
 
 
@@ -2258,19 +2273,32 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
     return {k: v for k, v in known.items() if not candidate_of_selected(k)}
 
 
-def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
+def load_snapshot_meta(path: Path = SNAPSHOT) -> tuple[float, dict[str, int], dict[str, float]]:
     try:
         doc = json.loads(path.read_text())
-        return float(doc["at"]), {k: int(v) for k, v in doc["sizes"].items()}
+        sizes = {k: int(v) for k, v in doc["sizes"].items()}
+        at = float(doc["at"])
+        measured = doc.get("measured_at") if isinstance(doc.get("measured_at"), dict) else {}
+        times = {k: float(v) for k, v in measured.items() if k in sizes and isinstance(v, (int, float))}
+        return at, sizes, times
     except (OSError, ValueError, KeyError, TypeError):
-        return 0.0, {}
+        return 0.0, {}, {}
 
 
-def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT, at: float | None = None) -> None:
-    """`at` is when the oldest size was measured; only a full measurement moves it to now."""
+def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
+    at, sizes, _ = load_snapshot_meta(path)
+    return at, sizes
+
+
+def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT, at: float | None = None,
+                  measured_at: dict[str, float] | None = None) -> None:
+    """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"at": time.time() if at is None else at, "sizes": sizes}))
+    payload = {"at": time.time() if at is None else at, "sizes": sizes}
+    if measured_at is not None:
+        payload["measured_at"] = {k: v for k, v in measured_at.items() if k in sizes}
+    tmp.write_text(json.dumps(payload))
     os.replace(tmp, path)
 
 
@@ -2348,6 +2376,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
         if not fam.reclaimable:
+            verdict = "report-only"
+        elif reasons:
+            verdict = "in-use"
+        elif fam.retired_only and not owner_retired(fam):
             verdict = "report-only"
         elif keep:
             verdict = "kept"
@@ -2506,14 +2538,105 @@ def gib(n: int) -> str:
     return f"{n / GIB:6.1f}G"
 
 
+ACCOUNTING_MAX_AGE_S = 6 * 3600
+_ACCOUNTING_MEM: dict[tuple[int, str], list[dict[str, Any]]] = {}
+
+
+def _accounting_cache() -> dict[str, Any]:
+    try:
+        doc = json.loads(ACCOUNTING.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, Any]]:
+    """Show df-used minus catalogued bytes and bounded top-level volume usage.
+
+    The top-level walk is cached for six hours. Item sizes stay the authoritative measured catalog;
+    this report deliberately calls out anything the catalog does not own so a zero reclaimable result
+    cannot hide a full volume.
+    """
+    cached = _accounting_cache()
+    now = time.time()
+    out: list[dict[str, Any]] = []
+    cache_records: dict[str, dict[str, Any]] = {}
+    for fs in fss:
+        key = str(fs.dev)
+        hit = cached.get(key) if isinstance(cached.get(key), dict) else None
+        mem = _ACCOUNTING_MEM.get((fs.dev, fs.mount))
+        if mem is not None:
+            top = mem
+            top_at = float(hit.get("at", 0)) if hit else 0.0
+        elif not DARWIN:
+            # Linux test and development hosts do not need a / walk for the macOS mini report.
+            top = []
+            top_at = now
+        elif hit and now - float(hit.get("at", 0)) < ACCOUNTING_MAX_AGE_S and hit.get("mount") == fs.mount:
+            top = hit.get("top_level") if isinstance(hit.get("top_level"), list) else []
+            top_at = float(hit.get("at", 0))
+        else:
+            top_map = du_children(Path(fs.mount))
+            top = [{"path": p, "bytes": n} for p, n in sorted(top_map.items(), key=lambda kv: -kv[1])[:32]]
+            top_at = now
+        _ACCOUNTING_MEM[(fs.dev, fs.mount)] = top
+        measured = 0
+        catalogued: list[tuple[Path, int]] = []
+        for i in items:
+            try:
+                if Path(i.path).stat().st_dev == fs.dev:
+                    catalogued.append((Path(i.path), i.bytes))
+            except OSError:
+                continue
+        # A parent catalog item already includes every nested item. Count only the highest-level path
+        # in each overlapping set so the unmeasured figure remains an accounting gap, not an overlap artifact.
+        selected: list[Path] = []
+        for path, size in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
+            if any(path == parent or parent in path.parents for parent in selected):
+                continue
+            selected.append(path)
+            measured += size
+        used = max(0, fs.total - fs.free)
+        entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
+                 "unmeasured": max(0, used - measured), "top_level": top}
+        out.append(entry)
+        cache_records[str(fs.dev)] = {**entry, "at": top_at}
+    try:
+        ACCOUNTING.parent.mkdir(parents=True, exist_ok=True)
+        ACCOUNTING.write_text(json.dumps(cache_records))
+    except OSError:
+        pass
+    return out
+
+
+def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict[str, Any]]) -> None:
+    """Write the bounded local summary consumed by mini-health and ci-dash's Health row."""
+    try:
+        HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"schema": "glaeda-disk/v1", "at": int(time.time()),
+                   "reclaimable": sum(i.bytes for i in items if i.verdict == "reclaimable"),
+                   "accounting": [dict(x) for x in accounting],
+                   "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
+                                    "under": x.under} for x in fss]}
+        tmp = HEALTH_SUMMARY.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp, HEALTH_SUMMARY)
+    except OSError:
+        pass
+
+
 def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
-           notes: dict[str, str] | None = None, fams: dict[str, Family] | None = None) -> None:
+           notes: dict[str, str] | None = None, fams: dict[str, Family] | None = None,
+           accounting: list[dict[str, Any]] | None = None) -> None:
     for fs in fss:
         print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
               f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
               f"{gib(fs.low).strip()}{' (tmpfs: RAM and swap)' if fs.tmpfs else ''}"
               f"{' (under pressure)' if fs.under else ''}")
     print(f"idle window {idle_hours:g}h\n")
+    for a in accounting or []:
+        print(f"unmeasured {gib(a['unmeasured']).strip()} on {a['mount']} "
+              f"(df used {gib(a['used']).strip()}, measured {gib(a['measured']).strip()})")
     by_fam: dict[str, int] = {}
     for i in items:
         by_fam[i.family] = by_fam.get(i.family, 0) + i.bytes
@@ -2586,8 +2709,12 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     cwds = open_index(cwds)
     lsof_at, lsof_items = time.monotonic(), 0
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
-    # cheapest loss per byte first, not simply largest first
-    for i in sorted(items, key=lambda i: value(i, families[i.family]), reverse=True):
+    # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
+    def order(i):
+        if ACTIVITY_MODE == "pressure" and i.family in FLEET_FAMILY_IDS:
+            return (1, i.jobs_since if i.jobs_since is not None else -1, i.idle_hours, i.bytes)
+        return (0, value(i, families[i.family]), 0, 0)
+    for i in sorted(items, key=order, reverse=True):
         if i.verdict != "reclaimable":
             continue
         p = Path(i.path)
@@ -2604,6 +2731,15 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
+        if families[i.family].id in FLEET_FAMILY_IDS:
+            # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
+            # before each rename. A job may start using a candidate after the survey or during a long pass.
+            try:
+                opened, cmds = process_evidence()
+            except NoEvidence as e:
+                print(f"refusing to delete the rest: {e}", file=sys.stderr)
+                break
+            cwds = open_index(opened)
         if families[i.family].build_output and families[i.family].root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
         fresh_layout = ""
@@ -2627,7 +2763,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 if not cmds:
                     print("refusing to delete the rest: ps failed", file=sys.stderr)
                     break
-        if families[i.family].discover and not fresh_layout:
+        if families[i.family].retired_only and not owner_retired(families[i.family]):
+            outcome = "changed:owner-loaded"
+        elif families[i.family].discover and not fresh_layout:
             outcome = "changed:layout"
         elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
@@ -2639,7 +2777,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:modified"
         elif keep_verdict(families[i.family], p):
             outcome = "changed:kept"
-        elif families[i.family].discover and git_state(p, sealed=True) != "none":
+        elif not derived_data(families[i.family], p) and not families[i.family].git_disposable and family_git_state(families[i.family], p) != "none":
             outcome = "changed:git"  # a clone appeared at the top of the cache since the survey
         elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
               and (g := family_git_state(families[i.family], p)) != "none"
@@ -2931,24 +3069,50 @@ def main(argv: list[str] | None = None) -> int:
             print("another eviction running; skipped")
             return 0
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
-    at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
+    at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
+    original_known = set(known)
     if a.apply:
-        # sizes decide what gets deleted under pressure, so never trust stale ones there
+        # sizes decide what gets deleted under pressure, so never trust stale candidate sizes
         known = fresh_for_apply(known, fams)
+    now = time.time()
+    stale_s = a.max_age * 60
+    if a.pressure:
+        # A pressure decision must not be based on a report-only item measured hours ago.
+        known = {k: v for k, v in known.items() if now - measured_at.get(k, at) <= stale_s}
     known = {k: v for k, v in known.items() if os.path.lexists(k)}
+    dropped_for_measurement = original_known - set(known)
+    known_before = set(known)
     before = len(known)
+    measure_lock = None
+    try:
+        MEASURE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        measure_lock = MEASURE_LOCK.open("a")
+        fcntl.flock(measure_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if a.pressure or a.refresh:
+            print("another measurement running; skipped")
+            return 0
+        measure_lock = None
     items = survey(fams, idle, a.min_mib * 1024**2, known, defer_bulk=bool(at) and not a.apply)
+    # Release the measurement lock before starting a background refresh. The child must be able to
+    # acquire it, otherwise every stale report spawns a refresh that immediately skips.
+    if measure_lock is not None:
+        measure_lock.close()
+        measure_lock = None
+    fresh_paths = dropped_for_measurement | (set(known) - known_before)
     age_min = (time.time() - at) / 60 if at else 0.0
     if not a.no_snapshot:
         lock = SNAPSHOT.with_suffix(".refreshing")
         if a.refresh:
-            # merge, so a --family refresh keeps the other families' sizes
-            save_snapshot({**load_snapshot()[1], **known})
+            old_at, old_sizes, old_times = load_snapshot_meta()
+            merged = {**old_sizes, **known}
+            save_snapshot(merged, measured_at={**old_times, **{k: time.time() for k in known}})
             lock.unlink(missing_ok=True)
-        elif not at or len(known) != before or a.apply:
-            # adding a few new paths does not make the old sizes fresh: keep their stamp, so the
-            # background refresh still comes due (a status probe that runs often must not defer it)
-            save_snapshot(known, at=at or None)
+        elif not at or len(known) != before or a.apply or fresh_paths:
+            # Keep the global stamp old until every item has been refreshed, while recording exact item times.
+            updated_times = {k: v for k, v in measured_at.items() if k in known}
+            updated_times.update({k: time.time() for k in fresh_paths})
+            save_snapshot(known, at=at or None, measured_at=updated_times)
         if at and age_min > a.max_age and not a.apply and not _fresh(lock, 600):
             lock.touch()
             subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
@@ -2960,18 +3124,21 @@ def main(argv: list[str] | None = None) -> int:
               f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
               " verdicts are live\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
+    accounting = filesystem_accounting(shown, items)
+    write_health_summary(shown, items, accounting)
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) if sweep and DARWIN else []
     if a.json:
         print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
                           "tooling": [asdict(i) for i in tooling],
                           "filesystems": [asdict(fs) for fs in shown],
+                          "accounting": accounting,
                           "owners": {f.id: {"owner": f.owner, "retired": owner_retired(f)}
                                      for f in fams if f.owner},
                           "items": [asdict(i) for i in items]}, indent=2))
     else:
         report(items, shown, a.top, idle,
-               {f.id: f.rebuild for f in fams if f.id == "cargo-target"}, {f.id: f for f in fams})
+               {f.id: f.rebuild for f in fams if f.id == "cargo-target"}, {f.id: f for f in fams}, accounting)
         if tooling:
             print("\nXcode copies and simulator runtimes")
         for t in tooling:
