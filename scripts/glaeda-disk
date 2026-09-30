@@ -308,6 +308,11 @@ def idle_families(fams: list[Family]) -> list[Family]:
 # without a job log keeps the wall-clock windows. Every threshold is a key of DISK_POLICY.
 DISK_POLICY = HOME / ".config/glaeda/disk-policy.json"
 POLICY_DEFAULTS: dict[str, Any] = {
+    "low": "25%:60-200",
+    "target": "35%:100-350",
+    "emergency": "10%:30-60",
+    "low_margin_gib": 4.0,
+    "target_margin_gib": 20.0,
     "pressure_jobs": 80,
     "min_jobs": 6,
     "sweep_jobs": 190,
@@ -332,8 +337,12 @@ def disk_policy(path: Path | None = None) -> dict[str, Any]:
             if isinstance(default, bool):
                 if isinstance(value, bool):
                     policy[key] = value
+            elif isinstance(default, str):
+                if isinstance(value, str) and value:
+                    policy[key] = value
             elif isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-                policy[key] = type(default)(value)
+                if math.isfinite(value):
+                    policy[key] = type(default)(value)
     return policy
 
 
@@ -2307,13 +2316,13 @@ def ci_jobs() -> list[str]:
 
 
 def emergency_bytes(fs: "Fs", emergency: str, floor_gib: float = 0.0) -> int:
-    """The emergency floor on fs: --emergency, lifted on HOME's volume to RUNNER_FLOOR_TARGET_GIB above a
+    """The emergency floor on fs: --emergency, lifted on HOME's volume to target_margin_gib above a
     runner's disk floor. A busy mini always has a job running, so below this is the only place pressure
     deletes happen; under the gate's floor they would wait until the runners stopped taking jobs
     (cmux9s, 2026-09-27: every run deferred at 71 GiB free, emergency 46 GiB, floor 50 GiB)."""
     n = space(emergency, fs.total)
     if floor_gib > 0 and not fs.tmpfs and fs.dev == HOME.stat().st_dev:
-        n = max(n, min(int((floor_gib + RUNNER_FLOOR_TARGET_GIB) * GIB), fs.total // 2))
+        n = max(n, min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), fs.total // 2))
     return n
 
 
@@ -2325,7 +2334,7 @@ def ci_defer(fss: dict[int, Fs], jobs: list[str], emergency: str, floor_gib: flo
         return ""
     if any(fs.under and fs.free < emergency_bytes(fs, emergency, floor_gib) for fs in fss.values()):
         return ""
-    return f"deferred: a CI job is running ({jobs[0]}); pressure deletes wait unless free drops below {emergency} or {RUNNER_FLOOR_TARGET_GIB:g} GiB above a runner floor"
+    return f"deferred: a CI job is running ({jobs[0]}); pressure deletes wait unless free drops below {emergency} or {POLICY['target_margin_gib']:g} GiB above a runner floor"
 
 
 def mount_point(path: Path) -> Path:
@@ -2354,9 +2363,7 @@ class Fs:
 # A glaeda runner's listener gate holds the runner while free disk is under its job-started hook's --min-free-gib,
 # and resumes only GATE_DISK_RESUME_GIB (2 GiB) above it. Pressure on a disk must start by then, or a 460 GiB mini
 # between the default low (25%:60-200, about 115 GiB) and a 150 GiB floor stays held with nothing freed. The
-# target sits RUNNER_FLOOR_TARGET_GIB higher, so one run lifts the mini well clear of the floor.
-RUNNER_FLOOR_LOW_GIB = 4.0
-RUNNER_FLOOR_TARGET_GIB = 20.0
+# target sits target_margin_gib higher, so one run lifts the mini well clear of the floor.
 RUNNER_HOOKS = "actions-runner*/glaeda-hooks/job-started.sh"  # glaeda-cmux-runner's default --runner-dir
 MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"  # the hook's min_free_gib reads the same
 
@@ -2388,8 +2395,8 @@ def filesystems(fams: list[Family], low: str, target: str,
             # a runner's disk floor (runner_floor_gib) lifts both on HOME's volume, where the gate measures it,
             # never past half the disk, as space() keeps a small disk from permanent pressure
             if floor_gib > 0 and not tmpfs and dev == HOME.stat().st_dev:
-                lo_b = max(lo_b, min(int((floor_gib + RUNNER_FLOOR_LOW_GIB) * GIB), total // 2))
-                tg_b = max(tg_b, min(int((floor_gib + RUNNER_FLOOR_TARGET_GIB) * GIB), total // 2))
+                lo_b = max(lo_b, min(int((floor_gib + POLICY["low_margin_gib"]) * GIB), total // 2))
+                tg_b = max(tg_b, min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2))
             out[dev] = Fs(dev, str(mount_point(f.root)), free, total, lo_b, tg_b, tmpfs)
     return out
 
@@ -2699,10 +2706,10 @@ def main(argv: list[str] | None = None) -> int:
                          "window whatever the free space; with --pressure, only when there is no pressure, "
                          "at most hourly")
     # Air Blue sat at 3-7% free for a day with the old 15%/25%: act earlier and free more per run
-    ap.add_argument("--low", default="25%:60-200",
+    ap.add_argument("--low", default=POLICY["low"],
                     help="pressure threshold per filesystem: GiB free, N%% of its size, or "
                          "N%%:LO-HI to hold that share between LO and HI GiB (default %(default)s)")
-    ap.add_argument("--target", default="35%:100-350",
+    ap.add_argument("--target", default=POLICY["target"],
                     help="stop freeing at this much free, same forms (default %(default)s)")
     ap.add_argument("--tmpfs-low", default="75%",
                     help="pressure threshold for a tmpfs, whose files live in RAM and swap "
@@ -2710,14 +2717,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tmpfs-target", default="90%",
                     help="stop freeing a tmpfs at this much free (default %(default)s)")
     # One cold cmux job can write 10-36 GiB between two 15-minute runs, so the floor sits well above empty.
-    ap.add_argument("--emergency", default="10%:30-60",
+    ap.add_argument("--emergency", default=POLICY["emergency"],
                     help="with --pressure --apply: delete even while a CI job runs once free space is "
                          "below this, same forms as --low (default %(default)s)")
     ap.add_argument("--floor-gib", type=float, default=0.0,
                     help="a runner disk floor to honour besides the ones read from runner hooks (runner_floor_gib): "
                          "the runner hook passes its own --min-free-gib when it evicts before refusing a job")
     ap.add_argument("--need", type=float, default=None,
-                    help="make room for this many GiB before a job; derives floor+4 and floor+20 thresholds")
+                    help="make room for this many GiB before a job; derives thresholds from the policy margins")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -2742,8 +2749,8 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isfinite(a.need) or a.need <= 0:
             ap.error("--need must be a positive GiB value")
         a.floor_gib = max(a.floor_gib, a.need)
-        a.low = f"{a.need + RUNNER_FLOOR_LOW_GIB:g}"
-        a.target = f"{a.need + RUNNER_FLOOR_TARGET_GIB:g}"
+        a.low = f"{a.need + POLICY['low_margin_gib']:g}"
+        a.target = f"{a.need + POLICY['target_margin_gib']:g}"
 
     fams = default_families()
     for ov in a.root_override:

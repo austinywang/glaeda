@@ -1776,5 +1776,26 @@ class ActivityClockTest(unittest.TestCase):
         policy.write_text("[")
         self.assertEqual(gd.disk_policy(policy), gd.POLICY_DEFAULTS)
 
+    def test_fleet_disk_thresholds_override_defaults_and_need_margins(self) -> None:
+        policy = self.dir / "disk-policy.json"
+        policy.write_text('{"low":"54","target":"70","emergency":"50",'
+                          '"low_margin_gib":5,"target_margin_gib":21}')
+        settings = gd.disk_policy(policy)
+        self.assertEqual((settings["low"], settings["target"], settings["emergency"]),
+                         ("54", "70", "50"))
+        seen: list[tuple[str, str, float]] = []
+
+        def fss(*args: object) -> dict:
+            seen.append((args[1], args[2], args[-1]))
+            return {}
+
+        with mock.patch.object(gd, "POLICY", settings), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
+                mock.patch.object(gd, "filesystems", side_effect=fss), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--pressure", "--no-snapshot"])
+            gd.main(["--pressure", "--need", "50", "--no-snapshot"])
+        self.assertEqual(seen, [("54", "70", 30.0), ("55", "71", 50.0)])
+
 if __name__ == "__main__":
     unittest.main()
