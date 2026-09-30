@@ -170,6 +170,9 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(policy["disk"]["min_free_gib"], 40)
         self.assertEqual(policy["macos"]["major"], 26)
 
+    def test_example_upgrade_disk_floor_matches_observed_upgrade_need(self) -> None:
+        self.assertEqual(self.manifest["defaults"]["disk"]["min_free_gib"], 30)
+
 
 class ClassAndPoolTests(unittest.TestCase):
     def setUp(self) -> None:

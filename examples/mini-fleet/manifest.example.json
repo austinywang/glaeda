@@ -100,7 +100,7 @@
       ]
     },
     "disk": {
-      "min_free_gib": 100
+      "min_free_gib": 30
     },
     "controller_token": "present",
     "toolchain": {
