@@ -203,6 +203,7 @@ def event(tmp: Path, name: str, payload: dict) -> Path:
 
 CMUX = {"full_name": "manaflow-ai/cmux", "fork": False}
 FORK = {"full_name": "someone/cmux", "fork": True}
+TEAMLEADER_FORK = {"full_name": "teamleaderleo/cmux", "fork": True}
 SAMPLE_EVENTS = {
     # name: (GITHUB_EVENT_NAME, payload, admitted)
     "same-repo-pr": ("pull_request", {"repository": CMUX, "pull_request": {
@@ -212,6 +213,8 @@ SAMPLE_EVENTS = {
     "merge-group": ("merge_group", {"repository": CMUX, "merge_group": {"head_ref": "gh-readonly-queue/main/x"}}, True),
     "fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": FORK}, "base": {"repo": CMUX}}}, False),
+    "teamleaderleo-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
+        "head": {"repo": TEAMLEADER_FORK}, "base": {"repo": CMUX}}}, True),
     "cross-repo-pr-not-flagged-fork": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": {"full_name": "other/cmux", "fork": False}}, "base": {"repo": CMUX}}}, False),
     "deleted-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
@@ -3984,7 +3987,7 @@ class RunnerTest(unittest.TestCase):
             tree.pop(".local/state/glaeda/cmux-runner/receipt.json")
         self.assertEqual(before, after)
 
-    def test_installed_wrapper_hooks_refuse_fork_prs(self) -> None:
+    def test_installed_wrapper_hooks_allow_only_teamleaderleo_fork_prs(self) -> None:
         self.invoke("--apply")
         hooks = self.home / "actions-runner-glaeda/glaeda-hooks"
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():

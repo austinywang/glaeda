@@ -11,8 +11,9 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
   * the event is not one of ADMITTED_EVENTS (so issue_comment, check_run, check_suite,
     pull_request_target and anything new are refused; --allow-event adds more)
   * the event is pull_request_target
-  * the event carries a pull_request whose head repository is a fork, is missing, or differs
-    from the base repository (covers pull_request, pull_request_review, and friends)
+  * the event carries a pull_request whose head repository is an unapproved fork, is missing, or differs
+    from the base repository (covers pull_request, pull_request_review, and friends); teamleaderleo/cmux is the
+    one approved fork
   * the event name starts with pull_request but the payload has no pull_request object
   * a workflow_run was triggered from a different head repository
   * the repository is not in the allowlist baked in at install time
@@ -637,6 +638,8 @@ GIT = shutil.which("git") or "/usr/bin/git"
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
+# The only fork trusted to run on the PR minis. Keep this a single narrow allowlist; add team accounts deliberately.
+ALLOWED_FORK_REPOS = frozenset({"teamleaderleo/cmux"})
 PREFIX = "glaeda-cmux-runner-hook"
 # listen: the runner LaunchAgent runs run.sh under this gate. While the fleet holds or wants the host
 # (an exclusive host lock, a process waiting for it, or a reservation), an idle runner stops listening,
@@ -719,10 +722,11 @@ def decide(event_name: str | None, event: Any, repository: str | None,
         base = (pr.get("base") or {}).get("repo") if isinstance(pr.get("base"), dict) else None
         if not isinstance(head, dict):
             return False, "pull request head repository is missing (deleted fork?)"
-        if head.get("fork") is True:
-            return False, f"fork pull request from {head.get('full_name')}"
         head_name, base_name = _repo_name(head), _repo_name(base)
-        if head_name is None or base_name is None or head_name != base_name:
+        allowed_fork = head.get("fork") is True and head_name in ALLOWED_FORK_REPOS
+        if head.get("fork") is True and not allowed_fork:
+            return False, f"fork pull request from {head.get('full_name')}"
+        if head_name is None or base_name is None or (head_name != base_name and not allowed_fork):
             return False, f"cross-repository pull request ({head_name} into {base_name})"
 
     if event_name == "workflow_run":
