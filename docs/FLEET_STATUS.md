@@ -112,7 +112,9 @@ The `disk` probe reads, per member:
   age far past any snapshot, so a status probe never starts glaeda-disk's
   background re-measure; `sizes_at` says how old the sizes are. Item paths never
   leave the member: only family totals do. `cache_bytes` leaves out
-  `cargo-target`, which is also counted inside its checkout.
+  `cargo-target`, which is also counted inside its checkout. The JSON also carries
+  `accounting`: df-used, measured bytes, unmeasured bytes, and a cached top-level
+  volume walk, so a zero reclaimable total still exposes space outside the catalog.
 - the last 48 lines of `~/Library/Logs/glaeda-fleet-cas-prune.jsonl`: the newest
   line (result, role, node store and local CAS bytes) and the newest line with a
   gc outcome (gc runs once a day; `not due` is not an outcome) with the dry run's

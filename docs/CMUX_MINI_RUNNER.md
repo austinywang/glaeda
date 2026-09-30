@@ -185,7 +185,10 @@ What `--apply` does:
      admission set when take-root `--switch` changed it. With telemetry off
      (`--no-telemetry`, `GLAEDA_RUNNER_TELEMETRY=0`) no lines are written.
    - job-completed stops the sampler (it writes the job's line), releases the host lock
-     (or the capacity share), runs the same disk pressure pass and always exits 0.
+     (or the capacity share), kills orphaned `cmux DEV.app` processes whose executable was
+     under a finished runner `_work/_temp/cmux-derived-data-tests-*` directory, runs the same
+     disk pressure pass and always exits 0. The two-minute `glaeda-mini-health` agent repeats
+     that ownership check when a post-job hook was skipped.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
    (runs `glaeda-hooks/listen.sh`, restarts on crash, logs to
    `~/Library/Logs/glaeda-cmux-runner.log`). `listen.sh` runs `run.sh` under the listener
@@ -263,8 +266,10 @@ What `--apply` does:
      (`defer_during_ci`, default false in `~/.config/glaeda/disk-policy.json`): a busy mini frees
      space while jobs run, holding only what a job uses. cmux CI's hot tier (parked PR builds,
      seeds, kept builds) ages in host CI jobs since last use rather than hours: under pressure an
-     item goes after `pressure_jobs` (80) jobs, or past its family window with `min_jobs` (6); the
-     idle sweep after `sweep_jobs` (190), or 24 h idle with 80 jobs since. From 11,393 job starts
+     item used in the last 30 minutes stays; older parked PR builds and other reproducible hot
+     state are then ranked by reuse distance and idle time until the target is reached. Pressure
+     keeps one current seed per root; an idle sweep keeps two and uses the activity thresholds.
+     From 11,393 job starts
      on 13 minis (2026-09-26..29) a PR's next job on the same host came p50 6, p90 76, p95 189 jobs
      later (0.4, 5.2, 15.5 h), so an item idle only because the fleet is idle stays.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the

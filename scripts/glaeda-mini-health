@@ -52,6 +52,7 @@ import json
 import os
 import plistlib
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -87,6 +88,8 @@ WEDGE_SIGNATURE = "XCIDESession is responsible for cleaning up its socket"
 SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created session")
 # A test that may be talking to testmanagerd (the hook's XCTEST_RUNNING, for hooks without it): the check waits.
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
+LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
+LEAKED_APP_TERM_S = 1.0
 
 
 def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) -> tuple[int, str]:
@@ -97,6 +100,27 @@ def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) 
     except (OSError, subprocess.SubprocessError):
         return 127, ""
     return p.returncode, p.stdout
+
+
+def leaked_test_app_pids(table: dict[int, tuple[int, int, str, str]]) -> list[tuple[int, str]]:
+    result: list[tuple[int, str]] = []
+    for pid, _uid, _state, command in table.values():
+        match = LEAKED_TEST_APP.search(command)
+        if not match:
+            continue
+        owner = pid
+        owned = False
+        for _ in range(256):
+            row = table.get(owner)
+            if owner <= 1 or row is None:
+                break
+            if re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", row[3]):
+                owned = True
+                break
+            owner = row[1]
+        if not owned:
+            result.append((pid, match.group(1)))
+    return result
 
 
 def finding(fid: str, severity: str, evidence: str, auto_fix: str, note: str = "") -> dict[str, Any]:
@@ -153,6 +177,15 @@ class Mini:
             parts = line.split(None, 3)
             if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
                 rows.append((int(parts[0]), int(parts[1]), parts[2], parts[3].strip()))
+        return rows
+
+    def process_tree(self) -> list[tuple[int, int, str]]:
+        """(pid, ppid, command) for ownership checks that need ancestry."""
+        rows = []
+        for line in sh(["/bin/ps", "-axo", "pid=,ppid=,command="])[1].splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                rows.append((int(parts[0]), int(parts[1]), parts[2].strip() if len(parts) > 2 else ""))
         return rows
 
     def elapsed_s(self, pid: int) -> int | None:
@@ -246,6 +279,43 @@ class Mini:
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
 
+    def leaked_test_apps(self) -> list[tuple[int, str]]:
+        hook = self.hook()
+        try:
+            rows = self.process_tree()
+            if hook is not None and hasattr(hook, "leaked_test_app_pids"):
+                table = {pid: (ppid, command) for pid, ppid, command in rows}
+                return hook.leaked_test_app_pids(table)
+            return leaked_test_app_pids({pid: (pid, ppid, "", command) for pid, ppid, command in rows})
+        except Exception:
+            return []
+
+    def kill_leaked_test_apps(self) -> list[str]:
+        hook = self.hook()
+        if hook is not None and hasattr(hook, "cleanup_leaked_test_apps"):
+            return hook.cleanup_leaked_test_apps()
+        killed = []
+        for pid, path in self.leaked_test_apps():
+            if (pid, path) not in self.leaked_test_apps():
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                continue
+            deadline = time.monotonic() + LEAKED_APP_TERM_S
+            while pid in {p for p, *_ in self.process_tree()} and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if pid in {p for p, *_ in self.process_tree()} and (pid, path) in self.leaked_test_apps():
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            if pid not in {p for p, *_ in self.process_tree()}:
+                killed.append(f"killed pid {pid} {path}")
+        return killed
+
+    def disk_summary(self) -> dict[str, Any]:
+        path = self.home / ".local/state/glaeda/disk/summary.json"
+        return load_json(path)
+
 
 # ---------------------------------------------------------------- checks
 
@@ -273,6 +343,33 @@ def check_power(mini: Mini) -> list[dict[str, Any]]:
         out.append(finding("display_sleep", "warn", f"display sleep is {m.group(1)} min; the screen lock "
                            "follows it", "impossible", "root: pmset -a displaysleep 0"))
     return out
+
+
+def check_leaked_test_apps(mini: Mini) -> list[dict[str, Any]]:
+    apps = mini.leaked_test_apps()
+    if not apps:
+        return []
+    return [finding("leaked_test_apps", "warn", f"{len(apps)} orphaned cmux DEV.app process(es) under runner _temp",
+                    "pending", "killed by the runner post-job hook or mini-health backstop")]
+
+
+def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
+    summary = mini.disk_summary()
+    if summary.get("schema") != "glaeda-disk/v1":
+        return []
+    accounting = summary.get("accounting") or []
+    missing = sum(float(x.get("unmeasured")) for x in accounting
+                  if isinstance(x, dict) and isinstance(x.get("unmeasured"), (int, float)))
+    if missing < 1 * 1024**3:
+        return []
+    top: list[str] = []
+    for x in accounting:
+        for entry in (x.get("top_level") or []) if isinstance(x, dict) else []:
+            if isinstance(entry, dict) and entry.get("path") and isinstance(entry.get("bytes"), (int, float)):
+                top.append(f"{entry['path']} {entry['bytes'] / 1024**3:.1f} GiB")
+    where = "; top level: " + ", ".join(top[:5]) if top else ""
+    return [finding("disk_unmeasured", "warn", f"{missing / 1024**3:.1f} GiB used space is outside glaeda-disk's measured items{where}",
+                    "pending", "glaeda-disk reports the top-level volume directories and refreshes their accounting")]
 
 
 def check_testmanagerd(mini: Mini, now: float) -> list[dict[str, Any]] | None:
@@ -374,11 +471,17 @@ def heal_runner(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     return running, f"launchctl kickstart {label}: {'running' if running else 'still not running'}"
 
 
+def heal_leaked_test_apps(mini: Mini) -> tuple[bool, str]:
+    notes = mini.kill_leaked_test_apps()
+    return bool(notes), "; ".join(notes) if notes else "no orphaned cmux DEV.app remained after recheck"
+
+
 # code -> (heal, runs in a row seen before healing)
 HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]] = {
     "testmanagerd_wedged": (heal_testmanagerd, 1),
     "tailscale_down": (heal_tailscale, 2),
     "runner_stopped": (heal_runner, 2),
+    "leaked_test_apps": (lambda mini, _f: heal_leaked_test_apps(mini), 1),
 }
 
 
@@ -413,7 +516,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     healed = [h for h in state.get("healed") or [] if isinstance(h, dict) and now - (h.get("t") or 0) < HEALED_KEEP_S]
     previous = {f["id"]: f for f in (load_json(report_path).get("findings") or []) if isinstance(f, dict)}
 
-    found = check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
+    found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
+             + check_leaked_test_apps(mini) + check_disk_accounting(mini))
     tm = check_testmanagerd(mini, now)
     carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
     found += [previous["testmanagerd_wedged"]] if carried else tm or []

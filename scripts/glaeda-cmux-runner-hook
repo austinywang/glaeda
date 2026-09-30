@@ -1052,6 +1052,11 @@ TESTMANAGERD = "/usr/libexec/testmanagerd"
 TESTMANAGERD_TERM_S = 3.0
 TESTMANAGERD_KILL_S = 5.0
 TESTMANAGERD_STUCK = "testmanagerd: stuck"
+# Finished CI XCTest apps can outlive the Runner.Worker after their _temp tree is removed.
+# Only this exact derived-data app family is eligible; arbitrary user apps are never touched.
+LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
+LEAKED_TEST_TEMP = re.compile(r"^(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+)(?:/|$)")
+LEAKED_APP_TERM_S = 1.0
 # A process that may be talking to testmanagerd: an XCTest runner, or xcodebuild testing. A false match only
 # keeps the daemon, so these err wide.
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
@@ -3842,6 +3847,80 @@ def finish_sampler(state_dir: Path, wait_s: float = 5.0) -> str:
     return "job telemetry recorded" if not pid_alive(pid) else f"job telemetry sampler {pid} still writing"
 
 
+def leaked_test_app_pids(table: dict[int, tuple[int, str]], ignored_workers: set[int] | None = None) -> list[tuple[int, str]]:
+    """Find exact CI test apps whose process tree and temp tree have no live job owner."""
+    result: list[tuple[int, str]] = []
+    ignored_workers = ignored_workers or set()
+    for pid, (ppid, command) in table.items():
+        match = LEAKED_TEST_APP.search(command)
+        if not match or pid == os.getpid():
+            continue
+        temp = LEAKED_TEST_TEMP.match(match.group(1))
+        if temp:
+            # XCTest may reparent through testmanagerd or launchd. A live job process that still names the
+            # same per-run temp tree is ownership evidence even when the app's parent is pid 1, but only
+            # alongside that runner's live Runner.Worker. A stale command line alone is not ownership.
+            prefix = temp.group(1) + "/"
+            runner_prefix = temp.group(1).split("/_work/", 1)[0]
+            worker = any(other not in ignored_workers and runner_prefix in cmd
+                         and re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", cmd)
+                         for other, (_ppid, cmd) in table.items())
+            if worker and any(other != pid and prefix in cmd and not LEAKED_TEST_APP.search(cmd)
+                              for other, (_ppid, cmd) in table.items()):
+                continue
+        owner = pid
+        owned = False
+        for _ in range(256):
+            if owner <= 1 or owner not in table:
+                break
+            if owner not in ignored_workers and re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", table[owner][1]):
+                owned = True
+                break
+            owner = table[owner][0]
+        if not owned:
+            result.append((pid, match.group(1)))
+    return result
+
+
+def cleanup_leaked_test_apps(ignored_workers: set[int] | None = None) -> list[str]:
+    """Kill orphaned cmux DEV test apps and return bounded receipt lines."""
+    try:
+        found = leaked_test_app_pids(processes(), ignored_workers)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    killed: list[str] = []
+    for pid, path in found:
+        # Re-observe the exact pid and command immediately before each signal. A pid can be reused
+        # between the survey and the kill, and a replacement must never inherit the old verdict.
+        try:
+            current = processes()
+            if (pid, path) not in leaked_test_app_pids(current, ignored_workers):
+                continue
+        except (OSError, subprocess.SubprocessError):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            continue
+        deadline = time.monotonic() + LEAKED_APP_TERM_S
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if pid_alive(pid):
+            try:
+                current = processes()
+                if (pid, path) not in leaked_test_app_pids(current, ignored_workers):
+                    continue
+            except (OSError, subprocess.SubprocessError):
+                continue
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        if not pid_alive(pid):
+            killed.append(f"killed pid {pid} {path}")
+    return killed
+
+
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
         return explicit if os.path.isfile(explicit) else None
@@ -4144,6 +4223,10 @@ def main(argv: list[str] | None = None) -> int:
         if telemetry:
             print(f"{PREFIX}: {finish_sampler(args.state_dir)}", flush=True)
         print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
+    if args.phase == "job-completed":
+        current_worker = runner_worker_pid()
+        for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
+            print(f"{PREFIX}: {note}", flush=True)
     if not args.no_disk:
         print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)
     return 0

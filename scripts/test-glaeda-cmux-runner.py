@@ -2726,6 +2726,28 @@ ACQUIRE_FAILED = ("[2026-09-28 13:53:13Z ERR  Runner] Caught exception from acqu
                   "System.Net.Http.HttpRequestException: 503\n   at GitHub.Runner.Listener.Runner.RunAsync()\n")
 
 
+class LeakedAppTest(unittest.TestCase):
+    def test_orphaned_test_app_is_selected_but_live_job_app_is_protected(self) -> None:
+        app = "/Users/cmux/actions-runner-glaeda/_work/_temp/cmux-derived-data-tests-123-1-shard-2/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
+        table = {
+            10: (1, app),
+            20: (30, app),
+            30: (1, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient"),
+        }
+        self.assertEqual([pid for pid, _ in hook.leaked_test_app_pids(table)], [10])
+        self.assertEqual([pid for pid, _ in hook.leaked_test_app_pids(table, {30})], [10, 20])
+
+    def test_reparented_app_is_protected_by_live_temp_tree_owner(self) -> None:
+        root = "/Users/cmux/actions-runner-glaeda/_work/_temp/cmux-derived-data-tests-123-1-shard-2"
+        app = root + "/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
+        table = {
+            10: (1, app),
+            40: (1, "/usr/bin/xcodebuild -derivedDataPath " + root + "/Build test-without-building"),
+            50: (1, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient"),
+        }
+        self.assertEqual(hook.leaked_test_app_pids(table), [])
+
+
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
