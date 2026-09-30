@@ -67,7 +67,7 @@ fits names the step classes this mini could admit right now. Each prints one JSO
 
 runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the fleet has the host (an exclusive
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
-taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
+taken, or the mini is saturated (sampled host CPU at least GATE_CPU_PAUSE or elevated memory pressure), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
 down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
 (console_refusal). Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
@@ -649,12 +649,15 @@ PREFIX = "glaeda-cmux-runner-hook"
 GATE = "glaeda-cmux-runner-gate"
 GATE_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_POLL_S") or 2.0)
 GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary hold never stops a listener
-# A mini whose 1-minute load reaches GATE_LOAD_PAUSE per core stops its idle listeners; they listen again once it
-# falls below GATE_LOAD_RESUME per core. Load, not ps CPU, because a compile's short-lived swift-frontend processes
-# saturate a mini while ps's decaying %cpu shows 6 of 14 cores used. Measured over 229 cmux jobs on the PR minis
-# (glaeda-cmux-jobs.jsonl, 2026-09-25 07:54-10:37Z): claude-wrapper, which itself uses 0.1 core, took 46-95 s at a
-# mean load under 25 on 14 cores and 120-527 s at 36-100 (5 of 6 runs; its lane times out at 10 min), and every
-# job window with a mean load of 40 or more had a compile admission on that mini.
+# The old 1-minute load gate overcounted runnable threads on these 14-core minis: it held 578 runner-hours on
+# 09-28 while median host CPU was only 34-59%. Gate on sampled iostat CPU busy instead, with hysteresis, and hold
+# for elevated/critical Darwin VM pressure even when CPU is quiet. An unreadable sample fails open; job admission's
+# unit locks and the existing load-independent safety checks remain in force.
+GATE_CPU_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_PAUSE") or 80.0)
+GATE_CPU_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_RESUME") or 70.0)
+GATE_CPU_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_EVERY_S") or 10.0)
+GATE_MEMORY_PRESSURE_HOLD = 2
+# Kept for the pure mini_saturated helper and old operator tooling; the listener gate no longer uses load average.
 GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
 GATE_LOAD_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_RESUME") or 1.5)
 SATURATED = "the mini is saturated"
@@ -2686,6 +2689,30 @@ def mini_saturated(paused: bool, load: float | None = None, cores: int | None = 
             f"listening resumes below {GATE_LOAD_RESUME:g})")
 
 
+def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure: int | None = None) -> str | None:
+    """Why the listener should pause from measured host pressure, or None when it has headroom.
+
+    CPU busy is iostat's one-second sample; memory pressure 2 (elevated) or 4 (critical) is a separate
+    admission brake. Missing samples fail open so a broken probe never strands a runner.
+    """
+    memory_hot = memory_pressure is not None and memory_pressure >= GATE_MEMORY_PRESSURE_HOLD
+    if cpu_busy is None and not memory_hot:
+        return None
+    if paused:
+        cpu_hot = cpu_busy is not None and cpu_busy >= GATE_CPU_RESUME
+    else:
+        cpu_hot = cpu_busy is not None and cpu_busy >= GATE_CPU_PAUSE
+    if not cpu_hot and not memory_hot:
+        return None
+    reasons = []
+    if cpu_hot:
+        limit = GATE_CPU_RESUME if paused else GATE_CPU_PAUSE
+        reasons.append(f"CPU busy at least {limit:g}%")
+    if memory_hot:
+        reasons.append(f"memory pressure level {memory_pressure}")
+    return f"{SATURATED} ({' and '.join(reasons)}; listening resumes below {GATE_CPU_RESUME:g}% CPU and normal memory pressure)"
+
+
 def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
     shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
@@ -2851,8 +2878,12 @@ class Gate:
         self.source = source_identity()
         self.thermal: int | None = None  # the level while the gate holds for heat, else None
         self.thermal_at = -GATE_THERMAL_EVERY_S
-        self.load_since: float | None = None  # when the current load hold began
-        self.load_waived = False  # a hold ran past GATE_LOAD_MAX_HOLD_S; ignored until the load falls
+        self.load_since: float | None = None  # when the current CPU/memory hold began (legacy field name)
+        self.load_waived = False  # a pressure hold ran past GATE_LOAD_MAX_HOLD_S; ignored until pressure falls
+        self.cpu_busy: float | None = None
+        self.cpu_at = -GATE_CPU_EVERY_S
+        self.memory_pressure: int | None = None
+        self.memory_at = -GATE_CPU_EVERY_S
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
         self.console_at = -GATE_CONSOLE_EVERY_S
         self.disk_since: float | None = None  # when the current disk hold began
@@ -2928,13 +2959,19 @@ class Gate:
         return why
 
     def saturated(self) -> str | None:
-        """mini_saturated with this gate's hysteresis and hold limit. Checked before mini_full, so a mini both
-        full and saturated holds for load and resumes only below GATE_LOAD_RESUME."""
-        why = mini_saturated(paused=self.load_since is not None or self.load_waived)
+        """Use sampled host CPU and VM pressure with hysteresis; unreadable probes never hold a listener."""
         now = time.monotonic()
+        if now - self.cpu_at >= GATE_CPU_EVERY_S:
+            _, self.cpu_busy = host_io()
+            self.cpu_at = now
+        if now - self.memory_at >= GATE_CPU_EVERY_S:
+            self.memory_pressure = memory_pressure_level()
+            self.memory_at = now
+        why = host_saturated(paused=self.load_since is not None or self.load_waived,
+                             cpu_busy=self.cpu_busy, memory_pressure=self.memory_pressure)
         if why is None:
             if self.load_waived:
-                gate_log("the load fell below the resume mark; load holds apply again")
+                gate_log("host pressure fell below the resume mark; pressure holds apply again")
             self.load_since, self.load_waived = None, False
             return None
         if self.load_waived:
@@ -2943,7 +2980,7 @@ class Gate:
             self.load_since = now
         elif now - self.load_since >= GATE_LOAD_MAX_HOLD_S:
             gate_log(f"{SATURATED} for over {GATE_LOAD_MAX_HOLD_S / 60:g} min, longer than any compile: listening "
-                     "anyway until the load falls (look for a process outside CI jobs)")
+                     "anyway until host pressure falls (look for a process outside CI jobs)")
             self.load_since, self.load_waived = None, True
             return None
         return why
