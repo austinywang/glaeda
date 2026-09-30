@@ -2776,6 +2776,25 @@ class GateTest(unittest.TestCase):
         proc.stdout.readline()
         return proc
 
+    def blocked_opener(self, name: str) -> subprocess.Popen:
+        """A process blocked acquiring LOCK_EX after opening the host lock."""
+        script = self.tmp / name
+        script.write_text(f"import fcntl, time\nf = open({os.fspath(self.lock)!r})\nprint('open', flush=True)\n"
+                          "fcntl.flock(f, fcntl.LOCK_EX)\ntime.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, os.fspath(script)], stdout=subprocess.PIPE)
+        self.addCleanup(proc.kill)
+        proc.stdout.readline()
+        return proc
+
+    def test_lock_waiter_parser_counts_only_a_blocked_exclusive_lock(self) -> None:
+        process_table = """\
+101  hrtimer_nanosleep worker-current
+102  pipe_read          /bin/cat /Users/Shared/cmux-build-fleet/host.lock
+201  locks_lock_inode_wait /usr/local/bin/with-host-lock host.lock
+301  hrtimer_nanosleep /usr/local/bin/with-host-lock host.lock (exclusive holder)
+"""
+        self.assertEqual(hook._blocked_lock_pids(process_table, {102, 201, 301}), {201})
+
     def test_a_free_host_or_our_shared_jobs_leave_the_listener_on(self) -> None:
         self.assertIsNone(self.held())
         self.hold(fcntl.LOCK_SH)  # a PR job's holder
@@ -2794,7 +2813,7 @@ class GateTest(unittest.TestCase):
         self.opener("fill-recipe.py")  # a child of this process with the lock open: the yielding build's own
         hook._gate_yield_verdict.clear()
         self.assertIsNone(self.held())
-        worker = self.opener("with-host-lock.py")
+        worker = self.blocked_opener("with-host-lock.py")
         worker_pid = worker.pid
         with mock.patch.object(hook, "yielding_family", return_value={os.getpid()}):
             hook._gate_yield_verdict.clear()  # another fleet build on the lock: the marker yields nothing
@@ -2813,7 +2832,8 @@ class GateTest(unittest.TestCase):
             self.assertEqual(self.held(), "host reserved by leo")
 
     def test_real_lsof_sees_a_fleet_waiter_but_not_this_hook_in_flight(self) -> None:
-        fleet = self.opener("with-host-lock.py")
+        self.hold(fcntl.LOCK_SH)  # keep the build's LOCK_EX blocked while lsof and ps observe it
+        fleet = self.blocked_opener("with-host-lock.py")
         ours = self.opener("glaeda-cmux-runner-hook-job-started.py")  # another runner's admission
         self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), {fleet.pid})
         real = subprocess.run
