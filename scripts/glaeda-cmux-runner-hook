@@ -723,7 +723,11 @@ def decide(event_name: str | None, event: Any, repository: str | None,
         if not isinstance(head, dict):
             return False, "pull request head repository is missing (deleted fork?)"
         head_name, base_name = _repo_name(head), _repo_name(base)
-        allowed_fork = head.get("fork") is True and head_name in ALLOWED_FORK_REPOS
+        allowed_fork = (
+            head.get("fork") is True
+            and head_name in ALLOWED_FORK_REPOS
+            and base_name == repo
+        )
         if head.get("fork") is True and not allowed_fork:
             return False, f"fork pull request from {head.get('full_name')}"
         if head_name is None or base_name is None or (head_name != base_name and not allowed_fork):

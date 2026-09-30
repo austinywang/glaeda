@@ -215,6 +215,9 @@ SAMPLE_EVENTS = {
         "head": {"repo": FORK}, "base": {"repo": CMUX}}}, False),
     "teamleaderleo-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": TEAMLEADER_FORK}, "base": {"repo": CMUX}}}, True),
+    "teamleaderleo-fork-wrong-base": ("pull_request", {"repository": CMUX, "pull_request": {
+        "head": {"repo": TEAMLEADER_FORK},
+        "base": {"repo": {"full_name": "manaflow-ai/other", "fork": False}}}}, False),
     "cross-repo-pr-not-flagged-fork": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": {"full_name": "other/cmux", "fork": False}}, "base": {"repo": CMUX}}}, False),
     "deleted-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
